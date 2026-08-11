@@ -1,0 +1,20 @@
+# 本地运行时数据（数据库、AI 密钥、安装配置）
+bridge/data/
+bridge/native_host_config.json
+bridge/com.xhsmonitor.bridge.json
+
+# 构建产物
+bridge/build/
+bridge/dist/
+bridge/__pycache__/
+*.pyc
+*.spec
+
+# 用户数据（Excel 总表、帖子素材、周报等）
+data/
+
+# 导出与临时文件
+bridge/exports/
+*.tmp.xlsx
+node_modules/
+.playwright-cli/

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>XHS-Monitor 帖子核对</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="brand-header">
+        <div class="brand-mark" aria-hidden="true">O</div>
+        <div class="brand-copy">
+          <div class="eyebrow">XIAOHONGSHU MONITOR</div>
+          <h1>帖子核对</h1>
+        </div>
+        <div class="header-actions">
+          <button id="toggleFloating" class="icon-button icon-button--float" type="button" title="缩小为悬浮窗" aria-label="缩小为悬浮窗">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4H4v4M16 4h4v4M20 16v4h-4M4 16v4h4"/><path d="M4 4l5 5M20 4l-5 5M20 20l-5-5M4 20l5-5"/></svg>
+          </button>
+          <button id="refreshAll" class="icon-button" type="button" title="刷新状态" aria-label="刷新全部状态">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+          </button>
+          <button id="openSettings" class="icon-button" type="button" title="打开 DeepSeek 设置" aria-label="打开 DeepSeek 设置" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm8.2 3.8-1.9-.7a6.7 6.7 0 0 0-.6-1.5l.8-1.8-1.6-1.6-1.8.8a6.7 6.7 0 0 0-1.5-.6L13 4.7h-2l-.6 1.9a6.7 6.7 0 0 0-1.5.6l-1.8-.8-1.6 1.6.8 1.8a6.7 6.7 0 0 0-.6 1.5l-1.9.7v2.1l1.9.6c.1.5.3 1 .6 1.5l-.8 1.8 1.6 1.6 1.8-.8c.5.3 1 .5 1.5.6l.6 1.9h2l.6-1.9c.5-.1 1-.3 1.5-.6l1.8.8 1.6-1.6-.8-1.8c.3-.5.5-1 .6-1.5l1.9-.6v-2.1Z"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="connection connection-quiet" aria-label="本地 Excel 连接状态">
+        <span id="bridgeStateDot" class="connection-dot" data-state="idle"></span>
+        <div class="connection-copy">
+          <strong id="bridgeStateText">正在连接本地 Excel</strong>
+          <span id="bridgeVersion">正在准备数据</span>
+        </div>
+        <span class="local-pill">LOCAL</span>
+      </section>
+      <section class="ai-strip" hidden aria-label="AI 与后台任务状态">
+        <div><span id="aiStateDot" class="mini-dot"></span><strong id="aiStateText">DeepSeek 未配置</strong></div>
+        <button id="aiQueueCount" class="task-pill task-pill-button" type="button" aria-expanded="false">AI 队列 0</button>
+        <span id="commentJobCount" class="task-pill">评论任务 0</span>
+      </section>
+
+      <section id="aiProgressBlock" class="ai-progress-block" hidden aria-label="AI 分析进度">
+        <div class="ai-progress-head">
+          <span id="aiProgressLabel">AI 分析中…</span>
+          <strong id="aiProgressPercent">0%</strong>
+        </div>
+        <div class="ai-progress-track">
+          <div id="aiProgressBar" class="ai-progress-fill" data-state="active" style="width:0%"></div>
+        </div>
+      </section>
+
+      <section id="aiActivity" class="ai-activity" hidden aria-label="AI 处理中心">
+        <div class="ai-activity-head">
+          <div>
+            <div class="section-kicker">AI PROCESS</div>
+            <h2>AI 处理中心</h2>
+            <p id="aiActivitySummary">正在读取任务状态…</p>
+          </div>
+          <button id="closeAIActivity" class="ai-close" type="button" aria-label="关闭 AI 处理中心">×</button>
+        </div>
+        <div class="ai-process-key" aria-label="AI 分析流程">
+          <span>1 入队</span><i>→</i><span>2 模型分析</span><i>→</i><span>3 保存结果</span>
+        </div>
+        <div id="aiJobList" class="ai-job-list"></div>
+        <p id="aiJobEmpty" class="ai-job-empty">暂无 AI 任务。点击帖子旁的“AI 分析”即可创建任务。</p>
+      </section>
+
+      <section class="scan-console">
+        <div id="scanTrack" class="scan-track" aria-hidden="true">
+          <span></span><i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="section-kicker">CURRENT SURFACE</div>
+        <div class="page-heading">
+          <div>
+            <h2 id="pageKeyword">等待小红书页面</h2>
+            <p id="pageCount">打开搜索结果页后即可扫描</p>
+          </div>
+          <span class="page-badge">DOM</span>
+        </div>
+        <div id="currentDetailCard" class="current-detail-card" hidden>
+          <div class="current-detail-card__head">
+            <div>
+              <span class="current-detail-card__kicker">OPEN DETAIL</span>
+              <strong id="currentDetailTitle">当前打开帖子</strong>
+            </div>
+            <span id="currentDetailState" class="current-detail-card__state" data-state="ready">可操作</span>
+          </div>
+          <p id="currentDetailMeta" class="current-detail-card__meta"></p>
+          <div class="current-detail-card__actions">
+            <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
+            <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
+          </div>
+          <p id="currentDetailHint" class="current-detail-card__hint">点击后会在放大帖子右侧显示 Process，逐步读取正文、图片、评论及 ID。</p>
+        </div>
+        <ol id="scanStages" class="scan-stages" hidden aria-label="扫描进度">
+          <li data-stage="cards"><span>1</span><strong>读取卡片</strong><small>标题与元数据</small></li>
+          <li data-stage="details"><span>2</span><strong>补全正文</strong><small>当前页详情层</small></li>
+          <li data-stage="compare"><span>3</span><strong>Excel 对比</strong><small>已有或未找到</small></li>
+        </ol>
+        <button id="scanCurrent" class="scan-button" type="button">
+          <span class="scan-button-icon" aria-hidden="true"></span>
+          <span id="scanButtonLabel">核对当前页面</span>
+          <span class="scan-button-arrow" aria-hidden="true">→</span>
+        </button>
+        <button id="deepScanCurrent" class="deep-scan-button" type="button" hidden>
+          <span class="deep-scan-glyph" aria-hidden="true">＋</span>
+          <span id="deepScanButtonLabel">仅深读未判断帖子</span>
+          <small>可单独重试</small>
+        </button>
+        <div id="status" class="status" data-state="idle" role="status" aria-live="polite">准备就绪</div>
+      </section>
+
+      <section class="metrics compare-metrics" aria-label="Excel 对比结果">
+        <button id="knownMetric" class="metric" type="button" data-note-status="known"><span id="knownCount">—</span><small>Excel 已有</small><i>点击查看</i></button>
+        <button id="newMetric" class="metric metric-primary" type="button" data-note-status="new"><span id="newCount">—</span><small>新相关未拉取</small><i>点击查看</i></button>
+      </section>
+
+      <div hidden aria-hidden="true">
+        <button id="ignoredMetric" type="button"><span id="ignoredCount">—</span></button>
+        <button id="negativeMetric" type="button"><span id="negativeCount">—</span></button>
+      </div>
+
+      <section class="data-scope" hidden aria-label="数据统计口径">
+        <div class="scope-total">
+          <span>Excel 基准表</span>
+          <strong id="libraryTotal">—</strong>
+          <small>sheet1 帖子总表</small>
+        </div>
+        <div class="scope-split">
+          <span>Excel 未找到 <strong id="inboxTotal">—</strong></span>
+          <span>本地去重记录 <strong id="recordTotal">—</strong></span>
+        </div>
+        <p>先用帖子 ID、标题和正文对比 Excel；Excel 没有时，只有确认与品牌词、产品词或官方账号相关的帖子才会框选。</p>
+      </section>
+
+      <div class="post-shortcuts" hidden>
+        <button id="allPosts" type="button">全部本地记录</button>
+        <button id="ignoredPosts" type="button">已忽略（可恢复）</button>
+      </div>
+
+      <nav id="negativeTabs" class="negative-tabs" hidden aria-label="差评类型">
+        <button type="button" data-negative-type="note">负面帖子</button>
+        <button type="button" data-negative-type="comment">负面评论</button>
+        <button type="button" data-negative-type="suspected">待人工确认</button>
+      </nav>
+      <details id="negativeFilters" class="negative-filters" hidden>
+        <summary>筛选差评</summary>
+        <div class="filter-grid">
+          <label>关键词<input id="negativeKeyword" type="search" placeholder="标题、正文、作者"></label>
+          <label>首次发现起<input id="negativeFirstSeen" type="date"></label>
+          <label>发布时间起<input id="negativePublished" type="date"></label>
+          <label>风险等级<select id="negativeRisk"><option value="">全部</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select></label>
+          <label>问题分类<input id="negativeCategory" type="text" placeholder="如 服务态度"></label>
+          <label>业务状态<select id="negativeBusinessStatus"><option value="">全部</option><option value="new">Excel 未找到</option><option value="known">Excel 已有</option><option value="confirmed">待加入 Excel</option><option value="ignored">已忽略</option></select></label>
+          <label>AI 状态<select id="negativeAIStatus"><option value="">全部</option><option value="completed">已完成</option><option value="failed">失败</option><option value="analyzing">分析中</option></select></label>
+          <label>复核状态<select id="negativeReviewStatus"><option value="">全部</option><option value="pending_review">待复核</option><option value="pending_action">待处理</option><option value="in_progress">处理中</option><option value="resolved">已解决</option><option value="false_positive">误判</option><option value="no_action_needed">无需处理</option></select></label>
+          <label>来源词<input id="negativeSourceKeyword" type="text" placeholder="品牌词 / 账号名"></label>
+        </div>
+        <button id="applyNegativeFilters" class="secondary-button" type="button">应用筛选</button>
+      </details>
+
+      <section id="queueSection" class="pending-section">
+        <div class="section-heading">
+          <button id="queueBack" class="queue-back" type="button" hidden aria-label="返回待处理队列">←</button>
+          <div>
+            <div id="queueKicker" class="section-kicker">NEW &amp; RELEVANT</div>
+            <h2 id="queueTitle">新相关未拉取</h2>
+            <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地 Excel 中还没有</p>
+          </div>
+          <span id="pendingCount" class="count-pill">0</span>
+        </div>
+        <div id="pendingList" class="pending-list"></div>
+        <button id="queueMore" class="queue-more" type="button" hidden>查看全部 Excel 未找到帖子</button>
+        <div id="pendingEmpty" class="empty-state">
+          <span class="empty-glyph" aria-hidden="true">✓</span>
+          <strong>没有发现 Excel 之外的新相关帖子</strong>
+          <p>继续下滑或重新扫描后，新加载的品牌相关帖子会出现在这里。</p>
+        </div>
+      </section>
+
+      <details id="settingsPanel" class="settings" hidden>
+        <summary>
+          <span>扫描设置</span>
+          <span class="summary-hint">关键词、Bridge 与 AI</span>
+        </summary>
+        <div class="settings-body">
+          <label for="keywords">触发自动扫描的搜索词</label>
+          <input id="keywords" type="text" value="品牌词" autocomplete="off" spellcheck="false">
+          <p class="field-help">内容相关性按 extension/relevance.js 里的品牌词、产品词、账号词库判断，可自行编辑。</p>
+
+          <label for="bridgeUrl">本地 Bridge 地址</label>
+          <input id="bridgeUrl" type="url" value="http://127.0.0.1:17881" autocomplete="off" spellcheck="false">
+          <button id="saveConfig" class="secondary-button" type="button">保存设置</button>
+
+          <div class="settings-divider"><span>DEEPSEEK</span></div>
+          <label for="aiBaseUrl">API Base URL</label>
+          <input id="aiBaseUrl" type="url" value="https://api.deepseek.com" autocomplete="off" spellcheck="false">
+          <label for="aiKey">API Key</label>
+          <input id="aiKey" type="password" placeholder="已配置时留空不会覆盖" autocomplete="new-password" spellcheck="false">
+          <p class="field-help">密钥只发送给本机 Bridge，并使用 Windows DPAPI 加密保存。</p>
+          <div class="field-grid">
+            <label>模型<input id="aiModel" type="text" value="deepseek-v4-flash" list="deepseekModels" autocomplete="off"></label>
+            <datalist id="deepseekModels"><option value="deepseek-v4-flash"><option value="deepseek-v4-pro"></datalist>
+            <label>思考模式<select id="aiThinking"><option value="disabled">关闭（舆情分类）</option><option value="enabled">开启</option></select></label>
+            <label>Temperature<input id="aiTemperature" type="number" min="0" max="2" step="0.1" value="0.1"></label>
+            <label>超时（秒）<input id="aiTimeout" type="number" min="5" max="180" value="45"></label>
+            <label>Max Tokens<input id="aiMaxTokens" type="number" min="256" max="8192" value="1800"></label>
+            <label>评论批量<input id="aiBatchSize" type="number" min="10" max="20" value="15"></label>
+            <label>最大并发<input id="aiConcurrency" type="number" min="1" max="3" value="1"></label>
+            <label>每日上限<input id="aiDailyLimit" type="number" min="1" max="10000" value="300"></label>
+          </div>
+          <label class="switch-row"><input id="autoAnalyzePosts" type="checkbox"> 自动分析新帖子</label>
+          <label class="switch-row"><input id="autoAnalyzeComments" type="checkbox"> 自动分析新评论</label>
+          <div class="button-pair">
+            <button id="testAI" class="secondary-button" type="button">测试连接</button>
+            <button id="saveAI" class="secondary-button" type="button">保存 AI 设置</button>
+          </div>
+          <button id="clearAIHistory" class="danger-button" type="button">清空 AI 分析历史（保留当前结果）</button>
+        </div>
+      </details>
+
+      <footer>
+        <span>本地 Excel 对比</span>
+        <span id="lastScan">尚未扫描</span>
+      </footer>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
