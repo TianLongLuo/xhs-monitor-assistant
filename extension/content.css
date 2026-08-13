@@ -649,7 +649,20 @@
   color: var(--process-ink);
   font-family: "Segoe UI Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
   max-height: calc(100vh - 16px);
-  overflow: hidden auto;
+  /* Keep this element as the single scroll viewport.  Without disabling
+     flex-shrink, the long field/comment sections are compressed to the
+     panel height, leaving scrollHeight === clientHeight and making wheel
+     gestures appear broken. */
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
+  pointer-events: auto !important;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+}
+
+.xhs-monitor-process > * {
+  flex: 0 0 auto;
 }
 
 .xhs-monitor-process::after {
