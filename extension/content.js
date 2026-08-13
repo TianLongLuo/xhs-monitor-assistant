@@ -54,7 +54,7 @@
     { id: "open", label: "打开帖子", hint: "点击卡片并展开详情" },
     { id: "body", label: "正文与字段", hint: "标题、正文、话题、作者" },
     { id: "comments", label: "评论及 ID", hint: "读取评论并生成稳定 ID" },
-    { id: "media", label: "素材图片", hint: "提取图片并保存帖子文件夹" },
+    { id: "media", label: "素材文件", hint: "提取图片 / 视频并保存帖子文件夹" },
     { id: "excel", label: "Excel / SQLite", hint: "按总表字段幂等写入" }
   ];
 
@@ -63,7 +63,7 @@
     ["笔记标题", "title"], ["笔记内容", "content"], ["笔记话题", "tags"],
     ["点赞量", "likeCount"], ["收藏量", "collectCount"], ["评论量", "commentCount"],
     ["分享量", "shareCount"], ["发布时间", "publishedAt"], ["更新时间", "updatedAt"],
-    ["IP地址", "ipLocation"], ["图片数量", "imageCount"], ["发布日期", "publishedAt"],
+    ["IP地址", "ipLocation"], ["图片数量", "imageCount"], ["视频数量", "videoCount"], ["发布日期", "publishedAt"],
     ["来源词", "keyword"], ["笔记ID", "noteId"], ["博主ID", "authorId"],
     ["对应帖子文件夹地址", "mediaDir"], ["文件夹内清单", "mediaFiles"],
     ["AI情绪判断", "postSentiment"], ["帖子好坏", "postSentiment"]
@@ -263,6 +263,7 @@
       if (label === "笔记话题") value = source.tags;
       if (label === "笔记话题" && Array.isArray(value) && !value.length && source.detailRead) value = "无话题";
       if (label === "图片数量" && value === undefined) value = source.imageUrls?.length || 0;
+      if (label === "视频数量" && value === undefined) value = source.videoUrls?.length || 0;
       if (label === "发布日期") value = processValue(source.publishedAt, 100).slice(0, 10);
       if (label === "文件夹内清单" && Array.isArray(value)) value = value.join("\n");
       if ((label === "AI情绪判断" || label === "帖子好坏") && !value) {
@@ -705,8 +706,9 @@
     const merged = { ...note };
     if (message.mediaDir) merged.mediaDir = message.mediaDir;
     if (message.mediaFiles) merged.mediaFiles = message.mediaFiles;
-    if (message.mediaFileCount !== undefined && merged.imageCount === undefined) merged.imageCount = message.mediaFileCount;
-    if (message.mediaCount !== undefined) merged.imageCount = message.mediaCount;
+    if (message.imageCount !== undefined) merged.imageCount = message.imageCount;
+    else if (message.mediaCount !== undefined && merged.imageCount === undefined) merged.imageCount = message.mediaCount;
+    if (message.videoCount !== undefined) merged.videoCount = message.videoCount;
     if (message.commentCount !== undefined) merged.commentCount = message.commentCount;
     if (message.excelPath) merged.excelPath = message.excelPath;
     if (message.excelRow) merged.excelRow = message.excelRow;
@@ -1008,6 +1010,46 @@
     return [...new Set(values)].slice(0, limit);
   }
 
+  function extractVideoUrls(root, limit = 8) {
+    const values = [];
+    const add = (value) => {
+      const raw = clean(value, 8000);
+      if (!raw || /^blob:/i.test(raw)) return;
+      try {
+        const url = new URL(raw, location.href);
+        if (!/^https?:$/i.test(url.protocol)) return;
+        if (/\.(?:jpe?g|png|webp|gif|bmp|avif)(?:[?#]|$)/i.test(url.href)) return;
+        values.push(url.href);
+      } catch (_error) {}
+    };
+    const attributes = [
+      "src", "data-src", "data-url", "data-video-url", "data-video-src",
+      "data-play-url", "data-master-url", "data-origin-url"
+    ];
+    for (const video of root?.querySelectorAll?.("video") || []) {
+      add(video.currentSrc);
+      for (const attribute of attributes) add(video.getAttribute(attribute));
+      for (const source of video.querySelectorAll("source")) {
+        add(source.src);
+        for (const attribute of attributes) add(source.getAttribute(attribute));
+      }
+    }
+    for (const element of root?.querySelectorAll?.(
+      "[data-video-url],[data-video-src],[data-play-url],[data-master-url],[data-origin-url]"
+    ) || []) {
+      for (const attribute of attributes) add(element.getAttribute(attribute));
+    }
+    // Some XHS players expose only a blob: URL on <video>. The signed CDN URL
+    // remains visible in the Resource Timing buffer after the detail opens.
+    if (!values.length && root?.querySelector?.("video")) {
+      for (const entry of performance.getEntriesByType?.("resource") || []) {
+        const url = String(entry?.name || "");
+        if (/\.(?:mp4|m4v|mov|webm)(?:[?#]|$)|sns-video|video\/tos|video-cdn|stream/i.test(url)) add(url);
+      }
+    }
+    return [...new Set(values)].slice(-limit);
+  }
+
   function visibleLargeElement(element) {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -1240,6 +1282,7 @@
     const tags = description.element ? extractTags(description.element, content) : [];
     const mediaRoot = detailRoot.querySelector?.(".media-container") || detailRoot;
     const imageUrls = extractImageUrls(mediaRoot || detailRoot, 32);
+    const videoUrls = extractVideoUrls(mediaRoot || detailRoot, 8);
     const authorUrl = noteUtils.normalizeXhsUrl(authorLink?.href || baseNote.authorUrl || "");
     return {
       ok: true,
@@ -1259,6 +1302,9 @@
         mediaText: extractMediaText(detailRoot),
         imageUrls: imageUrls.length ? imageUrls : (baseNote.imageUrls || []),
         imageCount: imageUrls.length || baseNote.imageCount || (baseNote.imageUrls || []).length,
+        videoUrls: videoUrls.length ? videoUrls : (baseNote.videoUrls || []),
+        videoCount: videoUrls.length || baseNote.videoCount || (baseNote.videoUrls || []).length,
+        mediaType: videoUrls.length || (baseNote.videoUrls || []).length ? "video" : "image",
         likeCount: baseNote.likeCount || processMetric(detailRoot, ["like", "点赞", "赞"]),
         collectCount: baseNote.collectCount || processMetric(detailRoot, ["collect", "收藏", "star"]),
         commentCount: baseNote.commentCount || processMetric(detailRoot, ["comment", "评论"]),
@@ -1339,7 +1385,8 @@
       note?.noteId || "",
       note?.title || "",
       info.loading ? "1" : "0",
-      note?.imageCount || note?.imageUrls?.length || 0
+      note?.imageCount || note?.imageUrls?.length || 0,
+      note?.videoCount || note?.videoUrls?.length || 0
     ].join("|");
     if (signature === lastDetailSignal) return;
     lastDetailSignal = signature;
@@ -1577,7 +1624,7 @@
       const commentsWithIds = await ensureCommentIds(detail.note, extracted.comments || []);
       if (showProcess) updateProcessPanel({
         process: true, noteId: note.noteId, phase: "media",
-        title: `评论及 ID 已读取 ${commentsWithIds.length} 条，准备保存素材图片`, note: detail.note,
+        title: `评论及 ID 已读取 ${commentsWithIds.length} 条，准备保存图片 / 视频素材`, note: detail.note,
         commentCount: commentsWithIds.length,
         commentRows: commentsWithIds.slice(0, 12)
       });

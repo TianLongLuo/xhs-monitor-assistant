@@ -810,9 +810,10 @@ async function pullNote(note, preferredTabId = null) {
 
       broadcastPullProgress({
         noteId, phase: "media", process: showProcess,
-        title: `正文与评论已读取，正在保存 ${detail.note.imageUrls?.length || 0} 张素材图片`,
+        title: `正文与评论已读取，正在保存 ${detail.note.imageUrls?.length || 0} 张图片、${detail.note.videoUrls?.length || 0} 个视频`,
         note: showProcess ? detail.note : undefined,
         imageCount: detail.note.imageUrls?.length || 0,
+        videoCount: detail.note.videoUrls?.length || 0,
         commentCount: comments.length,
         commentRows: showProcess ? comments.slice(0, 12) : undefined
       }, progressTabId);
@@ -829,7 +830,7 @@ async function pullNote(note, preferredTabId = null) {
           commentError,
           collectedAt: new Date().toISOString()
         })
-      }, 60000);
+      }, 10 * 60 * 1000);
       broadcastPullProgress({
         noteId, phase: "excel", process: showProcess,
         title: "素材与 Excel / SQLite 已写入，正在核对结果",
@@ -838,7 +839,8 @@ async function pullNote(note, preferredTabId = null) {
           mediaDir: result.mediaDir || "",
           mediaFiles: Array.isArray(result.mediaFiles) ? result.mediaFiles : []
         } : undefined,
-        imageCount: result.mediaCount ?? detail.note.imageUrls?.length ?? 0,
+        imageCount: result.imageCount ?? result.mediaCount ?? detail.note.imageUrls?.length ?? 0,
+        videoCount: result.videoCount ?? detail.note.videoUrls?.length ?? 0,
         mediaFileCount: result.mediaFileCount || 0,
         mediaDir: result.mediaDir || "",
         mediaFiles: result.mediaFiles || [],

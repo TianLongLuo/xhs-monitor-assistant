@@ -37,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.18.1"
+VERSION = "0.18.2"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -2074,6 +2074,15 @@ class MonitorStore:
         return target
 
     @staticmethod
+    def _video_extension(url: str, content_type: str = "") -> str:
+        suffix = Path(urlparse(url).path).suffix.lower()
+        if suffix in {".mp4", ".m4v", ".mov", ".webm", ".ts"}:
+            return suffix
+        mime = (content_type or "").split(";", 1)[0].strip().lower()
+        guessed = mimetypes.guess_extension(mime) or ".mp4"
+        return guessed if guessed in {".mp4", ".m4v", ".mov", ".webm", ".ts"} else ".mp4"
+
+    @staticmethod
     def _media_extension(url: str, content_type: str = "") -> str:
         suffix = Path(urlparse(url).path).suffix.lower()
         if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}:
@@ -2103,6 +2112,13 @@ class MonitorStore:
                 continue
             image_urls.append(raw)
         image_urls = image_urls[:32]
+        video_urls = []
+        for value in note.get("videoUrls") or []:
+            raw = text(value, 8000)
+            if not raw or raw in video_urls or raw.startswith("blob:"):
+                continue
+            video_urls.append(raw)
+        video_urls = video_urls[:8]
 
         def download_one(index: int, image_url: str) -> tuple[int, str, str]:
             temporary: Path | None = None
@@ -2169,6 +2185,67 @@ class MonitorStore:
             if error:
                 errors.append(error)
 
+        def download_video(index: int, video_url: str) -> tuple[int, str, str]:
+            temporary: Path | None = None
+            try:
+                parsed = urlparse(video_url)
+                if parsed.scheme not in {"http", "https"}:
+                    raise ValueError("视频链接不是 http(s)")
+                request = Request(
+                    video_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+                        "Accept": "video/mp4,video/webm,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
+                        "Referer": "https://www.xiaohongshu.com/",
+                        "Origin": "https://www.xiaohongshu.com",
+                    },
+                )
+                target = folder / f"video-{index:02d}{self._video_extension(video_url)}"
+                temporary = target.with_name(f".{target.name}.part")
+                total = 0
+                with urlopen(request, timeout=30) as response, temporary.open("wb") as output:
+                    content_type = response.headers.get("Content-Type", "")
+                    if content_type.lower().startswith("text/") or "json" in content_type.lower():
+                        raise ValueError(f"视频响应类型异常: {content_type}")
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > 1024 * 1024 * 1024:
+                            raise ValueError("视频超过 1GB 限制")
+                        output.write(chunk)
+                    if total <= 0:
+                        raise ValueError("视频响应为空")
+                    extension = self._video_extension(video_url, content_type)
+                if target.suffix.lower() != extension:
+                    target = target.with_suffix(extension)
+                os.replace(temporary, target)
+                return index, target.name, ""
+            except Exception as exc:
+                try:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return index, "", f"视频{index}: {text(exc, 300)}"
+
+        video_results: list[tuple[int, str, str]] = []
+        if video_urls:
+            worker_count = min(2, len(video_urls))
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-video") as executor:
+                futures = [
+                    executor.submit(download_video, index, video_url)
+                    for index, video_url in enumerate(video_urls, 1)
+                ]
+                for future in as_completed(futures):
+                    video_results.append(future.result())
+        for _index, filename, error in sorted(video_results, key=lambda item: item[0]):
+            if filename:
+                files.append(filename)
+            if error:
+                errors.append(error)
+
         metadata = {
             "noteId": note_id,
             "url": text(note.get("url"), 2000),
@@ -2176,6 +2253,8 @@ class MonitorStore:
             "content": text(note.get("content"), 12000),
             "tags": note.get("tags") or [],
             "imageUrls": image_urls,
+            "videoUrls": video_urls,
+            "mediaType": "video" if video_urls else "image",
             "pulledAt": now_iso(),
         }
         (folder / "note.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2195,6 +2274,7 @@ class MonitorStore:
             "folder": str(folder),
             "files": files,
             "imageCount": len([name for name in files if name.startswith("image-")]),
+            "videoCount": len([name for name in files if name.startswith("video-")]),
             "fileCount": len(files),
             "error": "；".join(errors),
         }
@@ -2718,6 +2798,7 @@ class MonitorStore:
             "files": [],
             "fileCount": 0,
             "imageCount": 0,
+            "videoCount": 0,
             "error": "素材尚未下载",
         }
         try:
@@ -2741,6 +2822,7 @@ class MonitorStore:
                     "files": [],
                     "fileCount": 0,
                     "imageCount": 0,
+                    "videoCount": 0,
                     "error": text(exc, 1000),
                 }
             settings = self.ai_settings.get(False)
@@ -2816,6 +2898,9 @@ class MonitorStore:
             "excelRow": int(xlsx_result.get("noteRow", 0) or 0),
             "mediaStatus": media_result.get("status", "failed"),
             "mediaCount": int(media_result.get("imageCount", 0) or 0),
+            "imageCount": int(media_result.get("imageCount", 0) or 0),
+            "videoCount": int(media_result.get("videoCount", 0) or 0),
+            "downloadedMediaCount": int(media_result.get("imageCount", 0) or 0) + int(media_result.get("videoCount", 0) or 0),
             "mediaFileCount": int(media_result.get("fileCount", 0) or 0),
             "mediaDir": media_result.get("folder", ""),
             "mediaFiles": media_result.get("files", []) or [],
