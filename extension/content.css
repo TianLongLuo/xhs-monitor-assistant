@@ -983,3 +983,29 @@
   .xhs-monitor-process *::before,
   .xhs-monitor-process *::after { transition-duration: .01ms !important; }
 }
+
+
+/* v0.18.1 — independent Process-panel scrolling */
+.xhs-monitor-process {
+  -webkit-overflow-scrolling: touch;
+  contain: layout paint style;
+  overscroll-behavior: contain;
+  pointer-events: auto;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+}
+
+.xhs-monitor-process__head {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+
+.xhs-monitor-process::-webkit-scrollbar { width: 8px; }
+.xhs-monitor-process::-webkit-scrollbar-track { background: transparent; }
+.xhs-monitor-process::-webkit-scrollbar-thumb {
+  background: rgba(47, 102, 88, .34);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}

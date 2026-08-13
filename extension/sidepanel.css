@@ -2117,3 +2117,24 @@ body.gathered-zine-ui.is-ball .ball-widget__ball[data-active="true"]::after {
   .gathered-zine-ui .current-detail-card__head strong { max-width: 155px; }
   .gathered-zine-ui .current-detail-card__visual img { min-height: 188px; }
 }
+
+
+/* v0.18.1 — stable side-panel rendering */
+html {
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+}
+
+body.gathered-zine-ui:not(.is-ball) {
+  overflow-anchor: none;
+}
+
+.gathered-zine-ui .shell,
+.gathered-zine-ui .current-detail-card,
+.gathered-zine-ui .pending-list {
+  overflow-anchor: none;
+}
+
+.gathered-zine-ui .current-detail-card__visual img {
+  content-visibility: auto;
+}

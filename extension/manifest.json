@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "114",
   "name": "小红书舆情监控助手",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "为小红书帖子提供同页核对、Gathered Scenes 证据流 UI、Process 进度、完整素材与评论采集，并幂等写入本地 Excel / SQLite。",
   "permissions": [
     "storage",
@@ -21,7 +21,13 @@
     "service_worker": "service-worker.js"
   },
   "action": {
-    "default_title": "舆情监控助手"
+    "default_title": "舆情监控助手",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "side_panel": {
     "default_path": "sidepanel.html"
@@ -45,5 +51,11 @@
       ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }

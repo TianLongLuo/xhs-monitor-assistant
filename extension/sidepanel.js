@@ -113,6 +113,10 @@ const activePulls = new Set();
 const aiWatchTargets = new Map(); // noteId -> { title, since }
 let currentDetailNote = null;
 let currentDetailPullingId = "";
+let currentDetailRenderSignature = "";
+let pendingRenderSignature = "";
+let pageInfoRequest = null;
+let refreshAllRequest = null;
 
 if (floatingMode) {
   document.title = "XHS-Monitor 帖子核对 · 悬浮窗";
@@ -316,10 +320,20 @@ function renderCurrentDetail(note = null, loading = false) {
   if (!card) return;
   const noteId = String(note?.noteId || note?.note_id || "").trim();
   currentDetailNote = noteId ? { ...note, noteId } : null;
+  const active = currentDetailPullingId === noteId || activePulls.has(noteId);
+  const nextSignature = currentDetailNote ? JSON.stringify([
+    noteId, loading, active, currentDetailNote.title, currentDetailNote.author,
+    currentDetailNote.publishedAt || currentDetailNote.publishTime,
+    currentDetailNote.content, currentDetailNote.imageCount,
+    Array.isArray(currentDetailNote.imageUrls) ? currentDetailNote.imageUrls[0] : "",
+    currentDetailNote.inExcel, currentDetailNote.pullStatus,
+    currentDetailNote.relevanceStatus, currentDetailNote.isRelevant
+  ]) : "empty";
+  if (nextSignature === currentDetailRenderSignature) return;
+  currentDetailRenderSignature = nextSignature;
   card.hidden = !currentDetailNote;
   if (!currentDetailNote) return;
 
-  const active = currentDetailPullingId === noteId || activePulls.has(noteId);
   const contentLength = String(currentDetailNote.content || "").trim().length;
   const imageCount = Number(currentDetailNote.imageCount) || currentDetailNote.imageUrls?.length || 0;
   const state = active
@@ -349,11 +363,15 @@ function renderCurrentDetail(note = null, loading = false) {
   if (elements.currentDetailVisual && elements.currentDetailThumb) {
     elements.currentDetailVisual.hidden = !imageUrl;
     if (imageUrl) {
-      elements.currentDetailThumb.src = imageUrl;
+      if (elements.currentDetailThumb.dataset.sourceUrl !== imageUrl) {
+        elements.currentDetailThumb.dataset.sourceUrl = imageUrl;
+        elements.currentDetailThumb.src = imageUrl;
+      }
       elements.currentDetailThumb.alt = `${title} 的首张素材`;
       elements.currentDetailThumb.onerror = () => { elements.currentDetailVisual.hidden = true; };
     } else {
-      elements.currentDetailThumb.removeAttribute("src");
+      if (elements.currentDetailThumb.hasAttribute("src")) elements.currentDetailThumb.removeAttribute("src");
+      delete elements.currentDetailThumb.dataset.sourceUrl;
       elements.currentDetailThumb.alt = "";
     }
   }
@@ -432,11 +450,16 @@ async function analyzeCurrentDetailRelevance() {
 }
 
 async function enrichCurrentDetail(note, loading = false) {
-  renderCurrentDetail(note, loading);
-  if (!note?.noteId) return;
-  const result = await sendRuntime({ type: "getNoteStatus", noteId: note.noteId }).catch(() => null);
-  if (!result?.ok || currentDetailNote?.noteId !== note.noteId) return;
-  renderCurrentDetail({ ...currentDetailNote, ...result }, loading);
+  const noteId = String(note?.noteId || note?.note_id || "").trim();
+  const sameNote = Boolean(noteId && currentDetailNote?.noteId === noteId);
+  // Keep the locally-enriched status while the 12-second page poll refreshes
+  // DOM fields. Rendering the raw DOM note first made the card oscillate
+  // between “未拉取” and “Excel 已有” on every poll.
+  renderCurrentDetail(sameNote ? { ...currentDetailNote, ...note, noteId } : note, loading);
+  if (!noteId) return;
+  const result = await sendRuntime({ type: "getNoteStatus", noteId }).catch(() => null);
+  if (!result?.ok || currentDetailNote?.noteId !== noteId) return;
+  renderCurrentDetail({ ...currentDetailNote, ...result, noteId }, loading);
 }
 
 async function pullCurrentDetail() {  const note = currentDetailNote;
@@ -885,7 +908,7 @@ async function reviewItem(item, reviewStatus, localNote = "", manualNegative = f
   await showNegativeView(item.target_type === "comment" ? "comment" : "note");
 }
 
-function showPendingQueue(showAll = false) {
+function showPendingQueue(showAll = false, options = {}) {
   elements.negativeTabs.hidden = true;
   elements.negativeFilters.hidden = true;
   queueView = { type: "pending", status: "new", showAll };
@@ -898,7 +921,7 @@ function showPendingQueue(showAll = false) {
     more: !showAll && pendingNotes.length > 8,
     sourceFallback: "浏览器扫描"
   });
-  elements.queueSection.scrollIntoView?.({ block: "start" });
+  if (!options.preserveScroll) elements.queueSection.scrollIntoView?.({ block: "start" });
 }
 
 async function showStatusView(status) {
@@ -949,10 +972,23 @@ function showScanResultView(notes) {
 }
 
 function renderPending(notes) {
-  pendingNotes = (notes || []).filter((note) => note.source !== "existing_xlsx");
+  const unique = new Map();
+  for (const note of (notes || [])) {
+    if (note?.source === "existing_xlsx") continue;
+    const key = String(note.noteId || note.note_id || note.url || "").trim();
+    if (key && !unique.has(key)) unique.set(key, note);
+  }
+  const nextNotes = [...unique.values()];
+  const nextSignature = JSON.stringify(nextNotes.map((note) => [
+    note.noteId || note.note_id, note.title, note.author, note.status,
+    note.pullStatus, note.inExcel, note.firstSeenAt
+  ]));
+  pendingNotes = nextNotes;
   visiblePendingCount = pendingNotes.length;
   elements.newCount.textContent = String(visiblePendingCount);
-  if (queueView.type === "pending") showPendingQueue(Boolean(queueView.showAll));
+  if (nextSignature === pendingRenderSignature) return;
+  pendingRenderSignature = nextSignature;
+  if (queueView.type === "pending") showPendingQueue(Boolean(queueView.showAll), { preserveScroll: true });
 }
 
 async function loadConfig() {
@@ -978,21 +1014,27 @@ async function loadConfig() {
 }
 
 async function loadPageInfo() {
-  try {
-    const info = await sendToActiveTab({ type: "getPageInfo" });
-    const label = info.keyword ? `“${info.keyword}”` : "小红书当前页";
-    elements.pageKeyword.textContent = label;
-    elements.pageKeyword.title = label;
-    elements.pageCount.textContent = `当前页面已加载 ${info.noteCount || 0} 篇帖子`;
-    await enrichCurrentDetail(info.currentDetail || null, Boolean(info.currentDetailLoading));
-    return info;
-  } catch (error) {
-    elements.pageKeyword.textContent = "等待小红书页面";
-    elements.pageKeyword.title = "";
-    elements.pageCount.textContent = error.message;
-    renderCurrentDetail(null, false);
-    return null;
-  }
+  if (pageInfoRequest) return pageInfoRequest;
+  pageInfoRequest = (async () => {
+    try {
+      const info = await sendToActiveTab({ type: "getPageInfo" });
+      const label = info.keyword ? `“${info.keyword}”` : "小红书当前页";
+      if (elements.pageKeyword.textContent !== label) elements.pageKeyword.textContent = label;
+      elements.pageKeyword.title = label;
+      const countLabel = `当前页面已加载 ${info.noteCount || 0} 篇帖子`;
+      if (elements.pageCount.textContent !== countLabel) elements.pageCount.textContent = countLabel;
+      await enrichCurrentDetail(info.currentDetail || null, Boolean(info.currentDetailLoading));
+      return info;
+    } catch (error) {
+      elements.pageKeyword.textContent = "等待小红书页面";
+      elements.pageKeyword.title = "";
+      elements.pageCount.textContent = error.message;
+      renderCurrentDetail(null, false);
+      return null;
+    }
+  })();
+  try { return await pageInfoRequest; }
+  finally { pageInfoRequest = null; }
 }
 
 async function refreshStats() {
@@ -1014,15 +1056,20 @@ async function refreshPending() {
 }
 
 async function refreshAll(options = {}) {
-  const [pageInfo, stats, pending] = await Promise.all([
-    loadPageInfo(), refreshStats(), refreshPending(), refreshAI()
-  ]);
-  if (!options.quiet && stats?.ok) setStatus("Excel 对比结果已刷新", "success");
-  if (!stats?.ok) {
-    renderBridgeState({ status: "offline", error: stats?.error });
-    if (!options.quiet) setStatus(`本地 Excel 暂不可用：${stats?.error || "请重新打开侧边栏"}`, "error");
-  }
-  return { pageInfo, stats, pending };
+  if (refreshAllRequest) return refreshAllRequest;
+  refreshAllRequest = (async () => {
+    const [pageInfo, stats, pending] = await Promise.all([
+      loadPageInfo(), refreshStats(), refreshPending(), refreshAI()
+    ]);
+    if (!options.quiet && stats?.ok) setStatus("Excel 对比结果已刷新", "success");
+    if (!stats?.ok) {
+      renderBridgeState({ status: "offline", error: stats?.error });
+      if (!options.quiet) setStatus(`本地 Excel 暂不可用：${stats?.error || "请重新打开侧边栏"}`, "error");
+    }
+    return { pageInfo, stats, pending };
+  })();
+  try { return await refreshAllRequest; }
+  finally { refreshAllRequest = null; }
 }
 
 async function refreshAI() {
@@ -1387,7 +1434,7 @@ async function initSidePanel() {
     if (document.visibilityState === "visible" && !scanning && !deepScanning) {
       loadPageInfo().catch(() => {});
     }
-  }, 5000);
+  }, 12000);
   detailRefreshTimer?.unref?.();
 }
 

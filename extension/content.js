@@ -319,6 +319,26 @@
     return button;
   }
 
+  function enableProcessPanelScroll(panel) {
+    if (!panel || panel._scrollShielded) return;
+    panel._scrollShielded = true;
+    // Xiaohongshu's detail layer installs its own wheel handlers. Shield the
+    // Process panel and perform the vertical scroll locally so the page/modal
+    // cannot swallow the gesture or trigger a new card scan.
+    panel.addEventListener("wheel", (event) => {
+      if (panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`)) return;
+      const delta = event.deltaMode === 1 ? event.deltaY * 16
+        : event.deltaMode === 2 ? event.deltaY * panel.clientHeight
+          : event.deltaY;
+      const maxScroll = Math.max(0, panel.scrollHeight - panel.clientHeight);
+      if (!maxScroll || !Number.isFinite(delta) || delta === 0) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      panel.scrollTop = Math.max(0, Math.min(maxScroll, panel.scrollTop + delta));
+    }, { capture: true, passive: false });
+    panel.addEventListener("touchmove", (event) => event.stopPropagation(), { capture: true, passive: true });
+  }
+
   function processDockRect(note = {}) {
     const exactContainer = document.querySelector("#noteContainer.note-container, #noteContainer");
     const exactRect = exactContainer?.getBoundingClientRect?.();
@@ -366,6 +386,7 @@
     const availableRight = Math.floor(window.innerWidth - rect.right - gap - edge);
     const top = Math.max(edge, Math.min(Math.round(rect.top), window.innerHeight - 72));
     processPanel.style.top = `${top}px`;
+    processPanel.style.maxHeight = `${Math.max(180, Math.floor(window.innerHeight - top - edge))}px`;
     if (availableRight >= 188) {
       const panelWidth = Math.min(304, availableRight);
       processPanel.style.width = `${panelWidth}px`;
@@ -547,6 +568,7 @@
     foot.textContent = "详情层保持打开；完成后可直接核对原文和评论";
     panel.append(header, target, progress, steps, fieldSection, commentSection, foot);
     (document.body || document.documentElement).append(panel);
+    enableProcessPanelScroll(panel);
     processPanel = panel;
     processPanelObserver = new MutationObserver(() => {
       if (panel._detailOpened && !detailRootForNote(panel._processNote || {})) removeProcessPanel();
@@ -2064,7 +2086,10 @@
         attributeFilter: ["href", "data-note-id", "note-id"]
       });
       document.addEventListener("click", rememberManualDetailHint, { capture: true, passive: true });
-      document.addEventListener("scroll", () => scheduleScan(140), { passive: true, capture: true });
+      document.addEventListener("scroll", (event) => {
+        if (event.target instanceof Element && event.target.closest(`.${PROCESS_PANEL_CLASS}`)) return;
+        scheduleScan(140);
+      }, { passive: true, capture: true });
       window.addEventListener("scroll", () => scheduleScan(140), { passive: true });
       scheduleDetailControl(20);
       scheduleScan();
