@@ -27,6 +27,7 @@ const elements = {
   currentDetailAnalyze: document.getElementById("currentDetailAnalyze"),
   currentDetailPull: document.getElementById("currentDetailPull"),
   currentDetailSummary: document.getElementById("currentDetailSummary"),
+  currentDetailComments: document.getElementById("currentDetailComments"),
   currentDetailRefresh: document.getElementById("currentDetailRefresh"),
   currentDetailDelete: document.getElementById("currentDetailDelete"),
   currentDetailHint: document.getElementById("currentDetailHint"),
@@ -117,7 +118,16 @@ const elements = {
   summaryDisagreements: document.getElementById("summaryDisagreements"),
   summaryRisks: document.getElementById("summaryRisks"),
   summaryActions: document.getElementById("summaryActions"),
-  summaryComments: document.getElementById("summaryComments")
+  summaryComments: document.getElementById("summaryComments"),
+  commentsPage: document.getElementById("commentsPage"),
+  commentsBack: document.getElementById("commentsBack"),
+  commentsReload: document.getElementById("commentsReload"),
+  commentsTitle: document.getElementById("commentsTitle"),
+  commentsMeta: document.getElementById("commentsMeta"),
+  personaHint: document.getElementById("personaHint"),
+  commentsLoading: document.getElementById("commentsLoading"),
+  commentsError: document.getElementById("commentsError"),
+  commentsList: document.getElementById("commentsList")
 };
 
 let scanning = false;
@@ -134,6 +144,7 @@ let currentDetailRenderSignature = "";
 let pendingRenderSignature = "";
 let pageInfoRequest = null;
 let refreshAllRequest = null;
+let commentPageData = { note: null, comments: [], persona: "brand" };
 
 if (floatingMode) {
   document.title = "XHS-Monitor 帖子核对 · 悬浮窗";
@@ -412,6 +423,7 @@ function renderCurrentDetail(note = null, loading = false) {
     : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 Excel";
   elements.currentDetailRefresh.disabled = active;
   elements.currentDetailSummary.disabled = active || !contentLength;
+  elements.currentDetailComments.disabled = active || !contentLength;
   elements.currentDetailDelete.hidden = !pulled;
   elements.currentDetailDelete.disabled = active;
 }
@@ -472,6 +484,104 @@ async function openCurrentNoteSummary(force = true) {
 function closeSummaryPage() {
   elements.summaryPage.hidden = true;
   document.body.classList.remove("summary-open");
+}
+
+function closeCommentsPage() {
+  elements.commentsPage.hidden = true;
+  document.body.classList.remove("comments-open");
+}
+
+function setCommentPersona(persona) {
+  commentPageData.persona = persona === "community" ? "community" : "brand";
+  document.querySelectorAll(".persona-switch button[data-persona]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.persona === commentPageData.persona);
+  });
+  elements.personaHint.textContent = commentPageData.persona === "brand"
+    ? "官方身份：承接问题，提供可核验处理路径。"
+    : "社区交流：不冒充消费者，不编造购买或使用经历。";
+}
+
+function renderCommentsPage() {
+  elements.commentsList.replaceChildren();
+  const comments = commentPageData.comments || [];
+  const children = new Map();
+  for (const comment of comments) {
+    const parentId = comment.parentCommentId || comment.parent_comment_id || "";
+    if (!children.has(parentId)) children.set(parentId, []);
+    children.get(parentId).push(comment);
+  }
+  const ordered = [];
+  const mains = comments.filter((item) => !(item.parentCommentId || item.parent_comment_id));
+  for (const main of mains) {
+    ordered.push(main, ...(children.get(main.commentId || main.comment_id) || []));
+  }
+  for (const item of comments) if (!ordered.includes(item)) ordered.push(item);
+  for (const comment of ordered) {
+    const commentId = comment.commentId || comment.comment_id;
+    const parentId = comment.parentCommentId || comment.parent_comment_id || "";
+    const card = document.createElement("article");
+    card.className = `comment-assist-card${parentId ? " is-reply" : ""}`;
+    card.dataset.commentId = commentId;
+    const head = document.createElement("div"); head.className = "comment-assist-card__head";
+    const author = document.createElement("strong"); author.textContent = `${parentId ? "↳ " : ""}${comment.author || "匿名用户"}${comment.isAuthor || comment.is_author ? " · 帖主" : ""}`;
+    const button = document.createElement("button"); button.type = "button"; button.textContent = "回复建议";
+    head.append(author, button);
+    const content = document.createElement("p"); content.textContent = comment.content || "";
+    const meta = document.createElement("small"); meta.textContent = [comment.publishedAt || comment.published_at, comment.likeCount || comment.like_count ? `赞 ${comment.likeCount || comment.like_count}` : "", parentId ? "子评论" : "主评论"].filter(Boolean).join(" · ");
+    const suggestion = document.createElement("div"); suggestion.className = "comment-suggestion"; suggestion.hidden = true;
+    button.addEventListener("click", async () => {
+      button.disabled = true; button.textContent = "DeepSeek 生成中…";
+      suggestion.hidden = false; suggestion.replaceChildren();
+      const loading = document.createElement("p"); loading.textContent = "正在结合正文、父评论和全评论区生成建议…"; suggestion.appendChild(loading);
+      try {
+        const result = await sendRuntime({ type: "suggestCommentReply", note: commentPageData.note,
+          comments: commentPageData.comments, targetComment: comment, persona: commentPageData.persona });
+        if (!result?.ok) throw new Error(result?.error || "回复建议生成失败");
+        const box = document.createElement("textarea"); box.value = result.suggestion?.reply || ""; box.rows = 4;
+        const rationale = document.createElement("small"); rationale.textContent = result.suggestion?.rationale || "请人工复核后填入。";
+        const confirm = document.createElement("button"); confirm.type = "button"; confirm.textContent = "确认并填入回复框";
+        confirm.addEventListener("click", async () => {
+          confirm.disabled = true; confirm.textContent = "正在定位评论…";
+          try {
+            const applied = await sendRuntime({ type: "applyCommentReply", note: commentPageData.note, comment, reply: box.value });
+            if (!applied?.ok) throw new Error(applied?.error || "填入失败");
+            confirm.textContent = "已填入，等待人工发送";
+            showToast("回复已填入小红书输入框，没有自动发送");
+          } catch (error) { confirm.disabled = false; confirm.textContent = "重试填入"; showToast(error.message || "填入失败", "error"); }
+        });
+        suggestion.replaceChildren(box, rationale, confirm);
+      } catch (error) { loading.textContent = error.message || "回复建议生成失败"; }
+      finally { button.disabled = false; button.textContent = "重新生成"; }
+    });
+    card.append(head, content, meta, suggestion);
+    elements.commentsList.appendChild(card);
+  }
+  if (!ordered.length) {
+    const empty = document.createElement("div"); empty.className = "comments-empty"; empty.textContent = "当前没有读取到评论，可刷新后重试。"; elements.commentsList.appendChild(empty);
+  }
+}
+
+async function openCommentsPage() {
+  const note = currentDetailNote;
+  if (!note?.noteId) throw new Error("请先打开一篇帖子");
+  elements.commentsPage.hidden = false;
+  document.body.classList.add("comments-open");
+  elements.commentsTitle.textContent = note.title || "当前帖子";
+  elements.commentsMeta.textContent = "正在读取评论…";
+  elements.commentsLoading.hidden = false;
+  elements.commentsError.hidden = true;
+  elements.commentsList.replaceChildren();
+  try {
+    const result = await sendRuntime({ type: "getCurrentNoteComments", note });
+    if (!result?.ok) throw new Error(result?.error || "评论读取失败");
+    commentPageData.note = result.note || note;
+    commentPageData.comments = result.comments || [];
+    elements.commentsMeta.textContent = `已读取 ${commentPageData.comments.length} 条 · 页面显示约 ${result.expectedCount || commentPageData.comments.length} 条`;
+    renderCommentsPage();
+  } catch (error) {
+    elements.commentsError.textContent = error.message || "评论读取失败";
+    elements.commentsError.hidden = false;
+  } finally { elements.commentsLoading.hidden = true; }
 }
 
 async function deleteLocalNote(note, button = null) {
@@ -1329,6 +1439,14 @@ elements.currentDetailPull?.addEventListener("click", () => {
 });
 elements.currentDetailSummary?.addEventListener("click", () => {
   openCurrentNoteSummary(true).catch((error) => setStatus(error.message || "AI 总结失败", "error"));
+});
+elements.currentDetailComments?.addEventListener("click", () => {
+  openCommentsPage().catch((error) => setStatus(error.message || "评论区读取失败", "error"));
+});
+elements.commentsBack?.addEventListener("click", closeCommentsPage);
+elements.commentsReload?.addEventListener("click", () => openCommentsPage().catch(() => {}));
+document.querySelectorAll(".persona-switch button[data-persona]").forEach((button) => {
+  button.addEventListener("click", () => setCommentPersona(button.dataset.persona));
 });
 elements.summaryBack?.addEventListener("click", closeSummaryPage);
 elements.summaryRerun?.addEventListener("click", () => {

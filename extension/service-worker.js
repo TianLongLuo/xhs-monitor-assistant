@@ -797,6 +797,43 @@ async function summarizeCurrentNote(note, preferredTabId = null) {
   });
 }
 
+async function readCurrentNoteComments(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID" };
+  return runExclusivePageTask(async () => {
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    const result = await sendTabMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: false, process: false, allComments: true }
+    });
+    if (!result?.ok) throw new Error(result?.error || "评论区读取失败");
+    return result;
+  });
+}
+
+async function suggestCommentReply(payload, preferredTabId = null) {
+  const note = payload?.note || {};
+  let comments = Array.isArray(payload?.comments) ? payload.comments : [];
+  let freshNote = note;
+  if (!comments.length || !freshNote.content) {
+    const extracted = await readCurrentNoteComments(note, preferredTabId);
+    comments = extracted.comments || [];
+    freshNote = extracted.note || note;
+  }
+  const config = await getConfig();
+  return fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ai/reply-suggestion"), {
+    method: "POST",
+    body: JSON.stringify({ note: freshNote, comments, targetComment: payload.targetComment, persona: payload.persona })
+  }, 180000);
+}
+
+async function applyCommentReply(payload, preferredTabId = null) {
+  const activeTab = await activeXhsTab(preferredTabId);
+  if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+  return sendTabMessage(activeTab.id, {
+    type: "fillCommentReply", note: payload.note, comment: payload.comment, reply: payload.reply
+  });
+}
+
 async function pullNote(note, preferredTabId = null) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法拉取" };
   return runExclusivePageTask(async () => {
@@ -1160,6 +1197,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getNoteStatus") return getNoteStatus(message.noteId || message.note?.noteId || "");
     if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);
     if (message.type === "summarizeCurrentNote") return summarizeCurrentNote(message.note || {}, sender.tab?.id || null);
+    if (message.type === "getCurrentNoteComments") return readCurrentNoteComments(message.note || {}, sender.tab?.id || null);
+    if (message.type === "suggestCommentReply") return suggestCommentReply(message, sender.tab?.id || null);
+    if (message.type === "applyCommentReply") return applyCommentReply(message, sender.tab?.id || null);
     if (message.type === "getNoteSummary") {
       return bridgeApi(`/api/ai/summary?noteId=${encodeURIComponent(message.noteId || "")}`);
     }

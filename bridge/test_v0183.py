@@ -40,6 +40,11 @@ class FakeAI:
         }
 
 
+class FakeReplyAI:
+    def complete_json(self, _settings, _messages):
+        return {"reply": "感谢反馈，我们会进一步核实并跟进。", "rationale": "先承接反馈", "tone": "克制", "risk_notes": []}
+
+
 class V0183Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -81,6 +86,22 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(1, result["commentCount"])
         cached = self.store.note_summary("abcdef123456")
         self.assertTrue(cached["found"])
+
+    def test_reply_suggestion_uses_manual_send_workflow(self):
+        self.store.ai_client = FakeReplyAI()
+        self.store.ai_settings.get = lambda include_secret=False: {
+            "configured": True, "model": "deepseek-v4-flash", "max_tokens": 1800,
+            "api_key": "test", "base_url": "https://api.deepseek.com", "timeout_seconds": 45,
+            "temperature": 0.1, "thinking_mode": "disabled"
+        }
+        result = self.store.suggest_comment_reply({
+            "note": {"noteId": "abcdef123456", "title": "标题", "content": "正文"},
+            "comments": [{"commentId": "comment-1", "content": "价格是多少", "author": "用户"}],
+            "targetComment": {"commentId": "comment-1", "content": "价格是多少", "author": "用户"},
+            "persona": "brand"
+        })
+        self.assertTrue(result["ok"])
+        self.assertIn("感谢反馈", result["suggestion"]["reply"])
 
 
 if __name__ == "__main__":

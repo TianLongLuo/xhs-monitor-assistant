@@ -210,6 +210,36 @@
     };
   }
 
+  function findCommentElement(root, comment = {}) {
+    const targetId = clean(comment.commentId || comment.comment_id, 256);
+    if (targetId) {
+      for (const selector of [
+        `[data-comment-id="${CSS.escape(targetId)}"]`, `[comment-id="${CSS.escape(targetId)}"]`,
+        `#${CSS.escape(targetId)}`, `#comment-${CSS.escape(targetId)}`
+      ]) {
+        const direct = root.querySelector?.(selector);
+        if (direct) return direct.matches?.(".comment-item, [class*='comment-item'], [class*='reply-item']")
+          ? direct : direct.closest?.(".comment-item, [class*='comment-item'], [class*='reply-item']") || direct;
+      }
+      for (const candidate of root.querySelectorAll?.(ITEM_SELECTORS.join(",")) || []) {
+        if (elementCommentId(candidate) === targetId) return candidate;
+      }
+    }
+    const targetContent = clean(comment.content, 300);
+    const targetAuthor = clean(comment.author, 120);
+    return Array.from(root.querySelectorAll?.(ITEM_SELECTORS.join(",")) || []).find((candidate) => {
+      const basics = commentBasics(candidate, { noteId: comment.noteId || "" });
+      return targetContent && basics.content.includes(targetContent.slice(0, 80))
+        && (!targetAuthor || basics.author === targetAuthor);
+    }) || null;
+  }
+
+  function replyButtonFor(element) {
+    const nodes = Array.from(element?.querySelectorAll?.("button, [role='button'], span, div") || []);
+    return nodes.find((node) => node.offsetParent !== null && /^(回复|回覆)$/.test(clean(node.innerText || node.textContent, 20)))
+      || nodes.find((node) => node.offsetParent !== null && /回复/.test(clean(node.getAttribute?.("aria-label"), 30)));
+  }
+
   function expandableButtons(root) {
     return Array.from(root.querySelectorAll?.("button, [role='button'], span") || []).filter((element) => {
       if (element.offsetParent === null) return false;
@@ -220,6 +250,6 @@
 
   return {
     clean, numericText, profileIdFromUrl, isPostAuthorComment, stableCommentId, isReplyElement,
-    extractExpectedCount, extractComments, expandableButtons
+    extractExpectedCount, extractComments, expandableButtons, findCommentElement, replyButtonFor
   };
 });

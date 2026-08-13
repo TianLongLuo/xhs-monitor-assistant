@@ -101,6 +101,7 @@
           <div class="current-detail-card__actions">
             <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
             <button id="currentDetailSummary" class="current-detail-card__summary" type="button">AI 总结</button>
+            <button id="currentDetailComments" class="current-detail-card__comments" type="button">评论区</button>
             <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
             <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 Excel、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
@@ -262,6 +263,25 @@
         <section><h3>建议动作</h3><ul id="summaryActions"></ul></section>
         <section><h3>代表评论</h3><ul id="summaryComments"></ul></section>
       </article>
+    </section>
+    <section id="commentsPage" class="comments-page" hidden aria-label="帖子评论区助手">
+      <header class="comments-page__header">
+        <button id="commentsBack" type="button" aria-label="返回主页面">←</button>
+        <div><span>COMMENT DESK</span><h2>评论区回复助手</h2></div>
+        <button id="commentsReload" type="button">刷新</button>
+      </header>
+      <div class="comments-page__context">
+        <strong id="commentsTitle">当前帖子</strong>
+        <span id="commentsMeta">正在读取评论…</span>
+      </div>
+      <div class="persona-switch" role="group" aria-label="回复身份">
+        <button type="button" data-persona="brand" class="is-active">品牌方</button>
+        <button type="button" data-persona="community">路人交流</button>
+        <small id="personaHint">官方身份：承接问题，提供可核验处理路径。</small>
+      </div>
+      <div id="commentsLoading" class="summary-loading" hidden><i></i><strong>正在展开并读取全部可见评论</strong><span>主评论与子评论都会保留层级</span></div>
+      <div id="commentsError" class="summary-error" hidden></div>
+      <div id="commentsList" class="comments-list"></div>
     </section>
     <script src="sidepanel.js"></script>
   </body>

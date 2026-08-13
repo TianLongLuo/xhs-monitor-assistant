@@ -37,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.18.3"
+VERSION = "0.18.4"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -1660,6 +1660,72 @@ class MonitorStore:
             )
         return {"ok": True, "found": True, "noteId": note_id, "model": settings["model"],
                 "commentCount": len(compact_comments), "updatedAt": timestamp, "summary": result}
+
+    def suggest_comment_reply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
+        target = payload.get("targetComment") if isinstance(payload.get("targetComment"), dict) else {}
+        comments = payload.get("comments") if isinstance(payload.get("comments"), list) else []
+        note_id = valid_note_id(note.get("noteId") or payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        target_id = text(target.get("commentId") or target.get("comment_id"), 256)
+        target_content = text(target.get("content"), 2000)
+        if not target_id or not target_content:
+            raise ValueError("目标评论不完整")
+        persona = text(payload.get("persona"), 30).lower()
+        if persona not in {"brand", "community"}:
+            persona = "brand"
+        compact_comments = []
+        total_chars = 0
+        for item in comments[:300]:
+            if not isinstance(item, dict):
+                continue
+            body = text(item.get("content"), 600)
+            if not body:
+                continue
+            total_chars += len(body)
+            if total_chars > 42000:
+                break
+            compact_comments.append({
+                "comment_id": text(item.get("commentId") or item.get("comment_id"), 256),
+                "parent_comment_id": text(item.get("parentCommentId") or item.get("parent_comment_id"), 256),
+                "author": text(item.get("author"), 120), "content": body,
+                "is_author": bool(item.get("isAuthor") or item.get("is_author")),
+            })
+        settings = self.ai_settings.get(True)
+        if not settings.get("configured"):
+            raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
+        persona_instruction = (
+            "以品牌官方客服身份回复：坦诚、克制、可核验；不得假装消费者，遇到投诉先承接情绪并给出可执行的官方处理路径。"
+            if persona == "brand" else
+            "以普通社区用户交流口吻回复：自然、简短；只能基于帖子与评论中的公开信息表达，不得冒充亲身购买、使用或与品牌存在关系。"
+        )
+        schema = {"reply": "可直接填入小红书回复框的文本", "rationale": "回复思路", "tone": "语气", "risk_notes": ["需要人工留意的风险"]}
+        messages = [
+            {"role": "system", "content": "你是社交媒体评论回复助手。只生成建议稿，最终发送由人工决定。严格输出一个有效 JSON 对象，不要 Markdown。"},
+            {"role": "user", "content": "%s\n请结合帖子正文、目标评论、其父评论及全评论区上下文生成一条回复。不要编造功效、价格、活动、售后承诺或个人经历；不泄露隐私；建议控制在120字内。输出结构：%s。输入：%s" % (
+                persona_instruction, json.dumps(schema, ensure_ascii=False), json.dumps({
+                    "post": {"title": text(note.get("title"), 1000), "content": text(note.get("content"), 16000), "tags": note.get("tags") or []},
+                    "target_comment": target, "all_comments": compact_comments
+                }, ensure_ascii=False)
+            )},
+        ]
+        reply_settings = dict(settings)
+        reply_settings["max_tokens"] = min(4096, max(1200, int(settings.get("max_tokens") or 1800)))
+        raw = self.ai_client.complete_json(reply_settings, messages)
+        risk_notes = raw.get("risk_notes") or []
+        if not isinstance(risk_notes, list):
+            risk_notes = [risk_notes]
+        result = {
+            "reply": text(raw.get("reply"), 600),
+            "rationale": text(raw.get("rationale"), 1000),
+            "tone": text(raw.get("tone"), 100),
+            "riskNotes": [text(item, 300) for item in risk_notes if text(item, 300)][:6],
+        }
+        if not result["reply"]:
+            raise AIServiceError("DeepSeek 未返回回复文本", "invalid_response", True)
+        return {"ok": True, "noteId": note_id, "commentId": target_id, "persona": persona,
+                "model": settings["model"], "suggestion": result}
 
     def list_ai_jobs(self, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
         safe_status = status if status in {"queued", "analyzing", "completed", "failed"} else ""
@@ -3367,6 +3433,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.test_ai_connection(payload)
             elif self.path == "/api/ai/summary":
                 result = self.store.summarize_note(payload)
+            elif self.path == "/api/ai/reply-suggestion":
+                result = self.store.suggest_comment_reply(payload)
             elif self.path in {"/api/ai/analyze", "/api/ai/retry"}:
                 result = self.store.enqueue_ai(
                     text(payload.get("targetType"), 20), text(payload.get("targetId"), 256),

@@ -1648,9 +1648,13 @@
 
       let totalClicked = 0;
       let commentRoot = detailRootForNote(detail.note) || document;
-      for (let round = 0; round < 4; round += 1) {
+      const allComments = Boolean(note.allComments);
+      const commentScroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']");
+      const originalCommentScroll = Number(commentScroller?.scrollTop || 0);
+      let priorExtractedCount = -1;
+      let stagnantRounds = 0;
+      for (let round = 0; round < (allComments ? 28 : 4); round += 1) {
         const buttons = commentUtils.expandableButtons(commentRoot).slice(0, 16);
-        if (!buttons.length) break;
         buttons.forEach((button) => button.click());
         totalClicked += buttons.length;
         if (showProcess) updateProcessPanel({
@@ -1658,8 +1662,24 @@
           title: `已展开 ${totalClicked} 组回复，继续读取评论`, note: detail.note,
           commentCount: totalClicked
         });
-        await waitFor(650);
+        await waitFor(buttons.length ? 650 : 280);
         commentRoot = detailRootForNote(detail.note) || commentRoot;
+        if (!allComments) {
+          if (!buttons.length) break;
+          continue;
+        }
+        const snapshot = commentUtils.extractComments(commentRoot, detail.note);
+        if (snapshot.expectedCount > 0 && snapshot.comments.length >= snapshot.expectedCount) break;
+        stagnantRounds = snapshot.comments.length === priorExtractedCount ? stagnantRounds + 1 : 0;
+        priorExtractedCount = snapshot.comments.length;
+        const scroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']") || commentScroller;
+        if (scroller) {
+          const before = scroller.scrollTop;
+          scroller.scrollTop = Math.min(scroller.scrollHeight, before + Math.max(320, scroller.clientHeight * .78));
+          scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+          if (stagnantRounds >= 3 && scroller.scrollTop === before) break;
+        } else if (stagnantRounds >= 3) break;
+        await waitFor(450);
       }
       const refreshed = extractCurrentDetail(detail.note);
       if (refreshed?.ok) detail = refreshed;
@@ -1670,6 +1690,7 @@
         ? "likely_complete"
         : (extracted.status || "partial");
       const commentsWithIds = await ensureCommentIds(detail.note, extracted.comments || []);
+      if (allComments && commentScroller) commentScroller.scrollTop = originalCommentScroll;
       if (showProcess) updateProcessPanel({
         process: true, noteId: note.noteId, phase: "media",
         title: `评论及 ID 已读取 ${commentsWithIds.length} 条，准备保存图片 / 视频素材`, note: detail.note,
@@ -1698,6 +1719,63 @@
       if (opened && !showProcess) await closeDetailInPage();
       try { window.scrollTo({ top: originalScrollY, behavior: "auto" }); } catch (_error) { window.scrollTo(0, originalScrollY); }
     }
+  }
+
+  function setEditableValue(element, value) {
+    element.focus();
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+      const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(element, value); else element.value = value;
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+    if (element.isContentEditable || element.getAttribute?.("contenteditable") === "true") {
+      element.textContent = value;
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    }
+  }
+
+  async function fillCommentReply(message = {}) {
+    const note = message.note || {};
+    const comment = message.comment || {};
+    const reply = clean(message.reply, 600);
+    if (!note.noteId || !comment.commentId || !reply) return { ok: false, error: "回复参数不完整" };
+    const detail = extractCurrentDetail(note);
+    if (!detail.ok || detail.note.noteId !== note.noteId) return { ok: false, error: "当前打开的不是目标帖子" };
+    const root = detailRootForNote(note) || document;
+    let target = commentUtils.findCommentElement(root, comment);
+    if (!target) {
+      for (let round = 0; round < 3 && !target; round += 1) {
+        const buttons = commentUtils.expandableButtons(root).slice(0, 20);
+        buttons.forEach((button) => button.click());
+        await waitFor(500);
+        target = commentUtils.findCommentElement(root, comment);
+      }
+    }
+    if (!target) return { ok: false, error: "页面中尚未找到对应评论，请滚动到该评论附近后重试" };
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    await waitFor(280);
+    const replyButton = commentUtils.replyButtonFor(target);
+    if (!replyButton) return { ok: false, error: "没有找到该评论的回复按钮" };
+    replyButton.click();
+    await waitFor(350);
+    const scopedRoot = target.closest?.(".parent-comment, [class*='parent-comment'], [class*='comment-thread']") || root;
+    const selectors = [
+      "textarea[placeholder*='回复']", "textarea", "[contenteditable='true'][data-placeholder*='回复']",
+      "[contenteditable='true'][placeholder*='回复']", "[contenteditable='true']"
+    ];
+    let editor = null;
+    for (const selector of selectors) {
+      const candidates = [...scopedRoot.querySelectorAll?.(selector) || [], ...root.querySelectorAll?.(selector) || []];
+      editor = candidates.find((element) => element.offsetParent !== null && !element.closest?.(`.${PROCESS_PANEL_CLASS}`));
+      if (editor) break;
+    }
+    if (!editor) return { ok: false, error: "回复框尚未出现，请再试一次" };
+    setEditableValue(editor, reply);
+    editor.scrollIntoView({ behavior: "smooth", block: "center" });
+    return { ok: true, commentId: comment.commentId, inserted: true, sent: false };
   }
 
   function autoDetailEligible(note) {
@@ -2102,6 +2180,10 @@
     }
     if (message.type === "readNoteInPage") {
       readNoteInPage(message.note || {}).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
+    if (message.type === "fillCommentReply") {
+      fillCommentReply(message).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
       return true;
     }
     if (message.type === "resolveNoteUrl") {
