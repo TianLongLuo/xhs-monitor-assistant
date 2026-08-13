@@ -328,14 +328,19 @@
     // cannot swallow the gesture or trigger a new card scan.
     panel.addEventListener("wheel", (event) => {
       if (panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`)) return;
+      const origin = event.target instanceof Element ? event.target : panel;
+      const nested = origin.closest(
+        `.${PROCESS_PANEL_CLASS}__fields, .${PROCESS_PANEL_CLASS}__comments`
+      );
+      const viewport = nested && panel.contains(nested) ? nested : panel;
       const delta = event.deltaMode === 1 ? event.deltaY * 16
-        : event.deltaMode === 2 ? event.deltaY * panel.clientHeight
+        : event.deltaMode === 2 ? event.deltaY * viewport.clientHeight
           : event.deltaY;
-      const maxScroll = Math.max(0, panel.scrollHeight - panel.clientHeight);
+      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
       if (!maxScroll || !Number.isFinite(delta) || delta === 0) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      panel.scrollTop = Math.max(0, Math.min(maxScroll, panel.scrollTop + delta));
+      viewport.scrollTop = Math.max(0, Math.min(maxScroll, viewport.scrollTop + delta));
     }, { capture: true, passive: false });
     panel.addEventListener("touchmove", (event) => event.stopPropagation(), { capture: true, passive: true });
   }
