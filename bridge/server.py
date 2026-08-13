@@ -2520,12 +2520,20 @@ class MonitorStore:
                             managed_media_dirs.append(resolved_candidate)
 
             tombstones: list[tuple[Path, Path]] = []
-            for index, resolved_media in enumerate(managed_media_dirs, 1):
-                tombstone = resolved_media.with_name(
-                    f".{resolved_media.name}.deleting-{os.getpid()}-{time.time_ns()}-{index}"
-                )
-                resolved_media.rename(tombstone)
-                tombstones.append((resolved_media, tombstone))
+            try:
+                for index, resolved_media in enumerate(managed_media_dirs, 1):
+                    tombstone = resolved_media.with_name(
+                        f".{resolved_media.name}.deleting-{os.getpid()}-{time.time_ns()}-{index}"
+                    )
+                    resolved_media.rename(tombstone)
+                    tombstones.append((resolved_media, tombstone))
+            except OSError:
+                # If a later sibling is locked, put every directory already
+                # moved in this preparation phase back before aborting.
+                for original_media, tombstone in reversed(tombstones):
+                    if tombstone.exists() and not original_media.exists():
+                        tombstone.rename(original_media)
+                raise
             workbook = None
             temporary_path: Path | None = None
             backup_path: Path | None = None
