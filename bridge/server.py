@@ -2503,14 +2503,29 @@ class MonitorStore:
 
             media_dir = Path(text(note_row["media_dir"], 4000)).expanduser() if text(note_row["media_dir"], 4000) else None
             media_root = self._media_root().resolve()
-            tombstone: Path | None = None
+            managed_media_dirs: list[Path] = []
             if media_dir and media_dir.exists():
                 resolved_media = media_dir.resolve()
                 if resolved_media.parent != media_root:
                     raise ValueError("素材目录不在受管 posts_materials 目录内，已停止删除")
-                tombstone = resolved_media.with_name(f".{resolved_media.name}.deleting-{os.getpid()}-{time.time_ns()}")
-                resolved_media.rename(tombstone)
+                managed_media_dirs.append(resolved_media)
+            # Include stale title-based folders left by older releases. The
+            # exact note-ID suffix keeps this scoped to the same logical note.
+            if media_root.exists():
+                suffix = f"__{note_id}"
+                for candidate in media_root.iterdir():
+                    if candidate.is_dir() and candidate.name.endswith(suffix):
+                        resolved_candidate = candidate.resolve()
+                        if resolved_candidate not in managed_media_dirs:
+                            managed_media_dirs.append(resolved_candidate)
 
+            tombstones: list[tuple[Path, Path]] = []
+            for index, resolved_media in enumerate(managed_media_dirs, 1):
+                tombstone = resolved_media.with_name(
+                    f".{resolved_media.name}.deleting-{os.getpid()}-{time.time_ns()}-{index}"
+                )
+                resolved_media.rename(tombstone)
+                tombstones.append((resolved_media, tombstone))
             workbook = None
             temporary_path: Path | None = None
             backup_path: Path | None = None
@@ -2579,15 +2594,20 @@ class MonitorStore:
                     db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
 
                 logical_delete_committed = True
-                if tombstone and tombstone.exists():
+                cleanup_errors: list[str] = []
+                for _original_media, tombstone in tombstones:
+                    if not tombstone.exists():
+                        continue
                     try:
                         shutil.rmtree(tombstone)
-                        media_deleted = True
                     except OSError as exc:
-                        # Excel and SQLite have already committed. Restoring only
-                        # Excel here would split the sources of truth; keep the
-                        # hidden tombstone for a later cleanup and report it.
-                        media_cleanup_warning = f"素材目录已移出但清理失败：{text(exc, 300)}"
+                        cleanup_errors.append(f"{tombstone.name}: {text(exc, 220)}")
+                media_deleted = bool(tombstones) and not cleanup_errors
+                if cleanup_errors:
+                    # Excel and SQLite have already committed. Restoring only
+                    # Excel here would split the sources of truth; keep hidden
+                    # tombstones for a later cleanup and report every failure.
+                    media_cleanup_warning = "素材目录已移出但清理失败：" + "；".join(cleanup_errors)
                 if backup_path and backup_path.exists():
                     backup_path.unlink()
                 return {
@@ -2597,14 +2617,15 @@ class MonitorStore:
                     "deletedDatabaseComments": len(comment_ids),
                     "mediaDeleted": media_deleted,
                     "mediaCleanupWarning": media_cleanup_warning,
-                    "mediaTombstone": str(tombstone) if media_cleanup_warning and tombstone else "",
+                    "mediaTombstone": ";".join(str(path) for _original, path in tombstones if path.exists()),
                 }
             except Exception:
                 if not logical_delete_committed:
                     if backup_path and backup_path.exists():
                         os.replace(backup_path, xlsx_path)
-                    if tombstone and tombstone.exists() and media_dir and not media_dir.exists():
-                        tombstone.rename(media_dir)
+                    for original_media, tombstone in reversed(tombstones):
+                        if tombstone.exists() and not original_media.exists():
+                            tombstone.rename(original_media)
                 raise
             finally:
                 if workbook is not None:
