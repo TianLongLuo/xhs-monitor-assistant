@@ -6,7 +6,7 @@
     <title>XHS-Monitor 帖子核对</title>
     <link rel="stylesheet" href="sidepanel.css">
   </head>
-  <body>
+  <body class="gathered-zine-ui">
     <main class="shell">
       <header class="brand-header">
         <div class="brand-mark" aria-hidden="true">O</div>
@@ -80,6 +80,11 @@
           <span class="page-badge">DOM</span>
         </div>
         <div id="currentDetailCard" class="current-detail-card" hidden>
+          <div id="currentDetailVisual" class="current-detail-card__visual" hidden aria-hidden="true">
+            <img id="currentDetailThumb" alt="" referrerpolicy="no-referrer">
+            <span>LIVE NOTE</span>
+          </div>
+          <div class="current-detail-card__body">
           <div class="current-detail-card__head">
             <div>
               <span class="current-detail-card__kicker">当前帖子</span>
@@ -99,6 +104,7 @@
             <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 Excel、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
           <p id="currentDetailHint" class="current-detail-card__hint">点击后会在放大帖子右侧显示 Process，逐步读取正文、图片、评论及 ID。</p>
+          </div>
         </div>
         <ol id="scanStages" class="scan-stages" hidden aria-label="扫描进度">
           <li data-stage="cards"><span>1</span><strong>读取卡片</strong><small>标题与元数据</small></li>

@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "minimum_chrome_version": "114",
   "name": "小红书舆情监控助手",
-  "version": "0.17.0",
-  "description": "为当前小红书页面的帖子提供同页详情拉取、Process 进度面板、卡片框选与可选悬浮窗，把正文、图片和评论幂等写入本地 Excel 与 SQLite。",
+  "version": "0.18.0",
+  "description": "为小红书帖子提供同页核对、Gathered Scenes 证据流 UI、Process 进度、完整素材与评论采集，并幂等写入本地 Excel / SQLite。",
   "permissions": [
     "storage",
     "nativeMessaging",

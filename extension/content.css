@@ -727,3 +727,259 @@
 .xhs-monitor-process--done .xhs-monitor-process__head { background: #fff; }
 .xhs-monitor-process--error .xhs-monitor-process__head { background: #fff7f5; }
 .xhs-monitor-process--collapsed { border-radius: 12px; min-width: 250px; }
+
+/* v0.18 — Gathered Scenes evidence-process panel */
+.xhs-monitor-process {
+  --process-paper: #f2ede3;
+  --process-surface: #fffdf8;
+  --process-ink: #17382f;
+  --process-muted: #716f68;
+  --process-line: #d7cfc0;
+  --process-moss: #2f6658;
+  --process-honey: #ef5b3f;
+  --process-thread: #ef5b3f;
+  --process-thread-dark: #c83e29;
+  --process-fiber: #c7baa8;
+  background:
+    radial-gradient(circle at 90% 4%, rgba(239, 91, 63, .08), transparent 23%),
+    var(--process-paper);
+  border: 1px solid rgba(199, 186, 168, .9);
+  border-radius: 3px 15px 3px 9px;
+  box-shadow: 0 18px 48px rgba(43, 36, 28, .18);
+  color: var(--process-ink);
+  font-family: "Segoe UI Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  overflow: hidden auto;
+}
+
+.xhs-monitor-process::after {
+  background: linear-gradient(to bottom, var(--process-thread) 0 var(--signal-progress, 8%), var(--process-fiber) var(--signal-progress, 8%) 100%);
+  bottom: 11px;
+  left: 6px;
+  top: 11px;
+  width: 2px;
+}
+
+.xhs-monitor-process[data-position="outside"]::before {
+  background: var(--process-thread);
+  box-shadow: -5px -2px 0 -1px var(--process-thread), -3px 2px 0 -1px var(--process-thread);
+  height: 2px;
+  left: -10px;
+  top: 31px;
+  width: 10px;
+}
+
+.xhs-monitor-process__head {
+  background: rgba(255, 253, 248, .95);
+  border-bottom: 1px dashed var(--process-fiber);
+  color: var(--process-ink);
+  padding: 13px 10px 11px 16px;
+  backdrop-filter: blur(12px);
+}
+
+.xhs-monitor-process__eyebrow {
+  color: var(--process-thread-dark);
+  font: 800 8px/1 "Cascadia Mono", Consolas, monospace;
+  letter-spacing: .15em;
+}
+
+.xhs-monitor-process__title {
+  font-family: "STSong", "Songti SC", "SimSun", Georgia, serif;
+  font-size: 15px;
+  letter-spacing: .01em;
+}
+
+.xhs-monitor-process__status {
+  color: var(--process-muted);
+  font: 8px/1.45 "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__pull,
+.xhs-monitor-process__collapse,
+.xhs-monitor-process__close {
+  background: var(--process-surface);
+  border-color: var(--process-line);
+  border-radius: 50%;
+  color: var(--process-ink);
+}
+
+.xhs-monitor-process__pull {
+  background: var(--process-thread);
+  border-color: var(--process-thread);
+  border-radius: 2px 8px 2px 8px;
+  color: #fff;
+  font: 800 8px/1 "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__pull:hover:not(:disabled),
+.xhs-monitor-process__collapse:hover,
+.xhs-monitor-process__close:hover {
+  background: var(--process-thread-dark);
+  border-color: var(--process-thread-dark);
+  color: #fff;
+}
+
+.xhs-monitor-process__head-state {
+  background: transparent;
+  border-color: var(--process-line);
+  border-radius: 2px 7px 2px 7px;
+  color: var(--process-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__head-state[data-state="missing"],
+.xhs-monitor-process__head-state[data-state="unknown"] {
+  background: #fbe8df;
+  border-color: rgba(239, 91, 63, .38);
+  color: var(--process-thread-dark);
+}
+
+.xhs-monitor-process__head-state[data-state="pulled"],
+.xhs-monitor-process__head-state[data-state="relevant"] {
+  background: #e7ece5;
+  border-color: #c8d2c9;
+  color: var(--process-ink);
+}
+
+.xhs-monitor-process__target {
+  background: var(--process-surface);
+  border-bottom: 1px solid var(--process-line);
+  padding: 12px 11px 11px 16px;
+  position: relative;
+}
+
+.xhs-monitor-process__target::after {
+  background: linear-gradient(135deg, transparent 0 4px, var(--process-paper) 4px 8px, transparent 8px 11px) 0 0 / 100% 14px repeat-y;
+  bottom: 3px;
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: 3px;
+  width: 8px;
+}
+
+.xhs-monitor-process__target-title {
+  font-family: "STSong", "Songti SC", "SimSun", Georgia, serif;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.xhs-monitor-process__target-id {
+  color: var(--process-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__progress {
+  background: #ddd5c8;
+  height: 3px;
+}
+
+.xhs-monitor-process__progress-bar {
+  background: var(--process-thread);
+}
+
+.xhs-monitor-process__steps {
+  background: rgba(255, 253, 248, .9);
+  border-bottom: 1px dashed var(--process-fiber);
+  padding: 9px 10px 9px 16px;
+}
+
+.xhs-monitor-process__steps li:not(:last-child)::after {
+  background: var(--process-fiber);
+  left: 9px;
+}
+
+.xhs-monitor-process__step-marker {
+  background: var(--process-surface);
+  border: 1px solid var(--process-fiber);
+  color: var(--process-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__steps li[data-state="active"] .xhs-monitor-process__step-marker,
+.xhs-monitor-process__steps li[data-state="done"] .xhs-monitor-process__step-marker {
+  background: var(--process-thread);
+  border-color: var(--process-thread);
+  color: #fff;
+}
+
+.xhs-monitor-process__step-copy strong {
+  font-family: "STSong", "Songti SC", "SimSun", Georgia, serif;
+  font-size: 10px;
+}
+
+.xhs-monitor-process__step-copy small,
+.xhs-monitor-process__step-open {
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__step-open {
+  background: transparent;
+  border-color: var(--process-fiber);
+  border-radius: 2px 7px 2px 7px;
+  color: var(--process-ink);
+}
+
+.xhs-monitor-process__step-open:hover:not(:disabled) {
+  background: var(--process-thread);
+  border-color: var(--process-thread);
+  color: #fff;
+}
+
+.xhs-monitor-process__section {
+  background: rgba(255, 253, 248, .84);
+  border-top: 1px dashed var(--process-fiber);
+  padding: 10px 10px 10px 16px;
+}
+
+.xhs-monitor-process__section-head strong {
+  font-family: "STSong", "Songti SC", "SimSun", Georgia, serif;
+  font-size: 10px;
+}
+
+.xhs-monitor-process__field-count,
+.xhs-monitor-process__comment-count {
+  background: #fbe8df;
+  border-radius: 2px 7px 2px 7px;
+  color: var(--process-thread-dark);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__fields,
+.xhs-monitor-process__comments {
+  background: var(--process-surface);
+  border-color: var(--process-line);
+  border-radius: 2px 9px 2px 7px;
+}
+
+.xhs-monitor-process__field,
+.xhs-monitor-process__comment {
+  border-bottom-color: #e8e0d5;
+}
+
+.xhs-monitor-process__field > span,
+.xhs-monitor-process__field > strong,
+.xhs-monitor-process__comment code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.xhs-monitor-process__foot {
+  background: rgba(242, 237, 227, .84);
+  border-top: 1px dashed var(--process-fiber);
+  color: var(--process-muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  padding-left: 16px;
+}
+
+.xhs-monitor-process--error .xhs-monitor-process__head {
+  background: #fff0ea;
+}
+
+.xhs-monitor-process--collapsed {
+  border-radius: 3px 13px 3px 9px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .xhs-monitor-process *,
+  .xhs-monitor-process *::before,
+  .xhs-monitor-process *::after { transition-duration: .01ms !important; }
+}

@@ -2007,7 +2007,7 @@
         sendResponse({ ok: false, matchesTarget: false, currentNoteId, error: "当前详情不是目标帖子" });
         return false;
       }
-      const result = commentUtils.extractComments(document, message.note || {});
+      const result = commentUtils.extractComments(detailRoot || document, message.note || {});
       sendResponse({ ok: true, matchesTarget: !targetNoteId || targetNoteId === currentNoteId, currentNoteId, ...result });
       return false;
     }

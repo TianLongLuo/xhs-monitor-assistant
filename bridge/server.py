@@ -37,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -703,7 +703,7 @@ class MonitorStore:
             # browser can distinguish an actual Excel row from a discovery
             # record that only lives in SQLite.
             db.execute(
-                """UPDATE notes SET pull_status='synced', pull_error='', relevance_status='relevant', relevance_source='excel', relevance_status='relevant', relevance_source='excel',
+                """UPDATE notes SET pull_status='synced', pull_error='', relevance_status='relevant', relevance_source='excel',
                    excel_synced_at=?, excel_sync_path=?
                    WHERE source='existing_xlsx'""",
                 (timestamp, str(xlsx_path)),
@@ -2036,6 +2036,43 @@ class MonitorStore:
         title = re.sub(r"\s+", " ", title)[:80].strip(" .") or "未命名帖子"
         return f"{title}__{note_id}"
 
+    def _resolve_media_folder(self, note: dict[str, Any]) -> Path:
+        """Reuse or rename the folder already associated with this note ID.
+
+        A title can be improved after a deep read. Resolving by note ID before
+        creating the title-based folder prevents the corrected title from
+        producing a second material directory for the same note.
+        """
+        root = self._media_root()
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / self._safe_media_folder_name(note)
+        if target.is_dir():
+            return target
+
+        note_id = valid_note_id(note.get("noteId"))
+        if not note_id:
+            return target
+        suffix = f"__{note_id}"
+        try:
+            candidates = [path for path in root.iterdir() if path.is_dir() and path.name.endswith(suffix)]
+        except OSError:
+            return target
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            try:
+                candidate.rename(target)
+                return target
+            except OSError:
+                return target if target.is_dir() else candidate
+        if candidates:
+            def modified_at(path: Path) -> float:
+                try:
+                    return path.stat().st_mtime
+                except OSError:
+                    return 0.0
+            return max(candidates, key=modified_at)
+        return target
+
     @staticmethod
     def _media_extension(url: str, content_type: str = "") -> str:
         suffix = Path(urlparse(url).path).suffix.lower()
@@ -2055,7 +2092,7 @@ class MonitorStore:
         note_id = valid_note_id(note.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
-        folder = self._media_root() / self._safe_media_folder_name(note)
+        folder = self._resolve_media_folder(note)
         folder.mkdir(parents=True, exist_ok=True)
         files: list[str] = []
         errors: list[str] = []
@@ -2226,7 +2263,7 @@ class MonitorStore:
             existing_note_row = None
             matched_by = "new"
             for row_number in range(2, note_sheet.max_row + 1):
-                if text(note_sheet.cell(row_number, note_id_column).value, 128) == note_id:
+                if valid_note_id(note_sheet.cell(row_number, note_id_column).value) == note_id:
                     existing_note_row = row_number
                     matched_by = "note_id"
                     break
@@ -2301,6 +2338,7 @@ class MonitorStore:
             comment_id_column = comment_headers["笔记评论ID"]
             existing_comment_rows_by_id: dict[str, int] = {}
             existing_comment_rows_by_key: dict[tuple[str, str, str, str], int] = {}
+            existing_comment_rows_by_loose_key: dict[tuple[str, str, str], int] = {}
             for row_number in range(2, comment_sheet.max_row + 1):
                 row_id = text(comment_sheet.cell(row_number, comment_id_column).value, 256)
                 if row_id:
@@ -2317,6 +2355,7 @@ class MonitorStore:
                 )
                 if any(row_key):
                     existing_comment_rows_by_key[row_key] = row_number
+                    existing_comment_rows_by_loose_key[(row_key[0], row_key[1], row_key[2])] = row_number
 
             inserted_comments = 0
             duplicate_comments = 0
@@ -2333,6 +2372,11 @@ class MonitorStore:
                 row_number = existing_comment_rows_by_id.get(generated_id)
                 if row_number is None:
                     row_number = existing_comment_rows_by_key.get(comment_key)
+                # Older workbooks often have blank comment IDs or omit a
+                # timestamp. Note + author + exact content remains a stable,
+                # scoped fallback and prevents a retry from duplicating them.
+                if row_number is None:
+                    row_number = existing_comment_rows_by_loose_key.get(comment_key[:3])
                 is_new_comment = row_number is None
                 if is_new_comment:
                     row_number = max(2, comment_sheet.max_row + 1)
@@ -2359,6 +2403,7 @@ class MonitorStore:
                         comment_sheet.cell(row_number, column).value = value
                 existing_comment_rows_by_id[generated_id] = row_number
                 existing_comment_rows_by_key[comment_key] = row_number
+                existing_comment_rows_by_loose_key[comment_key[:3]] = row_number
                 if is_new_comment:
                     inserted_comments += 1
                 else:
@@ -2471,6 +2516,9 @@ class MonitorStore:
             backup_path: Path | None = None
             deleted_note_rows = 0
             deleted_comment_rows = 0
+            logical_delete_committed = False
+            media_deleted = False
+            media_cleanup_warning = ""
             try:
                 workbook = load_workbook(xlsx_path)
                 if "sheet1_笔记总表" not in workbook.sheetnames or "sheet2_评论总表" not in workbook.sheetnames:
@@ -2530,8 +2578,16 @@ class MonitorStore:
                     db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
                     db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
 
+                logical_delete_committed = True
                 if tombstone and tombstone.exists():
-                    shutil.rmtree(tombstone)
+                    try:
+                        shutil.rmtree(tombstone)
+                        media_deleted = True
+                    except OSError as exc:
+                        # Excel and SQLite have already committed. Restoring only
+                        # Excel here would split the sources of truth; keep the
+                        # hidden tombstone for a later cleanup and report it.
+                        media_cleanup_warning = f"素材目录已移出但清理失败：{text(exc, 300)}"
                 if backup_path and backup_path.exists():
                     backup_path.unlink()
                 return {
@@ -2539,13 +2595,16 @@ class MonitorStore:
                     "deletedNoteRows": deleted_note_rows,
                     "deletedCommentRows": deleted_comment_rows,
                     "deletedDatabaseComments": len(comment_ids),
-                    "mediaDeleted": bool(tombstone),
+                    "mediaDeleted": media_deleted,
+                    "mediaCleanupWarning": media_cleanup_warning,
+                    "mediaTombstone": str(tombstone) if media_cleanup_warning and tombstone else "",
                 }
             except Exception:
-                if backup_path and backup_path.exists():
-                    os.replace(backup_path, xlsx_path)
-                if tombstone and tombstone.exists() and media_dir and not media_dir.exists():
-                    tombstone.rename(media_dir)
+                if not logical_delete_committed:
+                    if backup_path and backup_path.exists():
+                        os.replace(backup_path, xlsx_path)
+                    if tombstone and tombstone.exists() and media_dir and not media_dir.exists():
+                        tombstone.rename(media_dir)
                 raise
             finally:
                 if workbook is not None:

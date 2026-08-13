@@ -17,6 +17,8 @@ const elements = {
   pageKeyword: document.getElementById("pageKeyword"),
   pageCount: document.getElementById("pageCount"),
   currentDetailCard: document.getElementById("currentDetailCard"),
+  currentDetailVisual: document.getElementById("currentDetailVisual"),
+  currentDetailThumb: document.getElementById("currentDetailThumb"),
   currentDetailTitle: document.getElementById("currentDetailTitle"),
   currentDetailState: document.getElementById("currentDetailState"),
   currentDetailMeta: document.getElementById("currentDetailMeta"),
@@ -151,7 +153,7 @@ function sendRuntime(message) {
 function friendlyTabError(error) {
   const message = String(error?.message || error || "未知错误");
   if (/Receiving end does not exist|Could not establish connection/i.test(message)) {
-    return new Error("插件尚未注入当前页面，请刷新小红书页面后重试");
+    return new Error("自动注入当前页面失败，请稍后重试或检查小红书页面权限");
   }
   return new Error(message);
 }
@@ -341,6 +343,20 @@ function renderCurrentDetail(note = null, loading = false) {
         ? `已读正文 ${contentLength} 字 · ${imageCount} 张图片；点击“拉取到 Excel”开始完整采集。`
         : "详情已打开，点击后会等待正文加载，再读取正文、素材图片、评论及 ID。";
 
+  const imageUrl = Array.isArray(currentDetailNote.imageUrls)
+    ? String(currentDetailNote.imageUrls.find(Boolean) || "")
+    : "";
+  if (elements.currentDetailVisual && elements.currentDetailThumb) {
+    elements.currentDetailVisual.hidden = !imageUrl;
+    if (imageUrl) {
+      elements.currentDetailThumb.src = imageUrl;
+      elements.currentDetailThumb.alt = `${title} 的首张素材`;
+      elements.currentDetailThumb.onerror = () => { elements.currentDetailVisual.hidden = true; };
+    } else {
+      elements.currentDetailThumb.removeAttribute("src");
+      elements.currentDetailThumb.alt = "";
+    }
+  }
   elements.currentDetailTitle.textContent = title;
   elements.currentDetailTitle.title = title;
   elements.currentDetailState.textContent = state.label;
@@ -369,6 +385,7 @@ async function deleteLocalNote(note, button = null) {
   if (!noteId) throw new Error("缺少帖子 ID，无法删除");
   const title = note.title || "该帖子";
   if (!confirm(`确定彻底删除“${title}”吗？\n\n将同时删除：\n• Excel 帖子整行及其全部评论行\n• SQLite 帖子、评论和分析记录\n• 对应素材目录\n\n此操作不可撤销。`)) return null;
+  const originalButtonText = button?.textContent || "删除本地帖子";
   if (button) {
     button.disabled = true;
     button.textContent = "删除中…";
@@ -382,8 +399,8 @@ async function deleteLocalNote(note, button = null) {
       renderCurrentDetail(currentDetailNote, false);
     }
     setStatus(
-      `删除完成：Excel 删除 ${result.deletedNoteRows || 0} 条帖子、${result.deletedCommentRows || 0} 条评论${result.mediaDeleted ? "，素材目录已删除" : ""}`,
-      "success"
+      `删除完成：Excel 删除 ${result.deletedNoteRows || 0} 条帖子、${result.deletedCommentRows || 0} 条评论${result.mediaDeleted ? "，素材目录已删除" : ""}${result.mediaCleanupWarning ? `；${result.mediaCleanupWarning}` : ""}`,
+      result.mediaCleanupWarning ? "warning" : "success"
     );
     await Promise.all([refreshStats(), refreshPending(), loadPageInfo()]);
     if (queueView.type === "status") await showStatusView(queueView.status || "known");
@@ -391,7 +408,7 @@ async function deleteLocalNote(note, button = null) {
   } finally {
     if (button?.isConnected) {
       button.disabled = false;
-      button.textContent = "删除本地帖子";
+      button.textContent = originalButtonText;
     }
   }
 }
