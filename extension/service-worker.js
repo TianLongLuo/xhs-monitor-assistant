@@ -674,7 +674,7 @@ async function collectComments(note) {
       const activeTab = await activeXhsTab();
       if (!activeTab?.id) throw new Error("找不到当前小红书页面");
       const extracted = await chrome.tabs.sendMessage(activeTab.id, {
-        type: "readNoteInPage", note
+        type: "readNoteInPage", note: { ...note, allComments: true }
       }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
       if (!extracted?.ok) throw new Error(extracted?.error || "评论区尚未加载完成");
       const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/upsert"), {
@@ -780,7 +780,7 @@ async function summarizeCurrentNote(note, preferredTabId = null) {
     const activeTab = await activeXhsTab(preferredTabId);
     if (!activeTab?.id) throw new Error("找不到当前小红书页面");
     const extracted = await sendTabMessage(activeTab.id, {
-      type: "readNoteInPage", note: { ...note, showProcess: false, process: false }
+      type: "readNoteInPage", note: { ...note, showProcess: false, process: false, allComments: true }
     }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
     if (!extracted?.ok || !extracted.note?.content) {
       throw new Error(extracted?.error || "正文尚未读取成功");
@@ -856,7 +856,7 @@ async function pullNote(note, preferredTabId = null) {
       }, progressTabId);
       const inline = await chrome.tabs.sendMessage(activeTab.id, {
         type: "readNoteInPage",
-        note: { ...note, noteId, showProcess }
+        note: { ...note, noteId, showProcess, allComments: true }
       }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
       if (!inline?.ok || !inline.note?.content) {
         throw new Error(inline?.error || "当前页面尚未读到完整正文，请先让帖子卡片和详情层加载完成");

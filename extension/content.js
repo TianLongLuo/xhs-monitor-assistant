@@ -1653,8 +1653,20 @@
       const originalCommentScroll = Number(commentScroller?.scrollTop || 0);
       let priorExtractedCount = -1;
       let stagnantRounds = 0;
-      for (let round = 0; round < (allComments ? 28 : 4); round += 1) {
-        const buttons = commentUtils.expandableButtons(commentRoot).slice(0, 16);
+      const collectedComments = new Map();
+      let largestExpectedCount = 0;
+      const collectSnapshot = () => {
+        const snapshot = commentUtils.extractComments(commentRoot, detail.note);
+        largestExpectedCount = Math.max(largestExpectedCount, Number(snapshot.expectedCount || 0));
+        for (const item of snapshot.comments || []) {
+          const key = item.commentId || [item.parentCommentId, item.author, item.content, item.publishedAt].join("\u001f");
+          collectedComments.set(key, { ...(collectedComments.get(key) || {}), ...item });
+        }
+        return snapshot;
+      };
+      collectSnapshot();
+      for (let round = 0; round < (allComments ? 60 : 4); round += 1) {
+        const buttons = commentUtils.expandableButtons(commentRoot).slice(0, 24);
         buttons.forEach((button) => button.click());
         totalClicked += buttons.length;
         if (showProcess) updateProcessPanel({
@@ -1668,10 +1680,10 @@
           if (!buttons.length) break;
           continue;
         }
-        const snapshot = commentUtils.extractComments(commentRoot, detail.note);
-        if (snapshot.expectedCount > 0 && snapshot.comments.length >= snapshot.expectedCount) break;
-        stagnantRounds = snapshot.comments.length === priorExtractedCount ? stagnantRounds + 1 : 0;
-        priorExtractedCount = snapshot.comments.length;
+        const snapshot = collectSnapshot();
+        if (largestExpectedCount > 0 && collectedComments.size >= largestExpectedCount) break;
+        stagnantRounds = collectedComments.size === priorExtractedCount ? stagnantRounds + 1 : 0;
+        priorExtractedCount = collectedComments.size;
         const scroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']") || commentScroller;
         if (scroller) {
           const before = scroller.scrollTop;
@@ -1685,11 +1697,16 @@
       if (refreshed?.ok) detail = refreshed;
       commentRoot = detailRootForNote(detail.note) || document;
       const extracted = commentUtils.extractComments(commentRoot, detail.note);
-      const expectedCount = Number(extracted.expectedCount || 0);
-      const commentStatus = expectedCount === 0 && extracted.comments.length === 0
+      for (const item of extracted.comments || []) {
+        const key = item.commentId || [item.parentCommentId, item.author, item.content, item.publishedAt].join("\u001f");
+        collectedComments.set(key, { ...(collectedComments.get(key) || {}), ...item });
+      }
+      const finalComments = allComments ? [...collectedComments.values()] : extracted.comments;
+      const expectedCount = Math.max(largestExpectedCount, Number(extracted.expectedCount || 0));
+      const commentStatus = expectedCount === 0 && finalComments.length === 0
         ? "likely_complete"
-        : (extracted.status || "partial");
-      const commentsWithIds = await ensureCommentIds(detail.note, extracted.comments || []);
+        : expectedCount > 0 && finalComments.length >= expectedCount ? "likely_complete" : "partial";
+      const commentsWithIds = await ensureCommentIds(detail.note, finalComments || []);
       if (allComments && commentScroller) commentScroller.scrollTop = originalCommentScroll;
       if (showProcess) updateProcessPanel({
         process: true, noteId: note.noteId, phase: "media",
@@ -1703,7 +1720,7 @@
         comments: commentsWithIds,
         expectedCount,
         status: commentStatus,
-        commentError: commentStatus === "partial" ? "当前页面只读取到已加载评论，可稍后重试" : "",
+        commentError: commentStatus === "partial" ? `当前读取 ${commentsWithIds.length}/${expectedCount || "?"} 条，仍有回复未加载，可再次补采` : "",
         expandedCount: totalClicked
       };
     } catch (error) {

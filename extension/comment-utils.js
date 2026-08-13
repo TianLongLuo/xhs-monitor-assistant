@@ -241,11 +241,14 @@
   }
 
   function expandableButtons(root) {
-    return Array.from(root.querySelectorAll?.("button, [role='button'], span") || []).filter((element) => {
+    const matched = Array.from(root.querySelectorAll?.("button, [role='button'], span, a, div") || []).filter((element) => {
       if (element.offsetParent === null) return false;
       const label = clean(element.innerText || element.getAttribute?.("aria-label"), 80);
-      return /展开\s*\d*\s*条?回复|查看更多回复|更多回复|展开回复/.test(label);
+      return /^(?:展开(?:更多|全部|剩余)?\s*\d*\s*条?回复|查看(?:更多|全部|剩余)?\s*\d*\s*条?回复|更多回复|展开回复)$/.test(label);
     });
+    // XHS often wraps the visible label in several nested div/span nodes.
+    // Keep only the innermost clickable match so one group is clicked once.
+    return matched.filter((element) => !matched.some((other) => other !== element && element.contains(other)));
   }
 
   return {
