@@ -100,6 +100,7 @@
           </div>
           <div class="current-detail-card__actions">
             <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
+            <button id="currentDetailSummary" class="current-detail-card__summary" type="button">AI 总结</button>
             <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
             <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 Excel、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
@@ -238,6 +239,30 @@
         <span id="lastScan">尚未扫描</span>
       </footer>
     </main>
+    <section id="summaryPage" class="summary-page" hidden aria-label="帖子舆情总结">
+      <header class="summary-page__header">
+        <button id="summaryBack" type="button" aria-label="返回主页面">←</button>
+        <div><span>DEEPSEEK BRIEF</span><h2>正文与评论总结</h2></div>
+        <button id="summaryRerun" type="button">重新分析</button>
+      </header>
+      <div class="summary-page__context">
+        <strong id="summaryTitle">当前帖子</strong>
+        <span id="summaryMeta">等待分析</span>
+      </div>
+      <div id="summaryLoading" class="summary-loading" hidden>
+        <i></i><strong>DeepSeek 正在综合正文与评论区</strong><span>读取观点、共识、争议与品牌风险…</span>
+      </div>
+      <div id="summaryError" class="summary-error" hidden></div>
+      <article id="summaryResult" class="summary-result" hidden>
+        <section class="summary-hero"><span id="summarySentiment">待判断</span><p id="summaryOverview"></p></section>
+        <section><h3>正文核心</h3><ul id="summaryKeyPoints"></ul></section>
+        <section><h3>评论区共识</h3><ul id="summaryConsensus"></ul></section>
+        <section><h3>争议与分歧</h3><ul id="summaryDisagreements"></ul></section>
+        <section><h3>品牌风险</h3><ul id="summaryRisks"></ul></section>
+        <section><h3>建议动作</h3><ul id="summaryActions"></ul></section>
+        <section><h3>代表评论</h3><ul id="summaryComments"></ul></section>
+      </article>
+    </section>
     <script src="sidepanel.js"></script>
   </body>
 </html>

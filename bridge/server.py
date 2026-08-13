@@ -37,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.18.2"
+VERSION = "0.18.3"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -486,6 +486,15 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_ai_records_target
                     ON ai_analysis_records(target_type, target_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS note_summaries (
+                    note_id TEXT PRIMARY KEY,
+                    model TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    comment_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS ai_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1548,6 +1557,110 @@ class MonitorStore:
         result["sentimentLabel"] = sentiment_label(result.get("post_sentiment")) if result.get("post_sentiment") else ""
         return {"ok": True, **result}
 
+    def note_summary(self, note_id: str) -> dict[str, Any]:
+        note_id = valid_note_id(note_id)
+        if not note_id:
+            raise ValueError("noteId is required")
+        with self.lock, self._session() as db:
+            row = db.execute("SELECT * FROM note_summaries WHERE note_id=?", (note_id,)).fetchone()
+        if row is None:
+            return {"ok": True, "found": False, "noteId": note_id}
+        item = dict(row)
+        try:
+            result = json.loads(item.get("result_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+        return {"ok": True, "found": True, "noteId": note_id, "model": item.get("model", ""),
+                "commentCount": int(item.get("comment_count") or 0), "updatedAt": item.get("updated_at", ""),
+                "summary": result}
+
+    @staticmethod
+    def _normalized_note_summary(value: dict[str, Any]) -> dict[str, Any]:
+        def string_list(key: str, limit: int = 8) -> list[str]:
+            raw = value.get(key) or []
+            if not isinstance(raw, list):
+                raw = [raw]
+            return [text(item, 500) for item in raw if text(item, 500)][:limit]
+        sentiment = text(value.get("sentiment"), 40).lower() or "uncertain"
+        if sentiment not in {"negative", "light_negative", "neutral", "positive", "mixed", "uncertain"}:
+            sentiment = "uncertain"
+        return {
+            "overview": text(value.get("overview") or value.get("summary"), 2000),
+            "sentiment": sentiment,
+            "keyPoints": string_list("key_points"),
+            "commentConsensus": string_list("comment_consensus"),
+            "disagreements": string_list("disagreements"),
+            "risks": string_list("risks"),
+            "actions": string_list("actions"),
+            "representativeComments": string_list("representative_comments", 10),
+        }
+
+    def summarize_note(self, payload: dict[str, Any]) -> dict[str, Any]:
+        incoming = payload.get("note") if isinstance(payload.get("note"), dict) else {}
+        note_id = valid_note_id(incoming.get("noteId") or payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        comments = payload.get("comments") if isinstance(payload.get("comments"), list) else []
+        with self.lock, self._session() as db:
+            row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            if not comments:
+                comments = [dict(item) for item in db.execute(
+                    "SELECT comment_id,parent_comment_id,author,content,like_count,reply_count FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT 300",
+                    (note_id,),
+                ).fetchall()]
+        stored = dict(row) if row else {}
+        note = {**stored, **incoming}
+        title = canonical_note_title(note.get("title"), note.get("content"), 100)
+        content = text(note.get("content"), 16000)
+        if not content:
+            raise ValueError("帖子正文尚未读取")
+        compact_comments = []
+        total_chars = 0
+        for item in comments[:300]:
+            if not isinstance(item, dict):
+                continue
+            body = text(item.get("content"), 800)
+            if not body:
+                continue
+            total_chars += len(body)
+            if total_chars > 45000:
+                break
+            compact_comments.append({
+                "author": text(item.get("author"), 120), "content": body,
+                "parent_comment_id": text(item.get("parentCommentId") or item.get("parent_comment_id"), 128),
+                "like_count": int(item.get("likeCount") or item.get("like_count") or 0),
+            })
+        settings = self.ai_settings.get(True)
+        if not settings.get("configured"):
+            raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
+        schema = {
+            "overview": "200字内总览", "sentiment": "negative/light_negative/neutral/positive/mixed/uncertain",
+            "key_points": ["正文核心观点"], "comment_consensus": ["评论区共识"],
+            "disagreements": ["争议或分歧"], "risks": ["品牌风险"], "actions": ["建议动作"],
+            "representative_comments": ["有代表性的评论原文"]
+        }
+        messages = [
+            {"role": "system", "content": "你是中文品牌舆情分析员。必须综合帖子正文和评论区，只依据输入内容，严格输出一个有效 JSON 对象，不要 Markdown，不要编造。"},
+            {"role": "user", "content": "总结这篇小红书帖子正文与评论区。输出结构：%s。输入：%s" % (
+                json.dumps(schema, ensure_ascii=False),
+                json.dumps({"note_id": note_id, "title": title, "content": content,
+                            "tags": note.get("tags") or [], "comments": compact_comments}, ensure_ascii=False)
+            )},
+        ]
+        summary_settings = dict(settings)
+        summary_settings["max_tokens"] = min(8192, max(2600, int(settings.get("max_tokens") or 1800)))
+        result = self._normalized_note_summary(self.ai_client.complete_json(summary_settings, messages))
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            db.execute(
+                """INSERT INTO note_summaries(note_id,model,result_json,comment_count,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(note_id) DO UPDATE SET model=excluded.model,
+                   result_json=excluded.result_json,comment_count=excluded.comment_count,updated_at=excluded.updated_at""",
+                (note_id, settings["model"], json.dumps(result, ensure_ascii=False), len(compact_comments), timestamp, timestamp),
+            )
+        return {"ok": True, "found": True, "noteId": note_id, "model": settings["model"],
+                "commentCount": len(compact_comments), "updatedAt": timestamp, "summary": result}
+
     def list_ai_jobs(self, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
         safe_status = status if status in {"queued", "analyzing", "completed", "failed"} else ""
         safe_limit = max(1, min(int(limit or 100), 500))
@@ -2105,6 +2218,15 @@ class MonitorStore:
         folder.mkdir(parents=True, exist_ok=True)
         files: list[str] = []
         errors: list[str] = []
+        skipped_files: list[str] = []
+        metadata_path = folder / "note.json"
+        previous: dict[str, Any] = {}
+        if metadata_path.is_file():
+            try:
+                loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+                previous = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError, json.JSONDecodeError):
+                previous = {}
         image_urls = []
         for value in note.get("imageUrls") or []:
             raw = text(value, 4000)
@@ -2119,6 +2241,43 @@ class MonitorStore:
                 continue
             video_urls.append(raw)
         video_urls = video_urls[:8]
+
+        def existing_for(kind: str, url: str, previous_urls: list[str], current_index: int) -> str:
+            try:
+                old_index = previous_urls.index(url) + 1
+            except ValueError:
+                return ""
+            candidates = sorted(folder.glob(f"{kind}-{old_index:02d}.*"))
+            for candidate in candidates:
+                try:
+                    if candidate.is_file() and candidate.stat().st_size > 0 and not candidate.name.endswith(".part"):
+                        desired = folder / f"{kind}-{current_index:02d}{candidate.suffix.lower()}"
+                        if desired != candidate:
+                            os.replace(candidate, desired)
+                            candidate = desired
+                        return candidate.name
+                except OSError:
+                    continue
+            return ""
+
+        previous_image_urls = [text(value, 4000) for value in previous.get("imageUrls") or [] if text(value, 4000)]
+        previous_video_urls = [text(value, 8000) for value in previous.get("videoUrls") or [] if text(value, 8000)]
+        # Remove only files managed by an earlier manifest and no longer
+        # belonging to this post. This cleans the old avatar-as-material bug
+        # without touching user-created files in the material directory.
+        for kind, old_urls, current_urls in (
+            ("image", previous_image_urls, image_urls), ("video", previous_video_urls, video_urls)
+        ):
+            if not current_urls:
+                continue
+            for old_index, old_url in enumerate(old_urls, 1):
+                if old_url in current_urls:
+                    continue
+                for stale in folder.glob(f"{kind}-{old_index:02d}.*"):
+                    try:
+                        stale.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         def download_one(index: int, image_url: str) -> tuple[int, str, str]:
             temporary: Path | None = None
@@ -2159,6 +2318,9 @@ class MonitorStore:
                     target = renamed
                 else:
                     os.replace(temporary, target)
+                for sibling in folder.glob(f"image-{index:02d}.*"):
+                    if sibling != target and not sibling.name.endswith(".part"):
+                        sibling.unlink(missing_ok=True)
                 return index, target.name, ""
             except Exception as exc:
                 try:
@@ -2169,12 +2331,20 @@ class MonitorStore:
                 return index, "", f"图片{index}: {text(exc, 300)}"
 
         download_results: list[tuple[int, str, str]] = []
-        if image_urls:
-            worker_count = min(6, len(image_urls))
+        image_tasks = []
+        for index, image_url in enumerate(image_urls, 1):
+            existing = existing_for("image", image_url, previous_image_urls, index)
+            if existing:
+                files.append(existing)
+                skipped_files.append(existing)
+            else:
+                image_tasks.append((index, image_url))
+        if image_tasks:
+            worker_count = min(6, len(image_tasks))
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-media") as executor:
                 futures = [
                     executor.submit(download_one, index, image_url)
-                    for index, image_url in enumerate(image_urls, 1)
+                    for index, image_url in image_tasks
                 ]
                 for future in as_completed(futures):
                     download_results.append(future.result())
@@ -2221,6 +2391,9 @@ class MonitorStore:
                 if target.suffix.lower() != extension:
                     target = target.with_suffix(extension)
                 os.replace(temporary, target)
+                for sibling in folder.glob(f"video-{index:02d}.*"):
+                    if sibling != target and not sibling.name.endswith(".part"):
+                        sibling.unlink(missing_ok=True)
                 return index, target.name, ""
             except Exception as exc:
                 try:
@@ -2231,12 +2404,20 @@ class MonitorStore:
                 return index, "", f"视频{index}: {text(exc, 300)}"
 
         video_results: list[tuple[int, str, str]] = []
-        if video_urls:
-            worker_count = min(2, len(video_urls))
+        video_tasks = []
+        for index, video_url in enumerate(video_urls, 1):
+            existing = existing_for("video", video_url, previous_video_urls, index)
+            if existing:
+                files.append(existing)
+                skipped_files.append(existing)
+            else:
+                video_tasks.append((index, video_url))
+        if video_tasks:
+            worker_count = min(2, len(video_tasks))
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xhs-video") as executor:
                 futures = [
                     executor.submit(download_video, index, video_url)
-                    for index, video_url in enumerate(video_urls, 1)
+                    for index, video_url in video_tasks
                 ]
                 for future in as_completed(futures):
                     video_results.append(future.result())
@@ -2254,10 +2435,11 @@ class MonitorStore:
             "tags": note.get("tags") or [],
             "imageUrls": image_urls,
             "videoUrls": video_urls,
+            "mediaFiles": sorted(set(files)),
             "mediaType": "video" if video_urls else "image",
             "pulledAt": now_iso(),
         }
-        (folder / "note.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         files.append("note.json")
         text_snapshot = "\n".join((
             canonical_note_title(note.get("title"), note.get("content"), 80),
@@ -2276,6 +2458,8 @@ class MonitorStore:
             "imageCount": len([name for name in files if name.startswith("image-")]),
             "videoCount": len([name for name in files if name.startswith("video-")]),
             "fileCount": len(files),
+            "downloadedCount": len(download_results) + len(video_results),
+            "skippedCount": len(skipped_files),
             "error": "；".join(errors),
         }
 
@@ -3119,6 +3303,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 note_id = text(query.get("noteId", [""])[0], 128)
                 self._send_json(200, self.store.note_analysis(note_id))
+            elif parsed.path == "/api/ai/summary":
+                query = parse_qs(parsed.query)
+                note_id = text(query.get("noteId", [""])[0], 128)
+                self._send_json(200, self.store.note_summary(note_id))
             elif parsed.path == "/api/ai/jobs":
                 query = parse_qs(parsed.query)
                 status = text(query.get("status", [""])[0], 20)
@@ -3177,6 +3365,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.save_ai_settings(payload)
             elif self.path == "/api/ai/test":
                 result = self.store.test_ai_connection(payload)
+            elif self.path == "/api/ai/summary":
+                result = self.store.summarize_note(payload)
             elif self.path in {"/api/ai/analyze", "/api/ai/retry"}:
                 result = self.store.enqueue_ai(
                     text(payload.get("targetType"), 20), text(payload.get("targetId"), 256),

@@ -975,7 +975,42 @@
     return [...new Set(values)].join(" ").slice(0, 6000);
   }
 
-  function extractImageUrls(root, limit = 32) {
+  function isAvatarOrUiImage(image) {
+    if (!image) return true;
+    const url = String(image.currentSrc || image.getAttribute?.("src") || "");
+    if (/sns-avatar|\/avatar\/|avatar-item|head(?:img|image)/i.test(url)) return true;
+    if (image.closest?.('.avatar, [class*="avatar"], [class*="comment"], [class*="author"], [class*="profile"], a[href*="/user/profile/"]')) return true;
+    const rect = image.getBoundingClientRect?.() || { width: 0, height: 0 };
+    const width = Math.max(Number(image.naturalWidth) || 0, Number(rect.width) || 0);
+    const height = Math.max(Number(image.naturalHeight) || 0, Number(rect.height) || 0);
+    return width > 0 && height > 0 && width < 180 && height < 180;
+  }
+
+  function detailMediaRoot(detailRoot) {
+    if (!detailRoot) return null;
+    const shell = detailRoot.matches?.("#noteContainer") ? detailRoot : detailRoot.closest?.("#noteContainer") || detailRoot;
+    const selectors = [
+      ":scope > .media-container", ".media-container", ".xhs-slider-container", ".note-slider",
+      "[class*='video-container']", "[class*='video-player']", "[class*='player-container']"
+    ];
+    for (const selector of selectors) {
+      const candidate = shell.querySelector?.(selector);
+      if (candidate && !candidate.closest?.('.interaction-container, [class*="comment"]')) return candidate;
+    }
+    const video = shell.querySelector?.("video");
+    if (video) {
+      let candidate = video.parentElement;
+      while (candidate?.parentElement && candidate.parentElement !== shell) {
+        const rect = candidate.getBoundingClientRect?.();
+        if (rect?.width >= 320 && rect?.height >= 180) return candidate;
+        candidate = candidate.parentElement;
+      }
+      return video.parentElement || shell;
+    }
+    return shell;
+  }
+
+  function extractImageUrls(root, limit = 32, strict = false) {
     const values = [];
     const add = (value) => {
       const raw = clean(value, 4000);
@@ -993,13 +1028,13 @@
       }
     };
     for (const image of root?.querySelectorAll?.("img") || []) {
+      if (strict && isAvatarOrUiImage(image)) continue;
       add(image.currentSrc);
       add(image.getAttribute("src"));
       add(image.getAttribute("data-src"));
       add(image.getAttribute("data-original"));
       addSrcSet(image.getAttribute("srcset"));
       addSrcSet(image.getAttribute("data-srcset"));
-      if (image.parentElement?.matches?.("a[href]")) add(image.parentElement.getAttribute("href"));
       if (values.length >= limit * 2) break;
     }
     for (const link of root?.querySelectorAll?.("a[href]") || []) {
@@ -1045,6 +1080,19 @@
       for (const entry of performance.getEntriesByType?.("resource") || []) {
         const url = String(entry?.name || "");
         if (/\.(?:mp4|m4v|mov|webm)(?:[?#]|$)|sns-video|video\/tos|video-cdn|stream/i.test(url)) add(url);
+      }
+      // Newer XHS players sometimes keep a blob: currentSrc while the signed
+      // CDN URL remains serialized in the page state script.
+      for (const script of document.scripts || []) {
+        const source = String(script.textContent || "");
+        if (!source || source.length > 12_000_000) continue;
+        const normalized = source.replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+        for (const match of normalized.matchAll(/https?:\/\/[^\s"'<>\\]+/g)) {
+          const candidate = match[0].replace(/&amp;/g, "&");
+          if (/\.mp4(?:[?#]|$)|sns-video|video\/tos|video-cdn|stream/i.test(candidate)) add(candidate);
+          if (values.length >= limit) break;
+        }
+        if (values.length >= limit) break;
       }
     }
     return [...new Set(values)].slice(-limit);
@@ -1280,9 +1328,9 @@
     const authorLink = detailRoot.querySelector?.("a[href*='/user/profile/']") || document.querySelector("a[href*='/user/profile/']");
     const metadata = processDetailMetadata(detailRoot);
     const tags = description.element ? extractTags(description.element, content) : [];
-    const mediaRoot = detailRoot.querySelector?.(".media-container") || detailRoot;
-    const imageUrls = extractImageUrls(mediaRoot || detailRoot, 32);
-    const videoUrls = extractVideoUrls(mediaRoot || detailRoot, 8);
+    const mediaRoot = detailMediaRoot(detailRoot);
+    const imageUrls = extractImageUrls(mediaRoot, 32, true);
+    const videoUrls = extractVideoUrls(mediaRoot, 8);
     const authorUrl = noteUtils.normalizeXhsUrl(authorLink?.href || baseNote.authorUrl || "");
     return {
       ok: true,

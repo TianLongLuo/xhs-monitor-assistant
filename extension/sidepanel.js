@@ -26,6 +26,7 @@ const elements = {
   currentDetailRelevance: document.getElementById("currentDetailRelevance"),
   currentDetailAnalyze: document.getElementById("currentDetailAnalyze"),
   currentDetailPull: document.getElementById("currentDetailPull"),
+  currentDetailSummary: document.getElementById("currentDetailSummary"),
   currentDetailRefresh: document.getElementById("currentDetailRefresh"),
   currentDetailDelete: document.getElementById("currentDetailDelete"),
   currentDetailHint: document.getElementById("currentDetailHint"),
@@ -100,7 +101,23 @@ const elements = {
   testAI: document.getElementById("testAI"),
   saveAI: document.getElementById("saveAI"),
   clearAIHistory: document.getElementById("clearAIHistory"),
-  lastScan: document.getElementById("lastScan")
+  lastScan: document.getElementById("lastScan"),
+  summaryPage: document.getElementById("summaryPage"),
+  summaryBack: document.getElementById("summaryBack"),
+  summaryRerun: document.getElementById("summaryRerun"),
+  summaryTitle: document.getElementById("summaryTitle"),
+  summaryMeta: document.getElementById("summaryMeta"),
+  summaryLoading: document.getElementById("summaryLoading"),
+  summaryError: document.getElementById("summaryError"),
+  summaryResult: document.getElementById("summaryResult"),
+  summarySentiment: document.getElementById("summarySentiment"),
+  summaryOverview: document.getElementById("summaryOverview"),
+  summaryKeyPoints: document.getElementById("summaryKeyPoints"),
+  summaryConsensus: document.getElementById("summaryConsensus"),
+  summaryDisagreements: document.getElementById("summaryDisagreements"),
+  summaryRisks: document.getElementById("summaryRisks"),
+  summaryActions: document.getElementById("summaryActions"),
+  summaryComments: document.getElementById("summaryComments")
 };
 
 let scanning = false;
@@ -394,8 +411,67 @@ function renderCurrentDetail(note = null, loading = false) {
     ? "处理中…"
     : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 Excel";
   elements.currentDetailRefresh.disabled = active;
+  elements.currentDetailSummary.disabled = active || !contentLength;
   elements.currentDetailDelete.hidden = !pulled;
   elements.currentDetailDelete.disabled = active;
+}
+
+function renderSummaryList(element, values, emptyText = "暂无明确内容") {
+  if (!element) return;
+  element.replaceChildren();
+  const items = Array.isArray(values) && values.length ? values : [emptyText];
+  for (const value of items) {
+    const li = document.createElement("li");
+    li.textContent = String(value || emptyText);
+    element.appendChild(li);
+  }
+}
+
+function renderNoteSummary(result) {
+  const summary = result?.summary || {};
+  const sentimentLabels = { negative: "负面", light_negative: "轻度负面", neutral: "中立", positive: "正面", mixed: "褒贬混合", uncertain: "信息不足" };
+  elements.summarySentiment.textContent = sentimentLabels[summary.sentiment] || "信息不足";
+  elements.summarySentiment.dataset.sentiment = summary.sentiment || "uncertain";
+  elements.summaryOverview.textContent = summary.overview || "DeepSeek 未返回总览。";
+  elements.summaryMeta.textContent = `${result.commentCount || 0} 条评论 · ${result.model || "DeepSeek"} · ${result.updatedAt ? new Date(result.updatedAt).toLocaleString() : "刚刚"}`;
+  renderSummaryList(elements.summaryKeyPoints, summary.keyPoints);
+  renderSummaryList(elements.summaryConsensus, summary.commentConsensus);
+  renderSummaryList(elements.summaryDisagreements, summary.disagreements);
+  renderSummaryList(elements.summaryRisks, summary.risks);
+  renderSummaryList(elements.summaryActions, summary.actions);
+  renderSummaryList(elements.summaryComments, summary.representativeComments);
+  elements.summaryResult.hidden = false;
+}
+
+async function openCurrentNoteSummary(force = true) {
+  const note = currentDetailNote;
+  if (!note?.noteId) throw new Error("请先打开一篇帖子");
+  elements.summaryPage.hidden = false;
+  document.body.classList.add("summary-open");
+  elements.summaryTitle.textContent = note.title || "当前帖子";
+  elements.summaryMeta.textContent = "正在读取正文与评论…";
+  elements.summaryLoading.hidden = false;
+  elements.summaryError.hidden = true;
+  elements.summaryResult.hidden = true;
+  elements.summaryRerun.disabled = true;
+  try {
+    const result = force
+      ? await sendRuntime({ type: "summarizeCurrentNote", note })
+      : await sendRuntime({ type: "getNoteSummary", noteId: note.noteId });
+    if (!result?.ok || !result?.found) throw new Error(result?.error || "尚无总结结果");
+    renderNoteSummary(result);
+  } catch (error) {
+    elements.summaryError.textContent = error.message || "DeepSeek 总结失败";
+    elements.summaryError.hidden = false;
+  } finally {
+    elements.summaryLoading.hidden = true;
+    elements.summaryRerun.disabled = false;
+  }
+}
+
+function closeSummaryPage() {
+  elements.summaryPage.hidden = true;
+  document.body.classList.remove("summary-open");
 }
 
 async function deleteLocalNote(note, button = null) {
@@ -1250,6 +1326,13 @@ elements.scanCurrent.addEventListener("click", scanCurrentPage);
 elements.deepScanCurrent.addEventListener("click", () => deepScanCurrentPage());
 elements.currentDetailPull?.addEventListener("click", () => {
   pullCurrentDetail().catch((error) => setStatus(error.message || "当前帖子拉取失败", "error"));
+});
+elements.currentDetailSummary?.addEventListener("click", () => {
+  openCurrentNoteSummary(true).catch((error) => setStatus(error.message || "AI 总结失败", "error"));
+});
+elements.summaryBack?.addEventListener("click", closeSummaryPage);
+elements.summaryRerun?.addEventListener("click", () => {
+  openCurrentNoteSummary(true).catch((error) => setStatus(error.message || "AI 总结失败", "error"));
 });
 elements.currentDetailAnalyze?.addEventListener("click", () => {
   analyzeCurrentDetailRelevance().catch((error) => setStatus(error.message || "AI 判断失败", "error"));

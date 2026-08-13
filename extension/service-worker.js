@@ -774,6 +774,29 @@ async function analyzeNoteRelevance(note, preferredTabId = null) {
   });
 }
 
+async function summarizeCurrentNote(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法总结" };
+  return runExclusivePageTask(async () => {
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    const extracted = await sendTabMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: false, process: false }
+    }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
+    if (!extracted?.ok || !extracted.note?.content) {
+      throw new Error(extracted?.error || "正文尚未读取成功");
+    }
+    const config = await getConfig();
+    return fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ai/summary"), {
+      method: "POST",
+      body: JSON.stringify({
+        note: extracted.note,
+        comments: Array.isArray(extracted.comments) ? extracted.comments : [],
+        expectedCount: extracted.expectedCount || 0
+      })
+    }, 180000);
+  });
+}
+
 async function pullNote(note, preferredTabId = null) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法拉取" };
   return runExclusivePageTask(async () => {
@@ -1136,6 +1159,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     if (message.type === "getNoteStatus") return getNoteStatus(message.noteId || message.note?.noteId || "");
     if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);
+    if (message.type === "summarizeCurrentNote") return summarizeCurrentNote(message.note || {}, sender.tab?.id || null);
+    if (message.type === "getNoteSummary") {
+      return bridgeApi(`/api/ai/summary?noteId=${encodeURIComponent(message.noteId || "")}`);
+    }
     if (message.type === "openLocalArtifact") {
       return bridgeApi("/api/open", {
         method: "POST",
