@@ -37,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.18.5"
+VERSION = "0.18.6"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -1695,18 +1695,35 @@ class MonitorStore:
         settings = self.ai_settings.get(True)
         if not settings.get("configured"):
             raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
+        parent_id = text(target.get("parentCommentId") or target.get("parent_comment_id"), 256)
+        parent_comment = next((item for item in compact_comments if item["comment_id"] == parent_id), None)
         persona_instruction = (
-            "以品牌官方客服身份回复：坦诚、克制、可核验；不得假装消费者，遇到投诉先承接情绪并给出可执行的官方处理路径。"
+            "你代表品牌官方账号。像真人运营在评论区当场回复，先回答用户眼前这句话。投诉、质疑和不适反馈要接住情绪，再给可执行且可核验的处理路径。语气亲切但不装熟，不写客服公函。"
             if persona == "brand" else
-            "以普通社区用户交流口吻回复：自然、简短；只能基于帖子与评论中的公开信息表达，不得冒充亲身购买、使用或与品牌存在关系。"
+            "你是普通社区用户，在评论区自然接话。可以热心、好奇、轻松，但只能根据帖子和评论里的公开信息说话。不得声称自己买过、用过、到过门店或知道内幕，也不要替品牌作保证。"
         )
-        schema = {"reply": "可直接填入小红书回复框的文本", "rationale": "回复思路", "tone": "语气", "risk_notes": ["需要人工留意的风险"]}
+        schema = {
+            "need": "目标评论真正想问、想表达或想获得什么，20字内",
+            "candidates": [
+                {"reply": "可直接填入回复框的候选", "style": "直答/共情/轻松", "why": "为什么适合当前语境"}
+            ],
+            "risk_notes": ["需要人工留意的事实或语气风险"]
+        }
+        style_rules = """
+先判断目标评论是在提问、吐槽、求证、分享、玩梗还是单纯附和，再决定怎样回。回复首先解决当前一句，不要把所有背景复述一遍。
+写成小红书里一个具体的人在说话。短句优先，允许一点停顿和口语。每条一般12到70个汉字，最多100字。
+生成3条明显不同的候选。至少一条直接自然，至少一条更有情绪回应；只有原评论本身轻松时，才给一条轻松候选。
+Emoji不是必需品。确实能补语气时每条最多1个。不要批量塞“哈哈哈哈、救命、绝了、宝子、姐妹、大数据推给我”，也不要为了网感硬加感叹号。
+避免AI和客服模板腔，包括“感谢您的反馈”“您的心情我们非常理解”“我们会进一步核实并跟进”“建议您持续关注”“希望能帮到您”。除非上下文确实需要，不要用“亲”“宝宝”。
+不要重复用户原话，不总结评论区，不说空泛正确话。问价格、渠道、成分、功效、过敏、售后等事实时，资料没有答案就坦白说明并引导人工核实，不能编数字、链接、活动、疗效或承诺。
+输出前默读一遍，删掉任何像公告、营销文案、万能安慰或为了像小红书而堆出的热词。
+""".strip()
         messages = [
-            {"role": "system", "content": "你是社交媒体评论回复助手。只生成建议稿，最终发送由人工决定。严格输出一个有效 JSON 对象，不要 Markdown。"},
-            {"role": "user", "content": "%s\n请结合帖子正文、目标评论、其父评论及全评论区上下文生成一条回复。不要编造功效、价格、活动、售后承诺或个人经历；不泄露隐私；建议控制在120字内。输出结构：%s。输入：%s" % (
-                persona_instruction, json.dumps(schema, ensure_ascii=False), json.dumps({
+            {"role": "system", "content": "你是熟悉小红书社区语境的中文评论编辑。活人感来自准确接话、具体上下文和自然分寸，不来自堆网络梗。只生成建议稿，发送由人工决定。严格输出一个有效 JSON 对象，不要 Markdown。"},
+            {"role": "user", "content": "%s\n\n%s\n\n请结合帖子正文、目标评论、其父评论和全评论区语境生成候选回复。输出结构：%s。输入：%s" % (
+                persona_instruction, style_rules, json.dumps(schema, ensure_ascii=False), json.dumps({
                     "post": {"title": text(note.get("title"), 1000), "content": text(note.get("content"), 16000), "tags": note.get("tags") or []},
-                    "target_comment": target, "all_comments": compact_comments
+                    "target_comment": target, "parent_comment": parent_comment, "all_comments": compact_comments
                 }, ensure_ascii=False)
             )},
         ]
@@ -1716,10 +1733,27 @@ class MonitorStore:
         risk_notes = raw.get("risk_notes") or []
         if not isinstance(risk_notes, list):
             risk_notes = [risk_notes]
+        candidates = raw.get("candidates") or []
+        if not isinstance(candidates, list):
+            candidates = []
+        normalized_candidates = []
+        for item in candidates[:5]:
+            if isinstance(item, str):
+                item = {"reply": item}
+            if not isinstance(item, dict):
+                continue
+            reply = text(item.get("reply"), 600)
+            if reply:
+                normalized_candidates.append({"reply": reply, "style": text(item.get("style"), 60), "why": text(item.get("why"), 500)})
+        legacy_reply = text(raw.get("reply"), 600)
+        if not normalized_candidates and legacy_reply:
+            normalized_candidates.append({"reply": legacy_reply, "style": text(raw.get("tone"), 60), "why": text(raw.get("rationale"), 500)})
         result = {
-            "reply": text(raw.get("reply"), 600),
-            "rationale": text(raw.get("rationale"), 1000),
-            "tone": text(raw.get("tone"), 100),
+            "need": text(raw.get("need"), 300),
+            "candidates": normalized_candidates[:3],
+            "reply": normalized_candidates[0]["reply"] if normalized_candidates else "",
+            "rationale": normalized_candidates[0].get("why", "") if normalized_candidates else "",
+            "tone": normalized_candidates[0].get("style", "") if normalized_candidates else "",
             "riskNotes": [text(item, 300) for item in risk_notes if text(item, 300)][:6],
         }
         if not result["reply"]:

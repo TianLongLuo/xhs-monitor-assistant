@@ -42,7 +42,11 @@ class FakeAI:
 
 class FakeReplyAI:
     def complete_json(self, _settings, _messages):
-        return {"reply": "感谢反馈，我们会进一步核实并跟进。", "rationale": "先承接反馈", "tone": "克制", "risk_notes": []}
+        return {"need": "想确认价格", "candidates": [
+            {"reply": "这个价格我也会先问清楚再决定，建议直接问官方渠道～", "style": "直答", "why": "接住价格疑问"},
+            {"reply": "1600确实得先做做功课😂 可以先把规格和渠道问明白", "style": "轻松", "why": "语气更松"},
+            {"reply": "价格信息还是以官方当前渠道为准，别急着下单，先确认清楚更稳妥。", "style": "稳妥", "why": "避免编价"}
+        ], "risk_notes": []}
 
 
 class V0183Tests(unittest.TestCase):
@@ -101,7 +105,8 @@ class V0183Tests(unittest.TestCase):
             "persona": "brand"
         })
         self.assertTrue(result["ok"])
-        self.assertIn("感谢反馈", result["suggestion"]["reply"])
+        self.assertEqual(3, len(result["suggestion"]["candidates"]))
+        self.assertIn("价格", result["suggestion"]["reply"])
 
 
 if __name__ == "__main__":

@@ -537,8 +537,23 @@ function renderCommentsPage() {
         const result = await sendRuntime({ type: "suggestCommentReply", note: commentPageData.note,
           comments: commentPageData.comments, targetComment: comment, persona: commentPageData.persona });
         if (!result?.ok) throw new Error(result?.error || "回复建议生成失败");
-        const box = document.createElement("textarea"); box.value = result.suggestion?.reply || ""; box.rows = 4;
-        const rationale = document.createElement("small"); rationale.textContent = result.suggestion?.rationale || "请人工复核后填入。";
+        const need = document.createElement("small"); need.className = "comment-suggestion__need";
+        need.textContent = result.suggestion?.need ? `这条评论想要的是：${result.suggestion.need}` : "选一条更像你会说的话，也可以直接修改。";
+        const choices = document.createElement("div"); choices.className = "comment-suggestion__choices";
+        const candidates = Array.isArray(result.suggestion?.candidates) && result.suggestion.candidates.length
+          ? result.suggestion.candidates : [{ reply: result.suggestion?.reply || "", style: result.suggestion?.tone || "" }];
+        const box = document.createElement("textarea"); box.value = candidates[0]?.reply || ""; box.rows = 4;
+        candidates.forEach((candidate, index) => {
+          const choice = document.createElement("button"); choice.type = "button"; choice.className = index === 0 ? "is-active" : "";
+          choice.textContent = candidate.style || `候选 ${index + 1}`;
+          choice.title = candidate.why || candidate.reply || "";
+          choice.addEventListener("click", () => {
+            choices.querySelectorAll("button").forEach((item) => item.classList.remove("is-active"));
+            choice.classList.add("is-active"); box.value = candidate.reply || "";
+          });
+          choices.appendChild(choice);
+        });
+        const rationale = document.createElement("small"); rationale.textContent = "建议稿只填入回复框，发送前请核对事实和语气。";
         const confirm = document.createElement("button"); confirm.type = "button"; confirm.textContent = "确认并填入回复框";
         confirm.addEventListener("click", async () => {
           confirm.disabled = true; confirm.textContent = "正在定位评论…";
@@ -549,7 +564,7 @@ function renderCommentsPage() {
             showToast("回复已填入小红书输入框，没有自动发送");
           } catch (error) { confirm.disabled = false; confirm.textContent = "重试填入"; showToast(error.message || "填入失败", "error"); }
         });
-        suggestion.replaceChildren(box, rationale, confirm);
+        suggestion.replaceChildren(need, choices, box, rationale, confirm);
       } catch (error) { loading.textContent = error.message || "回复建议生成失败"; }
       finally { button.disabled = false; button.textContent = "重新生成"; }
     });

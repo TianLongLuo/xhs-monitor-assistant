@@ -2236,6 +2236,11 @@ body.summary-open .shell { visibility: hidden; }
 .comment-suggestion { display: grid; gap: 8px; margin-top: 11px; padding-top: 10px; border-top: 1px dashed #c9bca7; }
 .comment-suggestion textarea { box-sizing: border-box; width: 100%; resize: vertical; border: 1px solid #bfb19d; border-radius: 8px; padding: 9px; background: #fff; color: #18342d; font: 12px/1.55 inherit; }
 .comment-suggestion small { color: #756b5d; font-size: 9px; line-height: 1.5; }
+.comment-suggestion__need { color: #173f35 !important; font-weight: 750; }
+.comment-suggestion__choices { display: flex; flex-wrap: wrap; gap: 5px; }
+.comment-suggestion__choices button { min-height: 28px; padding: 4px 9px; border: 1px solid #bfb19d; border-radius: 99px; background: #fffdf8; color: #173f35; font-size: 9px; font-weight: 750; }
+.comment-suggestion__choices button.is-active { border-color: #173f35; background: #173f35; color: #fff; }
 .comment-suggestion button { min-height: 36px; border: 0; border-radius: 8px; background: #f05a42; color: white; font-weight: 800; }
+.comment-suggestion__choices button { min-height: 28px; background: #fffdf8; color: #173f35; }
 .comments-empty { padding: 30px 14px; border: 1px dashed #c9bca7; text-align: center; color: #756b5d; }
 body.comments-open .shell { visibility: hidden; }
