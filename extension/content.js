@@ -1,5 +1,7 @@
 (function () {
   "use strict";
+  if (globalThis.__XHS_MONITOR_CONTENT_V0151__) return;
+  globalThis.__XHS_MONITOR_CONTENT_V0151__ = true;
 
   const DEFAULT_CONFIG = { targetKeywords: ["品牌词"], enabled: true };
   let activeRelevanceGroups = null;
@@ -36,6 +38,7 @@
   let deepScanQueued = false;
   let deepScanTimer = null;
   const pullingNoteIds = new Set();
+  const relevanceAnalyzingNoteIds = new Set();
   const detailRetryAt = new Map();
   const AUTO_DETAIL_RETRY_DELAY_MS = 60_000;
   let processPanel = null;
@@ -397,14 +400,23 @@
     heading.className = `${PROCESS_PANEL_CLASS}__heading`;
     const eyebrow = document.createElement("span");
     eyebrow.className = `${PROCESS_PANEL_CLASS}__eyebrow`;
-    eyebrow.textContent = "XHS-Monitor PROCESS";
+    eyebrow.textContent = "ORIGANI RADAR";
     const title = document.createElement("strong");
     title.className = `${PROCESS_PANEL_CLASS}__title`;
     title.textContent = "拉取进度";
     const status = document.createElement("small");
     status.className = `${PROCESS_PANEL_CLASS}__status`;
     status.textContent = "准备打开帖子";
-    heading.append(eyebrow, title, status);
+    const headStates = document.createElement("div");
+    headStates.className = `${PROCESS_PANEL_CLASS}__head-states`;
+    const headPullState = document.createElement("span");
+    headPullState.className = `${PROCESS_PANEL_CLASS}__head-state ${PROCESS_PANEL_CLASS}__head-state--pull`;
+    headPullState.textContent = "未拉取";
+    const headRelevanceState = document.createElement("span");
+    headRelevanceState.className = `${PROCESS_PANEL_CLASS}__head-state ${PROCESS_PANEL_CLASS}__head-state--relevance`;
+    headRelevanceState.textContent = "相关性未知";
+    headStates.append(headPullState, headRelevanceState);
+    heading.append(eyebrow, title, status, headStates);
     const actions = document.createElement("div");
     actions.className = `${PROCESS_PANEL_CLASS}__actions`;
     const pullButton = processButton("拉取到 Excel", `${PROCESS_PANEL_CLASS}__pull`, () => {
@@ -429,7 +441,16 @@
     const targetId = document.createElement("span");
     targetId.className = `${PROCESS_PANEL_CLASS}__target-id`;
     targetId.textContent = `ID ${note.noteId || "—"}`;
-    target.append(targetTitle, targetId);
+    const targetStates = document.createElement("div");
+    targetStates.className = `${PROCESS_PANEL_CLASS}__target-states`;
+    const pullState = document.createElement("span");
+    pullState.className = `${PROCESS_PANEL_CLASS}__state ${PROCESS_PANEL_CLASS}__state--pull`;
+    pullState.textContent = "拉取状态：读取中";
+    const relevanceState = document.createElement("span");
+    relevanceState.className = `${PROCESS_PANEL_CLASS}__state ${PROCESS_PANEL_CLASS}__state--relevance`;
+    relevanceState.textContent = "相关性：读取中";
+    targetStates.append(pullState, relevanceState);
+    target.append(targetTitle, targetId, targetStates);
 
     const progress = document.createElement("div");
     progress.className = `${PROCESS_PANEL_CLASS}__progress`;
@@ -635,6 +656,14 @@
     const targetId = panel.querySelector(`.${PROCESS_PANEL_CLASS}__target-id`);
     if (targetTitle) targetTitle.textContent = note.title || "未命名帖子";
     if (targetId) targetId.textContent = `ID ${note.noteId || message.noteId || "—"}`;
+    if (message.mode === "relevance" && message.done) {
+      const relevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__state--relevance`);
+      const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
+      const value = message.relevanceStatus || "unknown";
+      const label = value === "relevant" ? "相关" : value === "irrelevant" ? "不相关" : "相关性未知";
+      if (relevance) { relevance.dataset.state = value; relevance.textContent = `相关性：${label.replace("相关性", "")}`; }
+      if (headRelevance) { headRelevance.dataset.state = value; headRelevance.textContent = label; }
+    }
     panel.dataset.phase = phase;
     panel.classList.toggle(`${PROCESS_PANEL_CLASS}--error`, Boolean(message.error));
     panel.classList.toggle(`${PROCESS_PANEL_CLASS}--done`, Boolean(message.done && !message.error));
@@ -647,7 +676,9 @@
       if (marker) marker.textContent = state === "done" ? "✓" : state === "error" ? "!" : state === "active" ? "•" : "·";
     });
     const progressBar = panel.querySelector(`.${PROCESS_PANEL_CLASS}__progress-bar`);
-    if (progressBar) progressBar.style.width = `${message.done ? 100 : Math.max(8, ((activeIndex + (message.error ? 0 : 0.35)) / PROCESS_STEPS.length) * 100)}%`;
+    const progressPercent = message.done ? 100 : Math.max(8, ((activeIndex + (message.error ? 0 : 0.35)) / PROCESS_STEPS.length) * 100);
+    if (progressBar) progressBar.style.width = `${progressPercent}%`;
+    panel.style.setProperty("--signal-progress", `${progressPercent}%`);
 
     const merged = { ...note };
     if (message.mediaDir) merged.mediaDir = message.mediaDir;
@@ -821,16 +852,44 @@
     return "";
   }
 
+  function invalidNoteTitle(value) {
+    const normalized = clean(value, 1000).replace(/\s+/g, "").toLocaleLowerCase();
+    return !normalized || ["未命名帖子", "当前打开帖子", "待读取", "无标题", "猜你想搜"]
+      .includes(normalized) || normalized.startsWith("猜你想搜");
+  }
+
+  function titleFromContent(content, limit = 80) {
+    const paragraphs = String(content || "")
+      .split(/\n+/)
+      .map((line) => clean(line, 1000).replace(/\s+/g, " ").replace(/^[\s\-—|｜]+|[\s\-—|｜]+$/g, ""))
+      .filter(Boolean);
+    const selected = [];
+    for (const paragraph of paragraphs.slice(0, 3)) {
+      if (paragraph.startsWith("#") && selected.length) break;
+      selected.push(paragraph);
+      if (selected.join(" ").length >= limit) break;
+    }
+    const combined = selected.join(" ").trim();
+    if (!combined) return "未命名帖子";
+    return combined.length > limit
+      ? combined.slice(0, limit).replace(/[，。！？；、,!?;:：\s]+$/g, "")
+      : combined;
+  }
+
+  function canonicalTitle(title, content) {
+    return invalidNoteTitle(title) ? titleFromContent(content) : clean(title, 1000);
+  }
+
   function extractTitle(card, anchor) {
     const direct = firstText(card, [
       '[class*="title"]', '[class*="Title"]', "h1", "h2", "h3", "img[alt]"
     ]);
-    if (direct) return direct;
+    if (direct && !invalidNoteTitle(direct)) return direct;
     const lines = String(anchor.innerText || card.innerText || "")
       .split(/\n+/)
       .map((line) => clean(line, 300))
       .filter(Boolean);
-    return lines[0] || "未命名帖子";
+    return lines.find((line) => !invalidNoteTitle(line)) || "未命名帖子";
   }
 
   function extractAuthor(card, title) {
@@ -1037,11 +1096,12 @@
       const cardTags = lightweight ? [] : extractTags(card, cardContent);
       const detail = lightweight ? { content: "", tags: [] } : extractDetailContext(details, noteId, title);
       const content = detail.content || cardContent;
+      const finalTitle = canonicalTitle(title, content);
       const tags = [...new Set([...cardTags, ...detail.tags])];
       const note = {
         noteId,
         url,
-        title,
+        title: finalTitle,
         author,
         content,
         detailRead: Boolean(detail.content),
@@ -1142,7 +1202,10 @@
     ) || document.querySelector(
       "#detail-title, .note-detail-mask h1, #noteContainer h1, [class*='note-detail'] h1, [class*='note-detail'] [class*='title']"
     );
-    const title = clean(detailTitleElement?.innerText, 1000) || baseNote.title || "未命名帖子";
+    const title = canonicalTitle(
+      clean(detailTitleElement?.innerText, 1000) || baseNote.title,
+      content
+    );
     const detailAuthorElement = detailRoot.querySelector?.(
       '.author-container .username, .author-wrapper .username, [class*="author"] [class*="name"], [class*="nickname"]'
     );
@@ -1265,10 +1328,34 @@
     }).catch(() => {});
   }
 
+  async function refreshProcessPanelStatus(panel, note) {
+    if (!panel || !note?.noteId) return;
+    if (Date.now() - Number(panel._statusFetchedAt || 0) < 1500) return;
+    panel._statusFetchedAt = Date.now();
+    try {
+      const result = await sendRuntime({ type: "getNoteStatus", noteId: note.noteId });
+      if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      panel._processNote = { ...panel._processNote, ...result, inExcel: Boolean(result.inExcel) };
+      const pull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__state--pull`);
+      const relevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__state--relevance`);
+      const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+      const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
+      const pulled = result.inExcel || ["synced", "partial"].includes(result.pullStatus);
+      const pullLabel = pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
+      if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
+      if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = pulled ? "pulled" : "missing"; }
+      const rel = result.relevanceStatus || "unknown";
+      const relevanceLabel = rel === "relevant" ? "相关" : rel === "irrelevant" ? "不相关" : "相关性未知";
+      if (relevance) { relevance.textContent = `相关性：${relevanceLabel.replace("相关性", "")}`; relevance.dataset.state = rel; }
+      if (headRelevance) { headRelevance.textContent = relevanceLabel; headRelevance.dataset.state = rel; }
+    } catch (_error) {}
+  }
+
   function syncDetailControl() {
     const info = currentDetailInfo();
     const note = info.note;
     if (!note?.noteId) {
+      document.documentElement.classList.remove("xhs-monitor-detail-open");
       publishCurrentDetail({ note: null, loading: false });
       if (!detailRootForNote({})) {
         dismissedDetailId = "";
@@ -1277,6 +1364,7 @@
       return;
     }
 
+    document.documentElement.classList.add("xhs-monitor-detail-open");
     publishCurrentDetail(info);
     if (dismissedDetailId === note.noteId) return;
     if (dismissedDetailId && dismissedDetailId !== note.noteId) dismissedDetailId = "";
@@ -1307,6 +1395,7 @@
       }
     }
     positionProcessPanel();
+    refreshProcessPanelStatus(panel, note);
   }
 
   function scheduleDetailControl(delay = 70) {
@@ -1601,6 +1690,8 @@
       "xhs-monitor-card--unrelated", "xhs-monitor-card--unloaded",
       "xhs-monitor-card--partial",
       "xhs-monitor-card--pulling",
+      "xhs-monitor-card--relevance-relevant", "xhs-monitor-card--relevance-irrelevant",
+      "xhs-monitor-card--relevance-unknown",
       "xhs-monitor-position-anchor"
     );
     card.querySelectorAll(`:scope > .${TOOLBAR_CLASS}`).forEach((element) => element.remove());
@@ -1634,94 +1725,78 @@
 
   function renderDecoration(card, note, status) {
     const pullStatus = status?.pullStatus || "";
-    // The card UI intentionally has one identity rule: a normalized title is
-    // either present in the local Excel or it is not. Relevance and AI remain
-    // backend-only and must never decide whether a visible card gets a frame.
     let state = status?.inExcel ? "known" : "new";
     if (!status) state = "unloaded";
     if (status?.status === "ignored") state = "ignored";
     if (["partial", "failed"].includes(pullStatus)) state = "partial";
-    if (pullStatus === "pulling") state = "pulling";
-    if (pullingNoteIds.has(note.noteId)) state = "pulling";
+    if (pullStatus === "pulling" || pullingNoteIds.has(note.noteId)) state = "pulling";
     if (status?.inExcel) state = "known";
+    const relevanceStatus = status?.relevanceStatus || (status?.inExcel || status?.isRelevant ? "relevant" : "unknown");
+    const relevanceAnalyzing = relevanceAnalyzingNoteIds.has(note.noteId);
     const meta = STATE_META[state];
     const matchLabel = status?.matchLabel || "";
-    const matchTitle = matchLabel ? `；匹配方式：${matchLabel}` : "";
-    const expectedKey = `${note.noteId}|${state}|${matchLabel}|${pullStatus}`;
+    const expectedKey = `${note.noteId}|${state}|${matchLabel}|${pullStatus}|${relevanceStatus}|${relevanceAnalyzing}`;
     const existing = card.querySelector(`:scope > .${TOOLBAR_CLASS}`);
     if (existing?.dataset.renderKey === expectedKey) return;
 
     clearDecorations(card);
     ensurePositionAnchor(card);
-    card.classList.add(`xhs-monitor-card--${state}`);
-
+    card.classList.add(`xhs-monitor-card--${state}`, `xhs-monitor-card--relevance-${relevanceStatus}`);
     const toolbar = document.createElement("div");
     toolbar.className = `${TOOLBAR_CLASS} ${TOOLBAR_CLASS}--${state}`;
     toolbar.dataset.renderKey = expectedKey;
     toolbar.setAttribute("role", "group");
-    toolbar.setAttribute("aria-label", `XHS-Monitor 监控状态：${meta.label}`);
-
+    toolbar.setAttribute("aria-label", `拉取：${meta.label}；相关性：${relevanceStatus}`);
     const badge = document.createElement("span");
     badge.className = "xhs-monitor-badge";
     badge.textContent = meta.label;
-    badge.title = `${meta.hint}${matchTitle}`;
+    badge.title = meta.hint;
     toolbar.append(badge);
+    const relevanceBadge = document.createElement("span");
+    relevanceBadge.className = `xhs-monitor-relevance xhs-monitor-relevance--${relevanceStatus}`;
+    relevanceBadge.textContent = relevanceAnalyzing ? "AI判断中…" : relevanceStatus === "relevant" ? "相关" : relevanceStatus === "irrelevant" ? "不相关" : "相关性未知";
+    relevanceBadge.title = status?.relevanceReason || "综合标题、正文、话题和评论判断";
+    toolbar.append(relevanceBadge);
+
+    if (relevanceStatus === "unknown" && !relevanceAnalyzing) {
+      toolbar.append(makeAction("AI判断", "xhs-monitor-action--relevance", async (event) => {
+        event.preventDefault(); event.stopPropagation();
+        relevanceAnalyzingNoteIds.add(note.noteId);
+        renderDecoration(card, note, status);
+        try {
+          const result = await sendRuntime({ type: "analyzeNoteRelevance", note: { ...note, showProcess: true, process: true } });
+          if (!result?.ok) throw new Error(result?.error || "AI 判断失败");
+          renderDecoration(card, note, { ...status, relevanceStatus: result.relevanceStatus,
+            relevanceSource: result.relevanceSource, relevanceReason: result.relevanceReason,
+            relevanceConfidence: result.relevanceConfidence, isRelevant: result.isRelevant,
+            status: result.relevanceStatus === "irrelevant" ? "irrelevant" : status?.status || "new" });
+        } catch (error) {
+          relevanceBadge.title = error?.message || "AI 判断失败";
+        } finally {
+          relevanceAnalyzingNoteIds.delete(note.noteId);
+          scheduleScan("relevance-result", 300);
+        }
+      }));
+    }
 
     if (state !== "known" && state !== "ignored") {
-      const runPull = async () => {
-        const buttons = toolbar.querySelectorAll("button");
-        buttons.forEach((button) => { button.disabled = true; });
+      toolbar.append(makeAction(state === "partial" ? "重试拉取" : "拉取", "xhs-monitor-action--pull", async (event) => {
+        event.preventDefault(); event.stopPropagation();
+        toolbar.querySelectorAll("button").forEach((button) => { button.disabled = true; });
         pullingNoteIds.add(note.noteId);
-        badge.textContent = "拉取中…";
-        const pullButton = toolbar.querySelector(".xhs-monitor-action--pull");
-        if (pullButton) pullButton.textContent = "处理中…";
-        card.classList.remove("xhs-monitor-card--unrelated", "xhs-monitor-card--new", "xhs-monitor-card--unloaded", "xhs-monitor-card--partial");
-        card.classList.add("xhs-monitor-card--pulling");
+        renderDecoration(card, note, { ...status, pullStatus: "pulling" });
         try {
-          const result = await sendRuntime({
-            type: "pullNote",
-            note: { ...note, showProcess: true, process: true }
-          });
+          const result = await sendRuntime({ type: "pullNote", note: { ...note, showProcess: true, process: true } });
           if (!result?.ok) throw new Error(result?.error || "操作失败");
-          renderDecoration(card, note, {
-            ...status,
-            status: result.status || "known",
-            inExcel: true,
-            isNew: false,
-            pullStatus: result.pullStatus || "synced",
-            pullError: result.pullError || result.mediaError || ""
-          });
+          renderDecoration(card, note, { ...status, status: "known", inExcel: true, isNew: false,
+            pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true });
         } catch (error) {
-          const message = error?.message || "拉取失败";
-          renderDecoration(card, note, {
-            ...status,
-            status: "partial",
-            pullStatus: "partial",
-            pullError: message
-          });
-          const nextToolbar = card.querySelector(`:scope > .${TOOLBAR_CLASS}`);
-          const nextBadge = nextToolbar?.querySelector(".xhs-monitor-badge");
-          if (nextBadge) {
-            nextBadge.title = message;
-            nextToolbar.classList.add(`${TOOLBAR_CLASS}--error`);
-          }
-        } finally {
-          pullingNoteIds.delete(note.noteId);
-        }
-      };
-      const pullLabel = state === "partial" ? "重试拉取" : "拉取";
-      toolbar.append(makeAction(pullLabel, "xhs-monitor-action--pull", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          runPull();
-        }));
+          renderDecoration(card, note, { ...status, status: "partial", pullStatus: "partial", pullError: error?.message || "拉取失败" });
+        } finally { pullingNoteIds.delete(note.noteId); }
+      }));
     } else if (state === "known") {
-      const button = makeAction("已拉取", "xhs-monitor-action--done", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      });
+      const button = makeAction("已拉取", "xhs-monitor-action--done", (event) => { event.preventDefault(); event.stopPropagation(); });
       button.disabled = true;
-      button.title = "该帖子已写入本地 Excel 与数据库";
       toolbar.append(button);
     }
     card.prepend(toolbar);
@@ -1739,6 +1814,7 @@
           isNew: false,
           inExcel: false,
           isRelevant: false,
+          relevanceStatus: "unknown",
           pullStatus: "not_started"
         });
       }

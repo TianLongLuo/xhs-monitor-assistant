@@ -20,8 +20,12 @@ const elements = {
   currentDetailTitle: document.getElementById("currentDetailTitle"),
   currentDetailState: document.getElementById("currentDetailState"),
   currentDetailMeta: document.getElementById("currentDetailMeta"),
+  currentDetailPullStatus: document.getElementById("currentDetailPullStatus"),
+  currentDetailRelevance: document.getElementById("currentDetailRelevance"),
+  currentDetailAnalyze: document.getElementById("currentDetailAnalyze"),
   currentDetailPull: document.getElementById("currentDetailPull"),
   currentDetailRefresh: document.getElementById("currentDetailRefresh"),
+  currentDetailDelete: document.getElementById("currentDetailDelete"),
   currentDetailHint: document.getElementById("currentDetailHint"),
   scanCurrent: document.getElementById("scanCurrent"),
   scanButtonLabel: document.getElementById("scanButtonLabel"),
@@ -189,36 +193,21 @@ async function toggleFloatingWindow() {
   }
 }
 
-function sendToActiveTab(message) {
-  return new Promise((resolve, reject) => {
-    const queryActiveTab = (query) => {
-      chrome.tabs.query(query, (tabs) => {
-        const tab = tabs[0];
-        if (!tab?.id) {
-          reject(new Error("没有找到当前小红书标签页"));
-          return;
-        }
-        chrome.tabs.sendMessage(tab.id, message, (response) => {
-          if (chrome.runtime.lastError) reject(friendlyTabError(chrome.runtime.lastError));
-          else resolve(response);
-        });
-      });
-    };
-    if (!floatingMode || !chrome.storage?.local?.get) {
-      queryActiveTab({ active: true, currentWindow: true });
-      return;
-    }
-    // A popup window has no browser tab of its own. Follow the browser window
-    // that owned the side panel so scan/open/read actions still address XHS.
-    chrome.storage.local.get({ floatingOriginWindowId: null }, (state) => {
-      if (chrome.runtime.lastError) {
-        queryActiveTab({ active: true, currentWindow: true });
-        return;
-      }
-      const windowId = Number(state?.floatingOriginWindowId) || 0;
-      queryActiveTab(windowId ? { active: true, windowId } : { active: true, currentWindow: true });
-    });
-  });
+async function sendToActiveTab(message) {
+  let tabId = 0;
+  if (floatingMode && chrome.storage?.local?.get) {
+    const state = await chrome.storage.local.get({ floatingOriginWindowId: null }).catch(() => ({}));
+    const windowId = Number(state?.floatingOriginWindowId) || 0;
+    const tabs = await chrome.tabs.query(windowId ? { active: true, windowId } : { active: true, currentWindow: true });
+    tabId = Number(tabs?.[0]?.id) || 0;
+  } else {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = Number(tabs?.[0]?.id) || 0;
+  }
+  if (!tabId) throw new Error("没有找到当前小红书标签页");
+  const result = await sendRuntime({ type: "sendToActiveXhsTab", tabId, payload: message });
+  if (!result?.ok && result?.error) throw new Error(result.error);
+  return result;
 }
 
 function setStatus(message, state = "idle", action = null) {
@@ -357,16 +346,83 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailState.textContent = state.label;
   elements.currentDetailState.dataset.state = state.value;
   elements.currentDetailMeta.textContent = meta || "当前详情已识别，等待操作";
+  const pulled = currentDetailNote.inExcel || ["synced", "partial"].includes(currentDetailNote.pullStatus);
+  elements.currentDetailPullStatus.textContent = pulled ? (currentDetailNote.pullStatus === "partial" ? "拉取：部分拉取" : "拉取：已拉取") : "拉取：未拉取";
+  elements.currentDetailPullStatus.dataset.state = pulled ? "pulled" : "missing";
+  const relevance = currentDetailNote.relevanceStatus || (currentDetailNote.isRelevant ? "relevant" : "unknown");
+  elements.currentDetailRelevance.textContent = `相关性：${relevance === "relevant" ? "相关" : relevance === "irrelevant" ? "不相关" : "未知"}`;
+  elements.currentDetailRelevance.dataset.state = relevance;
+  elements.currentDetailAnalyze.hidden = relevance !== "unknown";
+  elements.currentDetailAnalyze.disabled = active;
   elements.currentDetailHint.textContent = hint;
   elements.currentDetailPull.disabled = active || !noteId;
   elements.currentDetailPull.textContent = active
     ? "处理中…"
     : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 Excel";
   elements.currentDetailRefresh.disabled = active;
+  elements.currentDetailDelete.hidden = !pulled;
+  elements.currentDetailDelete.disabled = active;
 }
 
-async function pullCurrentDetail() {
+async function deleteLocalNote(note, button = null) {
+  const noteId = note?.noteId || note?.note_id;
+  if (!noteId) throw new Error("缺少帖子 ID，无法删除");
+  const title = note.title || "该帖子";
+  if (!confirm(`确定彻底删除“${title}”吗？\n\n将同时删除：\n• Excel 帖子整行及其全部评论行\n• SQLite 帖子、评论和分析记录\n• 对应素材目录\n\n此操作不可撤销。`)) return null;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "删除中…";
+  }
+  setStatus(`正在删除“${title}”的 Excel 行、数据库记录和素材目录…`, "warning");
+  try {
+    const result = await sendRuntime({ type: "deletePulledNote", noteId });
+    if (!result?.ok) throw new Error(result?.error || "删除失败");
+    if (currentDetailNote?.noteId === noteId) {
+      currentDetailNote = { ...currentDetailNote, inExcel: false, pullStatus: "not_started" };
+      renderCurrentDetail(currentDetailNote, false);
+    }
+    setStatus(
+      `删除完成：Excel 删除 ${result.deletedNoteRows || 0} 条帖子、${result.deletedCommentRows || 0} 条评论${result.mediaDeleted ? "，素材目录已删除" : ""}`,
+      "success"
+    );
+    await Promise.all([refreshStats(), refreshPending(), loadPageInfo()]);
+    if (queueView.type === "status") await showStatusView(queueView.status || "known");
+    return result;
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "删除本地帖子";
+    }
+  }
+}
+
+async function analyzeCurrentDetailRelevance() {
   const note = currentDetailNote;
+  if (!note?.noteId) return;
+  elements.currentDetailAnalyze.disabled = true;
+  elements.currentDetailAnalyze.textContent = "AI 判断中…";
+  try {
+    const result = await sendRuntime({ type: "analyzeNoteRelevance", note: { ...note, showProcess: true, process: true } });
+    if (!result?.ok) throw new Error(result?.error || "AI 判断失败");
+    currentDetailNote = { ...currentDetailNote, relevanceStatus: result.relevanceStatus,
+      relevanceReason: result.relevanceReason, relevanceConfidence: result.relevanceConfidence,
+      isRelevant: result.isRelevant };
+    renderCurrentDetail(currentDetailNote, false);
+    showToast(result.relevanceStatus === "irrelevant" ? "已判定不相关，并写入 Excel 不相关 Sheet" : result.relevanceStatus === "relevant" ? "已判定与品牌相关" : "证据不足，保持相关性未知");
+    await refreshAll({ quiet: true });
+  } catch (error) { showToast(error.message || "AI 判断失败", "error"); }
+  finally { elements.currentDetailAnalyze.textContent = "AI 判断相关性"; elements.currentDetailAnalyze.disabled = false; }
+}
+
+async function enrichCurrentDetail(note, loading = false) {
+  renderCurrentDetail(note, loading);
+  if (!note?.noteId) return;
+  const result = await sendRuntime({ type: "getNoteStatus", noteId: note.noteId }).catch(() => null);
+  if (!result?.ok || currentDetailNote?.noteId !== note.noteId) return;
+  renderCurrentDetail({ ...currentDetailNote, ...result }, loading);
+}
+
+async function pullCurrentDetail() {  const note = currentDetailNote;
   const noteId = note?.noteId;
   if (!noteId || activePulls.has(noteId)) return;
   currentDetailPullingId = noteId;
@@ -663,6 +719,11 @@ function renderNoteList(notes, options = {}) {
       pullActions.removeAttribute?.("aria-hidden");
       pullActions.append(actionButton("补采评论", async (button) => pullNoteToExcel(note, button)));
     }
+    if (options.status === "known" || note.inExcel || ["synced", "partial"].includes(note.pullStatus)) {
+      pullActions.hidden = false;
+      pullActions.removeAttribute?.("aria-hidden");
+      pullActions.append(actionButton("删除", async (button) => deleteLocalNote({ ...note, noteId }, button)));
+    }
     if ((note.target_type || "note") === "note") {
       actions.append(
         actionButton("读评论", async () => {
@@ -906,7 +967,7 @@ async function loadPageInfo() {
     elements.pageKeyword.textContent = label;
     elements.pageKeyword.title = label;
     elements.pageCount.textContent = `当前页面已加载 ${info.noteCount || 0} 篇帖子`;
-    renderCurrentDetail(info.currentDetail || null, Boolean(info.currentDetailLoading));
+    await enrichCurrentDetail(info.currentDetail || null, Boolean(info.currentDetailLoading));
     return info;
   } catch (error) {
     elements.pageKeyword.textContent = "等待小红书页面";
@@ -1126,10 +1187,17 @@ elements.deepScanCurrent.addEventListener("click", () => deepScanCurrentPage());
 elements.currentDetailPull?.addEventListener("click", () => {
   pullCurrentDetail().catch((error) => setStatus(error.message || "当前帖子拉取失败", "error"));
 });
+elements.currentDetailAnalyze?.addEventListener("click", () => {
+  analyzeCurrentDetailRelevance().catch((error) => setStatus(error.message || "AI 判断失败", "error"));
+});
 elements.currentDetailRefresh?.addEventListener("click", () => {
   loadPageInfo().then((info) => {
     if (info?.currentDetail) setStatus("当前详情已重新读取", "success");
   }).catch((error) => setStatus(error.message || "详情刷新失败", "error"));
+});
+elements.currentDetailDelete?.addEventListener("click", () => {
+  deleteLocalNote(currentDetailNote, elements.currentDetailDelete)
+    .catch((error) => setStatus(error.message || "删除失败", "error"));
 });
 elements.toggleFloating?.addEventListener("click", () => toggleFloatingWindow());
 elements.openSettings.addEventListener("click", () => {
@@ -1226,7 +1294,7 @@ document.addEventListener("visibilitychange", () => {
 chrome.runtime.onMessage.addListener((message) => {
   if (ballMode) return false;
   if (message.type === "currentDetailChanged") {
-    renderCurrentDetail(message.currentDetail || null, Boolean(message.currentDetailLoading));
+    enrichCurrentDetail(message.currentDetail || null, Boolean(message.currentDetailLoading)).catch(() => {});
     return false;
   }
   if (message.type === "pullProgress") {
@@ -1248,7 +1316,10 @@ chrome.runtime.onMessage.addListener((message) => {
         elements.currentDetailHint.textContent = `${phaseText}… Process 窗口正在详情右侧同步显示字段。`;
       } else {
         currentDetailPullingId = "";
-        if (message.ok) currentDetailNote = { ...currentDetailNote, inExcel: true };
+        if (message.ok && message.mode === "relevance") {
+          currentDetailNote = { ...currentDetailNote, relevanceStatus: message.relevanceStatus || "unknown",
+            isRelevant: message.relevanceStatus === "relevant" };
+        } else if (message.ok) currentDetailNote = { ...currentDetailNote, inExcel: true, pullStatus: "synced" };
         renderCurrentDetail(currentDetailNote, false);
       }
     }

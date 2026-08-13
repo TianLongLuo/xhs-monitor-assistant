@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -36,7 +37,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.14.0"
+VERSION = "0.17.0"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -196,6 +197,26 @@ def valid_note_id(value: Any) -> str:
     return note_id
 
 
+def note_url_identity(value: Any) -> str:
+    """Return a token-insensitive note identity for Excel fallback matching."""
+    raw = text(value, 2000)
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        parts = [part for part in parsed.path.split("/") if part]
+        for marker in ("search_result", "explore", "item"):
+            if marker in parts:
+                index = parts.index(marker) + 1
+                if index < len(parts):
+                    candidate = valid_note_id(parts[index])
+                    if candidate:
+                        return candidate
+        return urlunparse(parsed._replace(query="", fragment="")).rstrip("/").casefold()
+    except ValueError:
+        return match_key(raw, 2000)
+
+
 def match_key(value: Any, limit: int = 12000) -> str:
     """Normalize visible note text for title/caption comparison."""
     normalized = unicodedata.normalize("NFKC", text(value, limit)).casefold()
@@ -261,6 +282,40 @@ def identity_keys(title: Any, content: Any) -> tuple[str, str, str]:
     return title_value, content_value, hashlib.sha256(raw).hexdigest()
 
 
+def canonical_note_title(title: Any, content: Any, limit: int = 80) -> str:
+    """Return a real title, deriving one from the first body paragraphs when absent.
+
+    Xiaohongshu's detail DOM may expose the search-suggestion label “猜你想搜”
+    through a generic title class. That UI text is never a note title.
+    """
+    supplied = text(title, 1000).strip()
+    normalized = match_key(supplied, 1000)
+    invalid = (
+        not normalized
+        or normalized in {"未命名帖子", "当前打开帖子", "待读取", "无标题", "猜你想搜"}
+        or normalized.startswith("猜你想搜")
+    )
+    if not invalid:
+        return supplied[:limit].strip()
+
+    paragraphs = [
+        re.sub(r"\s+", " ", line).strip(" -—|｜")
+        for line in text(content, 12000).splitlines()
+        if re.sub(r"\s+", " ", line).strip(" -—|｜")
+    ]
+    derived_parts: list[str] = []
+    for paragraph in paragraphs[:3]:
+        if paragraph.startswith("#") and derived_parts:
+            break
+        derived_parts.append(paragraph)
+        if len(" ".join(derived_parts)) >= limit:
+            break
+    derived = " ".join(derived_parts).strip()
+    if len(derived) > limit:
+        derived = derived[:limit].rstrip("，。！？；、,!?;:： ")
+    return derived or "未命名帖子"
+
+
 class MonitorStore:
     def __init__(self, db_path: Path, export_dir: Path, ai_client: Any | None = None):
         self.db_path = Path(db_path)
@@ -268,6 +323,10 @@ class MonitorStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        # Serialize a complete pull transaction. Without this lock, two clicks
+        # can both inspect the same workbook before either atomic replace and
+        # append duplicate rows despite row-level dedupe.
+        self.pull_lock = threading.Lock()
         self.seed_xlsx_path: Path | None = None
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
         self.ai_client = ai_client or DeepSeekClient()
@@ -352,6 +411,11 @@ class MonitorStore:
                 "media_dir": "TEXT NOT NULL DEFAULT ''",
                 "media_file_count": "INTEGER NOT NULL DEFAULT 0",
                 "media_error": "TEXT NOT NULL DEFAULT ''",
+                "relevance_status": "TEXT NOT NULL DEFAULT 'unknown'",
+                "relevance_source": "TEXT NOT NULL DEFAULT ''",
+                "relevance_reason": "TEXT NOT NULL DEFAULT ''",
+                "relevance_confidence": "REAL NOT NULL DEFAULT 0",
+                "relevance_analyzed_at": "TEXT NOT NULL DEFAULT ''",
             }
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(notes)").fetchall()}
             for column, definition in note_migrations.items():
@@ -363,6 +427,11 @@ class MonitorStore:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_title_content_key ON notes(title_content_key)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_negative ON notes(is_negative, ai_confidence)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_review ON notes(review_status)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_relevance ON notes(relevance_status, source)")
+            db.execute("""UPDATE notes SET relevance_status=CASE
+                WHEN source='existing_xlsx' OR is_relevant=1 THEN 'relevant'
+                ELSE 'unknown' END
+                WHERE relevance_status='' OR relevance_status IS NULL OR (relevance_status='unknown' AND (source='existing_xlsx' OR is_relevant=1))""")
 
             db.executescript(
                 """
@@ -546,7 +615,7 @@ class MonitorStore:
                             tags=CASE WHEN ? <> '' THEN ? ELSE tags END,
                             keyword=CASE WHEN ? <> '' THEN ? ELSE keyword END,
                             page_url=CASE WHEN ? <> '' THEN ? ELSE page_url END,
-                            status='known', source='existing_xlsx', is_relevant=1,
+                            status='known', source='existing_xlsx', is_relevant=1, relevance_status='relevant', relevance_source='excel',
                             post_sentiment=CASE WHEN ? <> '' THEN ? ELSE post_sentiment END,
                             title_key=CASE WHEN ? <> '' THEN ? ELSE title_key END,
                             content_key=CASE WHEN ? <> '' THEN ? ELSE content_key END,
@@ -598,12 +667,43 @@ class MonitorStore:
                     ),
                 )
                 inserted += 1
+
+            if 'sheet3_不相关帖子' in workbook.sheetnames:
+                irrelevant_sheet = workbook['sheet3_不相关帖子']
+                irrelevant_headers = [cell.value for cell in next(irrelevant_sheet.iter_rows(min_row=1, max_row=1))]
+                irrelevant_index = {str(item): position for position, item in enumerate(irrelevant_headers) if item}
+                def irrelevant_value(row: tuple[Any, ...], name: str) -> str:
+                    position = irrelevant_index.get(name)
+                    return text(row[position]) if position is not None and position < len(row) else ''
+                for row in irrelevant_sheet.iter_rows(min_row=2, values_only=True):
+                    note_id = valid_note_id(irrelevant_value(row, '笔记ID'))
+                    if not note_id:
+                        continue
+                    row_title = irrelevant_value(row, '笔记标题')
+                    row_content = irrelevant_value(row, '笔记内容')
+                    row_tags = irrelevant_value(row, '笔记话题')
+                    title_key, content_key, combined_key = identity_keys(row_title, row_content)
+                    db.execute(
+                        """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
+                           status,is_relevant,source,title_key,content_key,title_content_key,payload_json,relevance_status,
+                           relevance_source,relevance_reason,relevance_confidence,relevance_analyzed_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,'irrelevant',0,'irrelevant_xlsx',?,?,?,'{}','irrelevant',?,?,?,?)
+                           ON CONFLICT(note_id) DO UPDATE SET status='irrelevant',is_relevant=0,
+                           relevance_status='irrelevant',relevance_source='irrelevant_xlsx',
+                           relevance_reason=excluded.relevance_reason,relevance_confidence=excluded.relevance_confidence,
+                           relevance_analyzed_at=excluded.relevance_analyzed_at,last_seen_at=excluded.last_seen_at""",
+                        (note_id, irrelevant_value(row,'笔记url'), row_title, irrelevant_value(row,'用户昵称'),
+                         row_content, row_tags, irrelevant_value(row,'来源词'), irrelevant_value(row,'笔记url'), timestamp, timestamp,
+                         title_key, content_key, combined_key, irrelevant_value(row,'AI判断来源') or 'excel',
+                         irrelevant_value(row,'AI判断理由'), float(irrelevant_value(row,'AI置信度') or 0),
+                         irrelevant_value(row,'分析时间') or timestamp),
+                    )
             # Excel is the user-facing source of truth. Mark every row that
             # was successfully read from this workbook as synced so the
             # browser can distinguish an actual Excel row from a discovery
             # record that only lives in SQLite.
             db.execute(
-                """UPDATE notes SET pull_status='synced', pull_error='',
+                """UPDATE notes SET pull_status='synced', pull_error='', relevance_status='relevant', relevance_source='excel', relevance_status='relevant', relevance_source='excel',
                    excel_synced_at=?, excel_sync_path=?
                    WHERE source='existing_xlsx'""",
                 (timestamp, str(xlsx_path)),
@@ -712,6 +812,9 @@ class MonitorStore:
             relevance_matches: list[str],
             existing: sqlite3.Row | None,
         ) -> dict[str, Any]:
+            stored_relevance = (str(existing["relevance_status"] or "")
+                                if existing is not None and "relevance_status" in existing.keys() else "")
+            relevance_status = "relevant" if in_excel else (stored_relevance if stored_relevance in {"relevant", "irrelevant"} else ("relevant" if relevant else "unknown"))
             return {
                 "noteId": note_id,
                 "matchedNoteId": matched_note_id,
@@ -730,7 +833,11 @@ class MonitorStore:
                 }.get(matched_by, ""),
                 "inExcel": in_excel,
                 "excelStatus": "existing" if in_excel else "missing",
-                "isRelevant": relevant,
+                "isRelevant": relevance_status == "relevant",
+                "relevanceStatus": relevance_status,
+                "relevanceSource": (str(existing["relevance_source"] or "") if existing is not None and "relevance_source" in existing.keys() else ("excel" if in_excel else ("keyword" if relevant else ""))),
+                "relevanceReason": (str(existing["relevance_reason"] or "") if existing is not None and "relevance_reason" in existing.keys() else ""),
+                "relevanceConfidence": (float(existing["relevance_confidence"] or 0) if existing is not None and "relevance_confidence" in existing.keys() else (1.0 if in_excel else 0.0)),
                 "firstSeenAt": first_seen_at,
                 "relevanceMatches": relevance_matches,
                 "pullStatus": str(existing["pull_status"]) if existing is not None and "pull_status" in existing.keys() else "not_started",
@@ -793,6 +900,12 @@ class MonitorStore:
                 if existing is not None:
                     note_url = preferred_url(existing["url"], note_url)
                 relevant, relevance_matches = relevance_match(title, content, tags, media_text, author)
+                stored_relevance = (str(existing["relevance_status"] or "")
+                                    if existing is not None and "relevance_status" in existing.keys() else "")
+                if stored_relevance == "relevant":
+                    relevant = True
+                elif stored_relevance == "irrelevant":
+                    relevant = False
                 in_excel = bool(excel_existing is not None) if title_only else bool(
                     existing is not None and str(existing["source"]) == "existing_xlsx"
                 )
@@ -802,8 +915,8 @@ class MonitorStore:
                         statuses.append(status_record(
                             note_id,
                             str(existing["note_id"]) if existing is not None else note_id,
-                            "new",
-                            True,
+                            "irrelevant" if stored_relevance == "irrelevant" else "new",
+                            stored_relevance != "irrelevant",
                             matched_by,
                             False,
                             False,
@@ -871,7 +984,7 @@ class MonitorStore:
                             tags = CASE WHEN ? <> '' THEN ? ELSE tags END,
                             keyword = CASE WHEN ? <> '' THEN ? ELSE keyword END,
                             page_url = CASE WHEN ? <> '' THEN ? ELSE page_url END,
-                            is_relevant = 1,
+                            is_relevant = 1, relevance_status='relevant',
                             title_key = CASE WHEN ? <> '' THEN ? ELSE title_key END,
                             content_key = CASE WHEN ? <> '' THEN ? ELSE content_key END,
                             title_content_key = CASE WHEN ? <> '' THEN ? ELSE title_content_key END,
@@ -1219,6 +1332,145 @@ class MonitorStore:
                 (note_id, max(1, min(int(limit), 2000))),
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+    def note_status(self, note_id: str) -> dict[str, Any]:
+        note_id = valid_note_id(note_id)
+        if not note_id:
+            raise ValueError("noteId is required")
+        with self.lock, self._session() as db:
+            row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+        if row is None:
+            return {"ok": True, "noteId": note_id, "found": False, "inExcel": False,
+                    "pullStatus": "not_started", "relevanceStatus": "unknown"}
+        item = dict(row)
+        in_excel = item.get("source") == "existing_xlsx" or item.get("pull_status") in {"synced", "partial"}
+        relevance_status = item.get("relevance_status") or ("relevant" if item.get("is_relevant") else "unknown")
+        return {"ok": True, "noteId": note_id, "found": True, "status": item.get("status", "new"),
+                "inExcel": bool(in_excel), "pullStatus": item.get("pull_status") or "not_started",
+                "pullError": item.get("pull_error") or "", "relevanceStatus": relevance_status,
+                "isRelevant": relevance_status == "relevant", "relevanceSource": item.get("relevance_source") or "",
+                "relevanceReason": item.get("relevance_reason") or "",
+                "relevanceConfidence": float(item.get("relevance_confidence") or 0)}
+
+    def _sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        if not xlsx_path or not xlsx_path.exists():
+            raise ValueError("未配置 Excel 总表路径")
+        from openpyxl import load_workbook
+        headers = ["笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
+                   "发布时间", "来源词", "笔记ID", "博主ID", "评论数量", "相关性状态", "AI判断来源",
+                   "AI置信度", "AI判断理由", "分析时间", "评论内容汇总"]
+        temporary_path = xlsx_path.with_name(f".{xlsx_path.stem}.irrelevant-{os.getpid()}.tmp{xlsx_path.suffix}")
+        with self.lock:
+            workbook = load_workbook(xlsx_path)
+            try:
+                sheet = workbook["sheet3_不相关帖子"] if "sheet3_不相关帖子" in workbook.sheetnames else workbook.create_sheet("sheet3_不相关帖子")
+                if sheet.max_row == 1 and all(cell.value is None for cell in sheet[1]):
+                    sheet.delete_rows(1)
+                if sheet.max_row == 0:
+                    sheet.append(headers)
+                existing_headers = self._excel_headers(sheet)
+                for header in headers:
+                    if header not in existing_headers:
+                        sheet.cell(1, sheet.max_column + 1, header)
+                        existing_headers = self._excel_headers(sheet)
+                id_column = existing_headers["笔记ID"]
+                note_id = valid_note_id(note.get("noteId"))
+                target_row = next((row for row in range(2, sheet.max_row + 1)
+                                   if valid_note_id(sheet.cell(row, id_column).value) == note_id), sheet.max_row + 1)
+                comment_text = "\n".join(
+                    f"[{text(item.get('author'), 100)}] {text(item.get('content'), 1000)}"
+                    for item in comments if isinstance(item, dict) and text(item.get("content"), 1000)
+                )[:30000]
+                values = {
+                    "笔记url": text(note.get("url"), 2000), "用户主页url": text(note.get("authorUrl"), 2000),
+                    "用户昵称": text(note.get("author"), 500), "笔记标题": text(note.get("title"), 1000),
+                    "笔记内容": text(note.get("content"), 12000), "笔记话题": tag_text(note.get("tags")),
+                    "发布时间": text(note.get("publishedAt"), 100), "来源词": text(note.get("keyword"), 200),
+                    "笔记ID": note_id, "博主ID": text(note.get("authorId"), 256), "评论数量": len(comments),
+                    "相关性状态": "不相关", "AI判断来源": "DeepSeek", "AI置信度": decision["confidence"],
+                    "AI判断理由": decision["reason"], "分析时间": decision["analyzedAt"], "评论内容汇总": comment_text,
+                }
+                for header, column in existing_headers.items():
+                    if header in values:
+                        sheet.cell(target_row, column, values[header])
+                workbook.save(temporary_path)
+            finally:
+                workbook.close()
+            os.replace(temporary_path, xlsx_path)
+        return {"path": str(xlsx_path), "sheet": "sheet3_不相关帖子", "row": target_row}
+
+    def analyze_relevance(self, payload: dict[str, Any]) -> dict[str, Any]:
+        note = payload.get("note") or {}
+        comments = payload.get("comments") or []
+        if not isinstance(note, dict) or not isinstance(comments, list):
+            raise ValueError("note and comments are required")
+        note_id = valid_note_id(note.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        timestamp = now_iso()
+        title = text(note.get("title"), 1000)
+        content = text(note.get("content"), 12000)
+        tags = tag_text(note.get("tags"))
+        title_key, content_key, combined_key = identity_keys(title, content)
+        with self.lock, self._session() as db:
+            db.execute(
+                """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
+                   status,is_relevant,source,title_key,content_key,title_content_key,payload_json,relevance_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,'new',0,'dom',?,?,?,?,'unknown')
+                   ON CONFLICT(note_id) DO UPDATE SET url=excluded.url,title=excluded.title,author=excluded.author,
+                   content=excluded.content,tags=excluded.tags,keyword=excluded.keyword,page_url=excluded.page_url,
+                   title_key=excluded.title_key,content_key=excluded.content_key,title_content_key=excluded.title_content_key,
+                   payload_json=excluded.payload_json,last_seen_at=excluded.last_seen_at""",
+                (note_id, text(note.get("url"), 2000), title, text(note.get("author"), 500), content, tags,
+                 text(note.get("keyword"), 200), text(note.get("pageUrl"), 2000), timestamp, timestamp,
+                 title_key, content_key, combined_key, json.dumps(note, ensure_ascii=False)),
+            )
+        self.upsert_comments({"noteId": note_id, "comments": comments,
+                              "expectedCount": payload.get("expectedCount") or len(comments),
+                              "status": payload.get("commentStatus") or "partial", "collectedAt": timestamp})
+        settings = self.ai_settings.get(True)
+        if not settings.get("configured"):
+            raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
+        compact_comments = [{"author": text(item.get("author"), 200), "content": text(item.get("content"), 2000),
+                             "level": int(item.get("commentLevel") or 1), "is_author": bool(item.get("isAuthor"))}
+                            for item in comments if isinstance(item, dict) and text(item.get("content"), 2000)]
+        schema = {"relevance_status": "relevant/irrelevant/uncertain", "confidence": 0.0,
+                  "reason": "简短、可核验理由", "matched_topics": []}
+        data = {"monitor_brand": "ORIGANI（含品牌、产品、门店、员工/账号 Talia 等品牌舆情）",
+                "title": title, "content": content, "tags": tags, "author": text(note.get("author"), 500),
+                "comments": compact_comments}
+        messages = [
+            {"role": "system", "content": "你是品牌舆情相关性审核员。综合帖子正文和全部评论判断是否与监控品牌直接相关。仅出现搜索联想、同名无关词、路人顺带提及且主题无关时判不相关；证据不足判 uncertain。严格输出一个有效 JSON 对象，不要 Markdown。"},
+            {"role": "user", "content": "输出结构：%s。输入：%s" % (json.dumps(schema, ensure_ascii=False), json.dumps(data, ensure_ascii=False))},
+        ]
+        raw = self.ai_client.complete_json(settings, messages)
+        raw_status = text(raw.get("relevance_status"), 30).lower()
+        confidence = max(0.0, min(float(raw.get("confidence") or 0), 1.0))
+        relevance_status = raw_status if raw_status in {"relevant", "irrelevant"} and confidence >= 0.65 else "unknown"
+        reason = text(raw.get("reason"), 2000)
+        decision = {"status": relevance_status, "confidence": confidence, "reason": reason, "analyzedAt": timestamp,
+                    "matchedTopics": raw.get("matched_topics") if isinstance(raw.get("matched_topics"), list) else []}
+        with self.lock, self._session() as db:
+            db.execute("""UPDATE notes SET relevance_status=?,relevance_source='ai',relevance_reason=?,
+                       relevance_confidence=?,relevance_analyzed_at=?,is_relevant=?,status=? WHERE note_id=?""",
+                       (relevance_status, reason, confidence, timestamp, int(relevance_status == "relevant"),
+                        "irrelevant" if relevance_status == "irrelevant" else "new", note_id))
+            db.execute("""INSERT INTO ai_analysis_records(target_type,target_id,model,request_json,response_json,status,created_at)
+                       VALUES('relevance',?,?,?,?, 'completed',?)""",
+                       (note_id, settings["model"], json.dumps(messages, ensure_ascii=False), json.dumps(decision, ensure_ascii=False), timestamp))
+        excel = None
+        excel_warning = ""
+        if relevance_status == "irrelevant":
+            try:
+                excel = self._sync_irrelevant_to_xlsx(note, comments, decision)
+            except Exception as exc:
+                excel_warning = text(exc, 1000)
+        return {"ok": True, "noteId": note_id, "relevanceStatus": relevance_status,
+                "isRelevant": relevance_status == "relevant", "relevanceSource": "ai",
+                "relevanceReason": reason, "relevanceConfidence": confidence,
+                "excel": excel, "excelWarning": excel_warning, "commentCount": len(compact_comments)}
 
     def enqueue_ai(self, target_type: str, target_id: str, priority: int = 50, force: bool = False) -> dict[str, Any]:
         if target_type not in {"note", "comment"}:
@@ -1638,7 +1890,7 @@ class MonitorStore:
             latest = db.execute("SELECT MAX(last_seen_at) FROM notes").fetchone()[0]
             excel_existing = int(db.execute("SELECT COUNT(*) FROM notes WHERE source='existing_xlsx'").fetchone()[0])
             excel_missing = int(db.execute(
-                "SELECT COUNT(*) FROM notes WHERE source<>'existing_xlsx' AND is_relevant=1 AND status<>'ignored'"
+                "SELECT COUNT(*) FROM notes WHERE source<>'existing_xlsx' AND relevance_status='relevant' AND status<>'ignored'"
             ).fetchone()[0])
             pull_rows = db.execute(
                 "SELECT pull_status, COUNT(*) AS count FROM notes WHERE source<>'existing_xlsx' GROUP BY pull_status"
@@ -1737,6 +1989,39 @@ class MonitorStore:
         ))
         return f"dom-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
 
+    def _resolve_pull_identity(self, note: dict[str, Any]) -> tuple[str, str]:
+        """Resolve a pull to one canonical local note before any file is written.
+
+        Exact note ID wins. If the ID only belongs to a transient DOM record,
+        an already-synced Excel row with the same complete title+content wins so
+        retries cannot create a second material folder, SQLite note, or Excel row.
+        """
+        incoming_id = valid_note_id(note.get("noteId"))
+        if not incoming_id:
+            raise ValueError("noteId is required")
+        title_value, content_value, combined_value = identity_keys(note.get("title"), note.get("content"))
+        with self.lock, self._session() as db:
+            exact = db.execute(
+                "SELECT note_id,source,pull_status FROM notes WHERE note_id=?",
+                (incoming_id,),
+            ).fetchone()
+            if exact and (str(exact["source"]) == "existing_xlsx" or str(exact["pull_status"]) in {"synced", "partial"}):
+                return incoming_id, "note_id"
+            if combined_value:
+                canonical = db.execute(
+                    """SELECT note_id FROM notes
+                       WHERE title_content_key=?
+                         AND (source='existing_xlsx' OR pull_status IN ('synced','partial'))
+                       ORDER BY CASE WHEN source='existing_xlsx' THEN 0 ELSE 1 END, first_seen_at
+                       LIMIT 1""",
+                    (combined_value,),
+                ).fetchone()
+                if canonical:
+                    return str(canonical["note_id"]), "title_content"
+            if exact:
+                return incoming_id, "note_id"
+        return incoming_id, "new"
+
     def _media_root(self) -> Path:
         xlsx_path = getattr(self, "seed_xlsx_path", None)
         if xlsx_path:
@@ -1746,7 +2031,7 @@ class MonitorStore:
     @staticmethod
     def _safe_media_folder_name(note: dict[str, Any]) -> str:
         note_id = valid_note_id(note.get("noteId")) or "unknown-note"
-        title = text(note.get("title"), 120)
+        title = canonical_note_title(note.get("title"), note.get("content"), 80)
         title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", title).strip(" .")
         title = re.sub(r"\s+", " ", title)[:80].strip(" .") or "未命名帖子"
         return f"{title}__{note_id}"
@@ -1850,7 +2135,7 @@ class MonitorStore:
         metadata = {
             "noteId": note_id,
             "url": text(note.get("url"), 2000),
-            "title": text(note.get("title"), 1000),
+            "title": canonical_note_title(note.get("title"), note.get("content"), 80),
             "content": text(note.get("content"), 12000),
             "tags": note.get("tags") or [],
             "imageUrls": image_urls,
@@ -1859,7 +2144,7 @@ class MonitorStore:
         (folder / "note.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         files.append("note.json")
         text_snapshot = "\n".join((
-            text(note.get("title"), 1000) or "未命名帖子",
+            canonical_note_title(note.get("title"), note.get("content"), 80),
             "",
             text(note.get("content"), 12000),
             "",
@@ -1939,10 +2224,34 @@ class MonitorStore:
                 raise ValueError("noteId is required")
             note_id_column = note_headers["笔记ID"]
             existing_note_row = None
+            matched_by = "new"
             for row_number in range(2, note_sheet.max_row + 1):
                 if text(note_sheet.cell(row_number, note_id_column).value, 128) == note_id:
                     existing_note_row = row_number
+                    matched_by = "note_id"
                     break
+            # Defensive Excel-side fallback for legacy rows whose note ID was
+            # missing or changed, but whose fully-read title and body are equal.
+            if existing_note_row is None:
+                incoming_title, incoming_content, incoming_combined = identity_keys(
+                    note.get("title"), note.get("content")
+                )
+                if incoming_combined:
+                    title_column = note_headers.get("笔记标题")
+                    content_column = note_headers.get("笔记内容")
+                    if title_column and content_column:
+                        for row_number in range(2, note_sheet.max_row + 1):
+                            _, _, row_combined = identity_keys(
+                                note_sheet.cell(row_number, title_column).value,
+                                note_sheet.cell(row_number, content_column).value,
+                            )
+                            if row_combined == incoming_combined:
+                                existing_note_row = row_number
+                                matched_by = "title_content"
+                                stored_id = valid_note_id(note_sheet.cell(row_number, note_id_column).value)
+                                if stored_id:
+                                    note_id = stored_id
+                                break
             is_new_note = existing_note_row is None
             note_row = existing_note_row or max(2, note_sheet.max_row + 1)
             if is_new_note:
@@ -1965,7 +2274,7 @@ class MonitorStore:
                 "笔记url": note_url,
                 "用户主页url": text(note.get("authorUrl"), 2000),
                 "用户昵称": text(note.get("author"), 500),
-                "笔记标题": text(note.get("title"), 1000),
+                "笔记标题": canonical_note_title(note.get("title"), note.get("content"), 80),
                 "笔记内容": text(note.get("content"), 12000),
                 "笔记话题": note_tags,
                 "点赞量": note.get("likeCount", ""),
@@ -1991,7 +2300,7 @@ class MonitorStore:
 
             comment_id_column = comment_headers["笔记评论ID"]
             existing_comment_rows_by_id: dict[str, int] = {}
-            existing_comment_rows_by_key: dict[tuple[str, str, str], int] = {}
+            existing_comment_rows_by_key: dict[tuple[str, str, str, str], int] = {}
             for row_number in range(2, comment_sheet.max_row + 1):
                 row_id = text(comment_sheet.cell(row_number, comment_id_column).value, 256)
                 if row_id:
@@ -2000,6 +2309,8 @@ class MonitorStore:
                 content_column = comment_headers.get("评论内容")
                 time_column = comment_headers.get("评论时间")
                 row_key = (
+                    note_url_identity(comment_sheet.cell(row_number, comment_headers.get("原笔记url")).value)
+                    if comment_headers.get("原笔记url") else "",
                     text(comment_sheet.cell(row_number, author_column).value, 500) if author_column else "",
                     text(comment_sheet.cell(row_number, content_column).value, 8000) if content_column else "",
                     text(comment_sheet.cell(row_number, time_column).value, 100) if time_column else "",
@@ -2008,11 +2319,13 @@ class MonitorStore:
                     existing_comment_rows_by_key[row_key] = row_number
 
             inserted_comments = 0
+            duplicate_comments = 0
             for item in comments:
                 if not isinstance(item, dict) or not text(item.get("content"), 8000):
                     continue
                 generated_id = self._excel_comment_id(note_id, item)
                 comment_key = (
+                    note_url_identity(note_url) or note_id,
                     text(item.get("author"), 500),
                     text(item.get("content"), 8000),
                     text(item.get("publishedAt"), 100),
@@ -2048,6 +2361,8 @@ class MonitorStore:
                 existing_comment_rows_by_key[comment_key] = row_number
                 if is_new_comment:
                     inserted_comments += 1
+                else:
+                    duplicate_comments += 1
                 self._extend_excel_tables(comment_sheet, row_number)
 
             temporary_path = xlsx_path.with_name(
@@ -2069,6 +2384,9 @@ class MonitorStore:
                 "path": str(xlsx_path),
                 "postAdded": int(is_new_note),
                 "commentAdded": inserted_comments,
+                "commentSkipped": duplicate_comments,
+                "deduplicated": (not is_new_note) or duplicate_comments > 0,
+                "matchedBy": matched_by,
                 "noteRow": note_row,
             }
         finally:
@@ -2104,9 +2422,138 @@ class MonitorStore:
         note_sheet.append(note_headers)
         comment_sheet = workbook.create_sheet("sheet2_评论总表")
         comment_sheet.append(comment_headers)
+        irrelevant_sheet = workbook.create_sheet("sheet3_不相关帖子")
+        irrelevant_sheet.append(["笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
+                                 "发布时间", "来源词", "笔记ID", "博主ID", "评论数量", "相关性状态",
+                                 "AI判断来源", "AI置信度", "AI判断理由", "分析时间", "评论内容汇总"])
         workbook.save(xlsx_path)
         workbook.close()
         print(f"[bridge] 已自动创建 Excel 总表：{xlsx_path}")
+
+    def delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Physically remove one pulled note from Excel, SQLite and its media folder."""
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        xlsx_path = getattr(self, "seed_xlsx_path", None)
+        if not xlsx_path:
+            raise ValueError("未配置 Excel 总表路径")
+        xlsx_path = Path(xlsx_path)
+        if not xlsx_path.exists():
+            raise ValueError("Excel 总表不存在")
+
+        from openpyxl import load_workbook
+        from openpyxl.utils.cell import get_column_letter, range_boundaries
+
+        with self.pull_lock:
+            with self.lock, self._session() as db:
+                note_row = db.execute(
+                    "SELECT note_id,media_dir FROM notes WHERE note_id=?", (note_id,)
+                ).fetchone()
+                comment_ids = [str(row[0]) for row in db.execute(
+                    "SELECT comment_id FROM comments WHERE note_id=?", (note_id,)
+                ).fetchall()]
+            if note_row is None:
+                raise ValueError("本地数据库中未找到该帖子")
+
+            media_dir = Path(text(note_row["media_dir"], 4000)).expanduser() if text(note_row["media_dir"], 4000) else None
+            media_root = self._media_root().resolve()
+            tombstone: Path | None = None
+            if media_dir and media_dir.exists():
+                resolved_media = media_dir.resolve()
+                if resolved_media.parent != media_root:
+                    raise ValueError("素材目录不在受管 posts_materials 目录内，已停止删除")
+                tombstone = resolved_media.with_name(f".{resolved_media.name}.deleting-{os.getpid()}-{time.time_ns()}")
+                resolved_media.rename(tombstone)
+
+            workbook = None
+            temporary_path: Path | None = None
+            backup_path: Path | None = None
+            deleted_note_rows = 0
+            deleted_comment_rows = 0
+            try:
+                workbook = load_workbook(xlsx_path)
+                if "sheet1_笔记总表" not in workbook.sheetnames or "sheet2_评论总表" not in workbook.sheetnames:
+                    raise ValueError("Excel 总表缺少笔记或评论工作表")
+                note_sheet = workbook["sheet1_笔记总表"]
+                comment_sheet = workbook["sheet2_评论总表"]
+                note_headers = self._excel_headers(note_sheet)
+                comment_headers = self._excel_headers(comment_sheet)
+                note_id_column = note_headers.get("笔记ID")
+                comment_id_column = comment_headers.get("笔记评论ID")
+                comment_url_column = comment_headers.get("原笔记url")
+                if not note_id_column or not comment_id_column:
+                    raise ValueError("Excel 总表缺少帖子或评论 ID 列")
+
+                for row_number in range(note_sheet.max_row, 1, -1):
+                    if valid_note_id(note_sheet.cell(row_number, note_id_column).value) == note_id:
+                        note_sheet.delete_rows(row_number, 1)
+                        deleted_note_rows += 1
+
+                comment_id_set = set(comment_ids)
+                for row_number in range(comment_sheet.max_row, 1, -1):
+                    row_comment_id = text(comment_sheet.cell(row_number, comment_id_column).value, 256)
+                    url_identity = note_url_identity(comment_sheet.cell(row_number, comment_url_column).value) if comment_url_column else ""
+                    if row_comment_id in comment_id_set or url_identity == note_id:
+                        comment_sheet.delete_rows(row_number, 1)
+                        deleted_comment_rows += 1
+
+                for sheet in (note_sheet, comment_sheet):
+                    for table in sheet.tables.values():
+                        min_col, min_row, max_col, _max_row = range_boundaries(table.ref)
+                        table.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max(min_row, sheet.max_row)}"
+
+                temporary_path = xlsx_path.with_name(
+                    f".{xlsx_path.stem}.delete-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.tmp.xlsx"
+                )
+                workbook.save(temporary_path)
+                workbook.close()
+                workbook = None
+                try:
+                    backup_path = xlsx_path.with_name(
+                        f".{xlsx_path.stem}.delete-backup-{os.getpid()}-{time.time_ns()}.xlsx"
+                    )
+                    shutil.copy2(xlsx_path, backup_path)
+                    os.replace(temporary_path, xlsx_path)
+                except PermissionError as exc:
+                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试删除") from exc
+                temporary_path = None
+
+                with self.lock, self._session() as db:
+                    if comment_ids:
+                        placeholders = ",".join("?" for _ in comment_ids)
+                        db.execute(f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids)
+                        db.execute(f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids)
+                    db.execute("DELETE FROM ai_jobs WHERE target_type='note' AND target_id=?", (note_id,))
+                    db.execute("DELETE FROM ai_analysis_records WHERE target_type='note' AND target_id=?", (note_id,))
+                    db.execute("DELETE FROM comment_collection_jobs WHERE note_id=?", (note_id,))
+                    db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
+                    db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
+
+                if tombstone and tombstone.exists():
+                    shutil.rmtree(tombstone)
+                if backup_path and backup_path.exists():
+                    backup_path.unlink()
+                return {
+                    "ok": True, "noteId": note_id, "excelPath": str(xlsx_path),
+                    "deletedNoteRows": deleted_note_rows,
+                    "deletedCommentRows": deleted_comment_rows,
+                    "deletedDatabaseComments": len(comment_ids),
+                    "mediaDeleted": bool(tombstone),
+                }
+            except Exception:
+                if backup_path and backup_path.exists():
+                    os.replace(backup_path, xlsx_path)
+                if tombstone and tombstone.exists() and media_dir and not media_dir.exists():
+                    tombstone.rename(media_dir)
+                raise
+            finally:
+                if workbook is not None:
+                    workbook.close()
+                if temporary_path and temporary_path.exists():
+                    temporary_path.unlink(missing_ok=True)
+                if backup_path and backup_path.exists():
+                    backup_path.unlink(missing_ok=True)
 
     def _sync_ai_result_to_xlsx(self, target_type: str, target_id: str, result: dict[str, Any]) -> None:
         """Write completed AI sentiment back to the matching Excel row."""
@@ -2155,12 +2602,20 @@ class MonitorStore:
                     print(f"[bridge] Excel 总表被占用，AI 情绪回写跳过：{xlsx_path}", flush=True)
 
     def pull_to_excel(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Serialize and deduplicate one complete pull transaction."""
+        with self.pull_lock:
+            return self._pull_to_excel_locked(payload)
+
+    def _pull_to_excel_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Persist a completed browser read and make it visible in Excel."""
         raw_note = payload.get("note") if isinstance(payload.get("note"), dict) else payload
         note = dict(raw_note or {})
-        note_id = valid_note_id(note.get("noteId"))
-        if not note_id:
+        incoming_note_id = valid_note_id(note.get("noteId"))
+        if not incoming_note_id:
             raise ValueError("noteId is required")
+        note["title"] = canonical_note_title(note.get("title"), note.get("content"), 80)
+        note_id, prewrite_matched_by = self._resolve_pull_identity(note)
+        note["noteId"] = note_id
         comments = payload.get("comments") or []
         if not isinstance(comments, list):
             raise ValueError("comments must be an array")
@@ -2234,7 +2689,7 @@ class MonitorStore:
         final_error = "；".join(errors) if partial else ""
         with self.lock, self._session() as db:
             db.execute(
-                """UPDATE notes SET status='known', is_relevant=1, source='existing_xlsx',
+                """UPDATE notes SET status='known', is_relevant=1, source='existing_xlsx', relevance_status='relevant', relevance_source='pull',
                    pull_status=?, pull_error=?, last_pull_at=?, excel_synced_at=?,
                    excel_sync_path=?, media_status=?, media_dir=?, media_file_count=?, media_error=?
                    WHERE note_id=?""",
@@ -2253,12 +2708,21 @@ class MonitorStore:
         return {
             "ok": True,
             "noteId": note_id,
+            "incomingNoteId": incoming_note_id,
             "status": "known",
             "pullStatus": final_status,
             "commentStatus": comment_status,
             "commentError": comment_error,
             "postAdded": xlsx_result["postAdded"],
             "commentAdded": xlsx_result["commentAdded"],
+            "commentSkipped": int(xlsx_result.get("commentSkipped", 0) or 0),
+            "deduplicated": bool(
+                prewrite_matched_by != "new" or xlsx_result.get("deduplicated")
+            ),
+            "matchedBy": (
+                prewrite_matched_by if prewrite_matched_by != "new"
+                else text(xlsx_result.get("matchedBy"), 40) or "new"
+            ),
             "commentCount": comment_result["collectedCount"],
             "excelPath": xlsx_result["path"],
             "excelRow": int(xlsx_result.get("noteRow", 0) or 0),
@@ -2466,6 +2930,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 status = text(query.get("status", [""])[0], 30)
                 limit = int(query.get("limit", [100])[0])
                 self._send_json(200, {"ok": True, "notes": self.store.list_notes(status, limit)})
+            elif parsed.path == "/api/note/status":
+                query = parse_qs(parsed.query)
+                self._send_json(200, self.store.note_status(text(query.get("noteId", [""])[0], 128)))
             elif parsed.path == "/api/comments":
                 query = parse_qs(parsed.query)
                 note_id = text(query.get("noteId", [""])[0], 128)
@@ -2510,6 +2977,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.scan(payload)
             elif self.path == "/api/pull":
                 result = self.store.pull_to_excel(payload)
+            elif self.path == "/api/note/delete":
+                result = self.store.delete_pulled_note(payload)
+            elif self.path == "/api/relevance/analyze":
+                result = self.store.analyze_relevance(payload)
             elif self.path == "/api/open":
                 result = self.store.open_local_artifact(payload)
             elif self.path == "/api/confirm":

@@ -10,6 +10,9 @@ const REQUEST_TIMEOUT_MS = 6500;
 const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 12000;
+const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
+const CONTENT_STYLE_FILES = ["content.css"];
+const contentInjectionTasks = new Map();
 
 let nativeStartPromise = null;
 let deepScanPromise = null;
@@ -547,6 +550,42 @@ async function restoreDeepScanSurface(tabId, pageUrl) {
   return true;
 }
 
+function isInjectableXhsUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" && (url.hostname === "xiaohongshu.com" || url.hostname.endsWith(".xiaohongshu.com"));
+  } catch (_error) { return false; }
+}
+
+async function ensureContentInjected(tabId) {
+  const safeTabId = Number(tabId) || 0;
+  if (!safeTabId) throw new Error("没有找到当前小红书标签页");
+  const tab = await chrome.tabs.get(safeTabId).catch(() => null);
+  if (!tab || !isInjectableXhsUrl(tab.url)) throw new Error("当前标签页不是小红书页面");
+  const ping = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+  if (ping) return { ok: true, injected: false, tabId: safeTabId };
+  if (contentInjectionTasks.has(safeTabId)) return contentInjectionTasks.get(safeTabId);
+  const task = (async () => {
+    await chrome.scripting.insertCSS({ target: { tabId: safeTabId }, files: CONTENT_STYLE_FILES }).catch(() => {});
+    await chrome.scripting.executeScript({ target: { tabId: safeTabId }, files: CONTENT_SCRIPT_FILES });
+    await delay(80);
+    const ready = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+    if (!ready) throw new Error("插件自动注入后尚未就绪，请稍后重试");
+    return { ok: true, injected: true, tabId: safeTabId };
+  })();
+  contentInjectionTasks.set(safeTabId, task);
+  try { return await task; }
+  finally { contentInjectionTasks.delete(safeTabId); }
+}
+
+async function sendTabMessage(tabId, message) {
+  try { return await chrome.tabs.sendMessage(tabId, message); }
+  catch (_error) {
+    await ensureContentInjected(tabId);
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 async function activeXhsTab(preferredTabId = null) {
   if (preferredTabId) {
     try {
@@ -691,6 +730,48 @@ async function resolvePullUrl(note) {
   }
   if (desktopAccessibleUrl(note.url)) return note.url;
   throw new Error("当前页面没有可用的帖子访问链接，请先刷新小红书搜索结果页后重试");
+}
+
+async function getNoteStatus(noteId) {
+  if (!noteId) return { ok: true, found: false, inExcel: false, pullStatus: "not_started", relevanceStatus: "unknown" };
+  return bridgeApi(`/api/note/status?noteId=${encodeURIComponent(noteId)}`);
+}
+
+async function analyzeNoteRelevance(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法判断相关性" };
+  return runExclusivePageTask(async () => {
+    const noteId = note.noteId;
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    try {
+      broadcastPullProgress({ noteId, phase: "body", process: true, mode: "relevance",
+      title: "正在读取正文，准备判断品牌相关性", note }, activeTab.id);
+    const extracted = await chrome.tabs.sendMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: true, process: true, relevanceAnalysis: true }
+    }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
+    if (!extracted?.ok || !extracted.note?.content) {
+      throw new Error(extracted?.error || "尚未读到完整正文，稍后重试");
+    }
+    const comments = Array.isArray(extracted.comments) ? extracted.comments : [];
+    broadcastPullProgress({ noteId, phase: "excel", process: true, mode: "relevance",
+      title: `正文与 ${comments.length} 条评论已读取，DeepSeek 正在判断相关性`,
+      note: extracted.note, commentCount: comments.length }, activeTab.id);
+    const config = await getConfig();
+    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/relevance/analyze"), {
+      method: "POST", body: JSON.stringify({ note: extracted.note, comments,
+        expectedCount: extracted.expectedCount || comments.length,
+        commentStatus: extracted.status || "partial" })
+    }, 120000);
+    broadcastPullProgress({ noteId, phase: "done", process: true, mode: "relevance", done: true, ok: true,
+      title: result.relevanceStatus === "relevant" ? "AI 判断：相关" : result.relevanceStatus === "irrelevant" ? "AI 判断：不相关，已写入不相关 Sheet" : "AI 证据不足：保持未知",
+      relevanceStatus: result.relevanceStatus, note: extracted.note }, activeTab.id);
+      return result;
+    } catch (error) {
+      broadcastPullProgress({ noteId, phase: "failed", process: true, mode: "relevance", done: true,
+        ok: false, error: error?.message || "AI 判断失败", title: error?.message || "AI 判断失败", note }, activeTab.id);
+      throw error;
+    }
+  });
 }
 
 async function pullNote(note, preferredTabId = null) {
@@ -1031,9 +1112,28 @@ async function setConfig(nextConfig) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.type === "ensureContentInjected") {
+      const tab = await activeXhsTab(message.tabId || sender.tab?.id || null);
+      if (!tab?.id) throw new Error("没有找到当前小红书标签页");
+      return ensureContentInjected(tab.id);
+    }
+    if (message.type === "sendToActiveXhsTab") {
+      const tab = await activeXhsTab(message.tabId || sender.tab?.id || null);
+      if (!tab?.id) throw new Error("没有找到当前小红书标签页");
+      return sendTabMessage(tab.id, message.payload || {});
+    }
     if (message.type === "scanPage") return scanPage(message.payload || {});
     if (message.type === "confirmNote") return confirmNote(message.note || {});
     if (message.type === "pullNote") return pullNote(message.note || {}, sender.tab?.id || null);
+    if (message.type === "deletePulledNote") {
+      return bridgeApi("/api/note/delete", {
+        method: "POST",
+        body: JSON.stringify({ noteId: message.noteId || message.note?.noteId || "" }),
+        timeoutMs: 60000
+      });
+    }
+    if (message.type === "getNoteStatus") return getNoteStatus(message.noteId || message.note?.noteId || "");
+    if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);
     if (message.type === "openLocalArtifact") {
       return bridgeApi("/api/open", {
         method: "POST",

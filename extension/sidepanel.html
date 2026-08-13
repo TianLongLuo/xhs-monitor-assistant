@@ -11,8 +11,8 @@
       <header class="brand-header">
         <div class="brand-mark" aria-hidden="true">O</div>
         <div class="brand-copy">
-          <div class="eyebrow">XIAOHONGSHU MONITOR</div>
-          <h1>帖子核对</h1>
+          <div class="eyebrow">ORIGANI RADAR</div>
+          <h1>舆情雷达</h1>
         </div>
         <div class="header-actions">
           <button id="toggleFloating" class="icon-button icon-button--float" type="button" title="缩小为悬浮窗" aria-label="缩小为悬浮窗">
@@ -71,7 +71,7 @@
         <div id="scanTrack" class="scan-track" aria-hidden="true">
           <span></span><i></i><i></i><i></i><i></i><i></i>
         </div>
-        <div class="section-kicker">CURRENT SURFACE</div>
+        <div class="section-kicker">当前页面</div>
         <div class="page-heading">
           <div>
             <h2 id="pageKeyword">等待小红书页面</h2>
@@ -82,15 +82,21 @@
         <div id="currentDetailCard" class="current-detail-card" hidden>
           <div class="current-detail-card__head">
             <div>
-              <span class="current-detail-card__kicker">OPEN DETAIL</span>
+              <span class="current-detail-card__kicker">当前帖子</span>
               <strong id="currentDetailTitle">当前打开帖子</strong>
             </div>
             <span id="currentDetailState" class="current-detail-card__state" data-state="ready">可操作</span>
           </div>
           <p id="currentDetailMeta" class="current-detail-card__meta"></p>
+          <div class="current-detail-card__statuses">
+            <span id="currentDetailPullStatus" data-state="missing">拉取：未拉取</span>
+            <span id="currentDetailRelevance" data-state="unknown">相关性：未知</span>
+            <button id="currentDetailAnalyze" type="button">AI 判断相关性</button>
+          </div>
           <div class="current-detail-card__actions">
             <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
             <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
+            <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 Excel、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
           <p id="currentDetailHint" class="current-detail-card__hint">点击后会在放大帖子右侧显示 Process，逐步读取正文、图片、评论及 ID。</p>
         </div>
@@ -165,7 +171,7 @@
         <div class="section-heading">
           <button id="queueBack" class="queue-back" type="button" hidden aria-label="返回待处理队列">←</button>
           <div>
-            <div id="queueKicker" class="section-kicker">NEW &amp; RELEVANT</div>
+            <div id="queueKicker" class="section-kicker">采集队列</div>
             <h2 id="queueTitle">新相关未拉取</h2>
             <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地 Excel 中还没有</p>
           </div>
