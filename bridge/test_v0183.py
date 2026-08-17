@@ -5,7 +5,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from server import MonitorStore
+from server import MonitorStore, audit_reply_candidate, classify_reply_context
 
 
 class MediaHandler(BaseHTTPRequestHandler):
@@ -43,9 +43,9 @@ class FakeAI:
 class FakeReplyAI:
     def complete_json(self, _settings, _messages):
         return {"need": "想确认价格", "candidates": [
-            {"reply": "这个价格我也会先问清楚再决定，建议直接问官方渠道～", "style": "直答", "why": "接住价格疑问"},
-            {"reply": "1600确实得先做做功课😂 可以先把规格和渠道问明白", "style": "轻松", "why": "语气更松"},
-            {"reply": "价格信息还是以官方当前渠道为准，别急着下单，先确认清楚更稳妥。", "style": "稳妥", "why": "避免编价"}
+            {"reply": "理解你对价格的顾虑。你发下产品全名，我们按门店公示价帮你核对。", "style": "直答", "why": "接住价格疑问"},
+            {"reply": "确实要先把价格问清楚。方便的话发张包装图，我们帮你确认具体款式。", "style": "共情", "why": "先确认产品"},
+            {"reply": "价格会跟系列和容量有关。告诉我们产品名和门店，我们再核对当日标价。", "style": "稳妥", "why": "避免编价"}
         ], "risk_notes": []}
 
 
@@ -107,6 +107,26 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(3, len(result["suggestion"]["candidates"]))
         self.assertIn("价格", result["suggestion"]["reply"])
+        self.assertEqual("价格疑问", result["suggestion"]["intent"])
+        self.assertTrue(all(item["riskLevel"] != "high" for item in result["suggestion"]["candidates"]))
+        with self.store._session() as db:
+            self.assertEqual(3, db.execute("SELECT COUNT(*) FROM reply_generation_history").fetchone()[0])
+
+    def test_reply_policy_flags_template_marketing_and_mismatch(self):
+        intent, sentiment = classify_reply_context("我今天被拉着推销，感觉很不舒服")
+        self.assertEqual(("推销投诉", "负面"), (intent, sentiment))
+        audit = audit_reply_candidate(
+            "感谢宝宝认可与喜爱，未来2-3个月会有更多优惠活动，欢迎来店体验。",
+            "我今天被拉着推销，感觉很不舒服", "brand", []
+        )
+        self.assertEqual("high", audit["riskLevel"])
+        self.assertTrue(any("语义不匹配" in item for item in audit["riskNotes"]))
+
+    def test_reply_policy_flags_high_similarity(self):
+        reply = "理解你对价格的顾虑。你发下产品全名，我们按门店公示价帮你核对。"
+        audit = audit_reply_candidate(reply, "这个多少钱", "brand", [reply])
+        self.assertEqual("high", audit["riskLevel"])
+        self.assertGreaterEqual(audit["similarityScore"], 0.99)
 
 
 if __name__ == "__main__":

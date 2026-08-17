@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from copy import copy
 from datetime import datetime
+from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.18.9"
+VERSION = "0.19.0"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -123,6 +124,88 @@ def text(value: Any, limit: int = 4000) -> str:
     if value is None:
         return ""
     return str(value).strip()[:limit]
+
+
+def classify_reply_context(value: Any) -> tuple[str, str]:
+    body = text(value, 3000)
+    intent_patterns = (
+        ("推销投诉", r"推销|拉着|强推|硬推|销售|压力|围着|拦着"),
+        ("价格疑问", r"价格|多少钱|太贵|巨贵|价差|便宜|贵了|\d+元"),
+        ("成分疑问", r"成分|水杨酸|配方|全成分|含有"),
+        ("使用问题", r"怎么用|用法|颗粒|刺痛|过敏|不舒服|不适|泛红|干燥"),
+        ("门店问题", r"门店|哪里买|在哪买|地址|杭州|深圳|商场"),
+        ("赠品售后", r"赠品|小票|退款|售后|少了|漏发"),
+        ("正向体验", r"好用|不错|喜欢|顺滑|不刺激|有效果"),
+    )
+    intent = next((label for label, pattern in intent_patterns if re.search(pattern, body, re.I)), "普通交流")
+    negative = bool(re.search(r"推销|强推|压力|贵|不舒服|不适|过敏|失望|骗人|退|投诉|抗拒|烦|差", body, re.I))
+    positive = bool(re.search(r"好用|不错|喜欢|顺滑|舒服|满意|有效果", body, re.I))
+    sentiment = "负面" if negative else "正面" if positive else "中立"
+    return intent, sentiment
+
+
+def audit_reply_candidate(reply: Any, target_content: Any, persona: str, recent_replies: list[str] | None = None) -> dict[str, Any]:
+    body = text(reply, 1000)
+    target = text(target_content, 3000)
+    compact = re.sub(r"\s+", "", body)
+    char_count = len(compact)
+    notes: list[str] = []
+    score = 0
+    minimum, maximum = (20, 60) if persona == "brand" else (12, 70)
+    if char_count < minimum or char_count > maximum:
+        notes.append(f"长度应为{minimum}—{maximum}字")
+        score += 45
+    sentence_count = len([item for item in re.split(r"[。！？!?]+", body) if item.strip()])
+    if sentence_count > 2:
+        notes.append("超过2句话")
+        score += 30
+    external_terms = [term for term in ("淘宝", "微信", "手机号", "二维码", "私信", "加V", "链接") if term in body]
+    if external_terms:
+        notes.append("含站外导流或联系方式：" + "、".join(external_terms))
+        score += 55
+    claim_terms = [term for term in ("有效抗衰老", "促进代谢", "绝对安全", "保证有效", "保证效果", "最好", "顶级", "百分百", "治愈") if term in body]
+    if claim_terms:
+        notes.append("含功效保证或绝对化表述：" + "、".join(claim_terms))
+        score += 55
+    marketing_terms = [term for term in ("优惠", "活动", "线上渠道", "到店体验", "欢迎围观", "欢迎体验", "品牌介绍") if term in body and term not in target]
+    if marketing_terms:
+        notes.append("主动追加营销信息：" + "、".join(marketing_terms))
+        score += 35
+    intent, sentiment = classify_reply_context(target)
+    if sentiment == "负面" and re.search(r"感谢.{0,5}(认可|喜爱)|感谢宝宝|欢迎.{0,4}(围观|体验)", body):
+        notes.append("与负面评论语义不匹配")
+        score += 60
+    if persona == "brand" and "宝宝" in body:
+        notes.append("品牌回复默认不使用“宝宝”")
+        score += 25
+    if sentiment == "负面" and re.search(r"[\U0001F300-\U0001FAFF]", body):
+        notes.append("投诉类回复不使用emoji")
+        score += 25
+    target_numbers = set(re.findall(r"\d+(?:\.\d+)?", target))
+    reply_numbers = set(re.findall(r"\d+(?:\.\d+)?", body))
+    invented_numbers = sorted(reply_numbers - target_numbers)
+    if invented_numbers:
+        notes.append("包含评论中未提供的数字：" + "、".join(invented_numbers))
+        score += 35
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", body.lower())
+    max_similarity = 0.0
+    for previous in recent_replies or []:
+        previous_normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", text(previous, 1000).lower())
+        if normalized and previous_normalized:
+            max_similarity = max(max_similarity, SequenceMatcher(None, normalized, previous_normalized).ratio())
+    if max_similarity >= 0.72:
+        notes.append(f"与近期回复相似度{max_similarity:.0%}")
+        score += 50
+    elif max_similarity >= 0.60:
+        notes.append(f"与近期回复相似度{max_similarity:.0%}")
+        score += 18
+    score = min(100, score)
+    level = "high" if score >= 45 else "medium" if score >= 20 else "low"
+    return {
+        "intent": intent, "sentiment": sentiment, "charCount": char_count,
+        "sentenceCount": sentence_count, "similarityScore": round(max_similarity, 4),
+        "riskScore": score, "riskLevel": level, "riskNotes": notes,
+    }
 
 
 def bool_value(value: Any) -> bool:
@@ -511,6 +594,22 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_ai_jobs_queue
                     ON ai_jobs(status, available_at, priority, created_at);
+
+                CREATE TABLE IF NOT EXISTS reply_generation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    note_id TEXT NOT NULL,
+                    comment_id TEXT NOT NULL,
+                    persona TEXT NOT NULL DEFAULT 'brand',
+                    intent TEXT NOT NULL DEFAULT '',
+                    generated_reply TEXT NOT NULL,
+                    risk_level TEXT NOT NULL DEFAULT 'low',
+                    risk_score INTEGER NOT NULL DEFAULT 0,
+                    similarity_score REAL NOT NULL DEFAULT 0,
+                    risk_notes TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reply_history_recent
+                    ON reply_generation_history(persona, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS comment_collection_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1675,7 +1774,7 @@ class MonitorStore:
         persona = text(payload.get("persona"), 30).lower()
         if persona not in {"brand", "community"}:
             persona = "brand"
-        compact_comments = []
+        compact_comments: list[dict[str, Any]] = []
         total_chars = 0
         for item in comments[:300]:
             if not isinstance(item, dict):
@@ -1697,67 +1796,109 @@ class MonitorStore:
             raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
         parent_id = text(target.get("parentCommentId") or target.get("parent_comment_id"), 256)
         parent_comment = next((item for item in compact_comments if item["comment_id"] == parent_id), None)
+        intent, sentiment = classify_reply_context(target_content)
+        with self.lock, self._session() as db:
+            recent_replies = [row["generated_reply"] for row in db.execute(
+                "SELECT generated_reply FROM reply_generation_history WHERE persona=? ORDER BY id DESC LIMIT 50",
+                (persona,),
+            ).fetchall()]
         persona_instruction = (
-            "你代表品牌官方账号。像真人运营在评论区当场回复，先回答用户眼前这句话。投诉、质疑和不适反馈要接住情绪，再给可执行且可核验的处理路径。语气亲切但不装熟，不写客服公函。"
+            "你代表ORIGANI品牌官方账号。只回应用户当前问题，不把评论写成广告。"
             if persona == "brand" else
-            "你是普通社区用户，在评论区自然接话。可以热心、好奇、轻松，但只能根据帖子和评论里的公开信息说话。不得声称自己买过、用过、到过门店或知道内幕，也不要替品牌作保证。"
+            "你是普通社区用户。自然接话，但不冒充消费者，不虚构购买、使用、门店经历或品牌内幕。"
         )
+        brand_rules = """
+品牌方硬规则：
+1. 每条20—60个汉字，最多2句话；第一句回应具体问题或感受，第二句只给一个可核实信息、核实动作或处理路径。
+2. 每条单独创作，不复用固定开头结尾。用户说贵、被推销、不舒服、失望时，禁止写“感谢认可与喜爱”。
+3. 不主动追加优惠、活动、渠道预告、到店邀请或品牌介绍；不提淘宝、微信、手机号、二维码和站外联系方式。
+4. 禁止“有效抗衰老、促进代谢、绝对安全、保证有效、最好、顶级”等功效保证或绝对化表述。
+5. 成分、价格、门店、赠品不确定时，请用户补充产品名、门店和日期，或明确说明需要核对。
+6. 默认不用“宝宝”；emoji最多1个，投诉和负面评论不用emoji。
+7. 不争辩、不教育用户、不为销售行为辩解，不生成统一营销尾巴。
+""" if persona == "brand" else """
+社区身份硬规则：每条12—70字、最多2句话；不冒充购买或使用经历，不虚构价格、成分、门店和功效，不导流，不替品牌保证，不生成统一种草尾巴。
+"""
         schema = {
-            "need": "目标评论真正想问、想表达或想获得什么，20字内",
-            "candidates": [
-                {"reply": "可直接填入回复框的候选", "style": "直答/共情/轻松", "why": "为什么适合当前语境"}
-            ],
-            "risk_notes": ["需要人工留意的事实或语气风险"]
+            "need": "目标评论真正想获得什么，20字内", "intent": intent, "sentiment": sentiment,
+            "candidates": [{"reply": "候选回复", "style": "直答/共情/轻松", "why": "回复策略", "risk_notes": []}],
+            "risk_notes": ["需要人工核实的事实"]
         }
-        style_rules = """
-先判断目标评论是在提问、吐槽、求证、分享、玩梗还是单纯附和，再决定怎样回。回复首先解决当前一句，不要把所有背景复述一遍。
-写成小红书里一个具体的人在说话。短句优先，允许一点停顿和口语。每条一般12到70个汉字，最多100字。
-生成3条明显不同的候选。至少一条直接自然，至少一条更有情绪回应；只有原评论本身轻松时，才给一条轻松候选。
-Emoji不是必需品。确实能补语气时每条最多1个。不要批量塞“哈哈哈哈、救命、绝了、宝子、姐妹、大数据推给我”，也不要为了网感硬加感叹号。
-避免AI和客服模板腔，包括“感谢您的反馈”“您的心情我们非常理解”“我们会进一步核实并跟进”“建议您持续关注”“希望能帮到您”。除非上下文确实需要，不要用“亲”“宝宝”。
-不要重复用户原话，不总结评论区，不说空泛正确话。问价格、渠道、成分、功效、过敏、售后等事实时，资料没有答案就坦白说明并引导人工核实，不能编数字、链接、活动、疗效或承诺。
-输出前默读一遍，删掉任何像公告、营销文案、万能安慰或为了像小红书而堆出的热词。
-""".strip()
-        messages = [
-            {"role": "system", "content": "你是熟悉小红书社区语境的中文评论编辑。活人感来自准确接话、具体上下文和自然分寸，不来自堆网络梗。只生成建议稿，发送由人工决定。严格输出一个有效 JSON 对象，不要 Markdown。"},
-            {"role": "user", "content": "%s\n\n%s\n\n请结合帖子正文、目标评论、其父评论和全评论区语境生成候选回复。输出结构：%s。输入：%s" % (
-                persona_instruction, style_rules, json.dumps(schema, ensure_ascii=False), json.dumps({
-                    "post": {"title": text(note.get("title"), 1000), "content": text(note.get("content"), 16000), "tags": note.get("tags") or []},
-                    "target_comment": target, "parent_comment": parent_comment, "all_comments": compact_comments
-                }, ensure_ascii=False)
-            )},
-        ]
+        context = {
+            "post": {"title": text(note.get("title"), 1000), "content": text(note.get("content"), 16000), "tags": note.get("tags") or []},
+            "target_comment": target, "parent_comment": parent_comment, "all_comments": compact_comments,
+            "detected_intent": intent, "detected_sentiment": sentiment,
+        }
+        system = "你是小红书官方评论编辑。准确接话，克制具体，降低重复营销导致的折叠风险。只输出有效JSON对象，不要Markdown。"
+        base_user = "%s\n\n%s\n生成3条措辞和句式明显不同的候选。输出结构：%s。输入：%s" % (
+            persona_instruction, brand_rules.strip(), json.dumps(schema, ensure_ascii=False), json.dumps(context, ensure_ascii=False)
+        )
         reply_settings = dict(settings)
-        reply_settings["max_tokens"] = min(4096, max(1200, int(settings.get("max_tokens") or 1800)))
-        raw = self.ai_client.complete_json(reply_settings, messages)
-        risk_notes = raw.get("risk_notes") or []
-        if not isinstance(risk_notes, list):
-            risk_notes = [risk_notes]
-        candidates = raw.get("candidates") or []
-        if not isinstance(candidates, list):
-            candidates = []
-        normalized_candidates = []
-        for item in candidates[:5]:
-            if isinstance(item, str):
-                item = {"reply": item}
-            if not isinstance(item, dict):
-                continue
-            reply = text(item.get("reply"), 600)
-            if reply:
-                normalized_candidates.append({"reply": reply, "style": text(item.get("style"), 60), "why": text(item.get("why"), 500)})
-        legacy_reply = text(raw.get("reply"), 600)
-        if not normalized_candidates and legacy_reply:
-            normalized_candidates.append({"reply": legacy_reply, "style": text(raw.get("tone"), 60), "why": text(raw.get("rationale"), 500)})
-        result = {
-            "need": text(raw.get("need"), 300),
-            "candidates": normalized_candidates[:3],
-            "reply": normalized_candidates[0]["reply"] if normalized_candidates else "",
-            "rationale": normalized_candidates[0].get("why", "") if normalized_candidates else "",
-            "tone": normalized_candidates[0].get("style", "") if normalized_candidates else "",
-            "riskNotes": [text(item, 300) for item in risk_notes if text(item, 300)][:6],
-        }
-        if not result["reply"]:
+        reply_settings["max_tokens"] = min(4096, max(1400, int(settings.get("max_tokens") or 1800)))
+
+        def normalize(raw: dict[str, Any], comparison_pool: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
+            raw_notes = raw.get("risk_notes") or []
+            if not isinstance(raw_notes, list):
+                raw_notes = [raw_notes]
+            raw_candidates = raw.get("candidates") or []
+            if not isinstance(raw_candidates, list):
+                raw_candidates = []
+            if not raw_candidates and text(raw.get("reply"), 600):
+                raw_candidates = [{"reply": raw.get("reply"), "style": raw.get("tone"), "why": raw.get("rationale")}]
+            normalized: list[dict[str, Any]] = []
+            local_pool = list(comparison_pool)
+            for item in raw_candidates[:5]:
+                if isinstance(item, str): item = {"reply": item}
+                if not isinstance(item, dict): continue
+                reply = text(item.get("reply"), 600)
+                if not reply: continue
+                audit = audit_reply_candidate(reply, target_content, persona, local_pool)
+                candidate_notes = item.get("risk_notes") or []
+                if not isinstance(candidate_notes, list): candidate_notes = [candidate_notes]
+                audit["riskNotes"] = list(dict.fromkeys(audit["riskNotes"] + [text(value, 200) for value in candidate_notes if text(value, 200)]))
+                normalized.append({
+                    "reply": reply, "style": text(item.get("style"), 60), "why": text(item.get("why"), 500), **audit
+                })
+                local_pool.append(reply)
+            return normalized, [text(value, 300) for value in raw_notes if text(value, 300)][:6]
+
+        first_raw = self.ai_client.complete_json(reply_settings, [{"role": "system", "content": system}, {"role": "user", "content": base_user}])
+        first_candidates, global_notes = normalize(first_raw, recent_replies)
+        accepted = [item for item in first_candidates if item["riskLevel"] != "high"]
+        rejected = [item for item in first_candidates if item["riskLevel"] == "high"]
+        if len(accepted) < 3:
+            problems = [f"{item['reply']} -> {'；'.join(item['riskNotes'])}" for item in rejected]
+            rewrite_user = base_user + "\n\n以下候选未通过本地审查，请避开相同问题并全部重写：\n" + "\n".join(problems or ["候选数量不足或相似度过高"])
+            try:
+                second_raw = self.ai_client.complete_json(reply_settings, [{"role": "system", "content": system}, {"role": "user", "content": rewrite_user}])
+                second_candidates, second_notes = normalize(second_raw, recent_replies + [item["reply"] for item in accepted])
+                global_notes.extend(second_notes)
+                for item in second_candidates:
+                    if item["riskLevel"] != "high" and all(item["reply"] != existing["reply"] for existing in accepted):
+                        accepted.append(item)
+                    if len(accepted) >= 3: break
+            except Exception:
+                pass
+        final_candidates = accepted[:3]
+        if not final_candidates:
+            final_candidates = sorted(first_candidates, key=lambda item: item["riskScore"])[:1]
+        if not final_candidates:
             raise AIServiceError("DeepSeek 未返回回复文本", "invalid_response", True)
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            for item in final_candidates:
+                db.execute("""
+                    INSERT INTO reply_generation_history
+                    (note_id, comment_id, persona, intent, generated_reply, risk_level, risk_score, similarity_score, risk_notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (note_id, target_id, persona, intent, item["reply"], item["riskLevel"], item["riskScore"],
+                      item["similarityScore"], json.dumps(item["riskNotes"], ensure_ascii=False), timestamp))
+        first = final_candidates[0]
+        result = {
+            "need": text(first_raw.get("need"), 300), "intent": intent, "sentiment": sentiment,
+            "candidates": final_candidates, "reply": first["reply"], "rationale": first.get("why", ""),
+            "tone": first.get("style", ""), "riskNotes": list(dict.fromkeys(global_notes + first["riskNotes"]))[:8],
+        }
         return {"ok": True, "noteId": note_id, "commentId": target_id, "persona": persona,
                 "model": settings["model"], "suggestion": result}
 
