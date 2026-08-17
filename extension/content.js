@@ -1779,8 +1779,23 @@
     if (!target) return { ok: false, error: "页面中尚未找到对应评论，请滚动到该评论附近后重试" };
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     await waitFor(280);
+    // XHS may keep the action row outside the text node and only reveal it on
+    // hover. Trigger the same pointer state as a real user before locating it.
+    for (const hoverTarget of [
+      target,
+      target.parentElement,
+      target.closest?.(".parent-comment, [class*='parent-comment'], [class*='comment-thread']")
+    ].filter(Boolean)) {
+      for (const type of ["pointerover", "pointerenter", "mouseover", "mouseenter", "mousemove"]) {
+        const EventType = type.startsWith("pointer") && typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
+        hoverTarget.dispatchEvent(new EventType(type, { bubbles: true, cancelable: true, view: window }));
+      }
+    }
+    await waitFor(180);
+    // Scrolling/hovering can cause XHS virtualized comments to re-render.
+    target = commentUtils.findCommentElement(root, comment) || target;
     const replyButton = commentUtils.replyButtonFor(target);
-    if (!replyButton) return { ok: false, error: "没有找到该评论的回复按钮" };
+    if (!replyButton) return { ok: false, error: "已定位评论，但回复控件尚未加载，请保持评论可见后重试" };
     replyButton.click();
     await waitFor(350);
     const scopedRoot = target.closest?.(".parent-comment, [class*='parent-comment'], [class*='comment-thread']") || root;

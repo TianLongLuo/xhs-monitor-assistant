@@ -235,9 +235,45 @@
   }
 
   function replyButtonFor(element) {
-    const nodes = Array.from(element?.querySelectorAll?.("button, [role='button'], span, div") || []);
-    return nodes.find((node) => node.offsetParent !== null && /^(回复|回覆)$/.test(clean(node.innerText || node.textContent, 20)))
-      || nodes.find((node) => node.offsetParent !== null && /回复/.test(clean(node.getAttribute?.("aria-label"), 30)));
+    if (!element) return null;
+    const ownerSelector = ITEM_SELECTORS.join(",");
+    const owner = element.matches?.(ownerSelector) ? element : element.closest?.(ownerSelector) || element;
+    const anchor = owner.querySelector?.(CONTENT_SELECTORS.join(",")) || element;
+    const anchorRect = anchor.getBoundingClientRect?.() || { left: 0, bottom: 0 };
+    const scopes = [];
+    let cursor = owner;
+    for (let depth = 0; cursor && depth < 5; depth += 1) {
+      scopes.push(cursor);
+      if (depth > 0 && cursor.matches?.(".parent-comment, [class*='parent-comment'], [class*='comment-thread']")) break;
+      cursor = cursor.parentElement;
+    }
+    const nodes = [];
+    const seen = new Set();
+    for (const scope of scopes) {
+      for (const node of scope.querySelectorAll?.("button, [role='button'], a, span, p, div") || []) {
+        if (seen.has(node)) continue;
+        seen.add(node);
+        const label = clean(
+          node.getAttribute?.("aria-label") || node.getAttribute?.("title") || node.innerText || node.textContent,
+          40
+        );
+        if (!/^(?:回复|回覆)(?:\s*\d+)?$/.test(label)) continue;
+        if (node.offsetParent === null || node.getClientRects?.().length === 0) continue;
+        const candidateOwner = node.closest?.(ownerSelector);
+        let ownerPenalty = 0;
+        if (candidateOwner && candidateOwner !== owner) {
+          if (owner.contains?.(candidateOwner)) ownerPenalty = 10000;
+          else if (!candidateOwner.contains?.(owner)) ownerPenalty = 100000;
+        }
+        const rect = node.getBoundingClientRect?.() || { left: 0, top: 0 };
+        nodes.push({
+          node,
+          score: ownerPenalty + Math.abs(rect.top - anchorRect.bottom) * 10 + Math.abs(rect.left - anchorRect.left)
+        });
+      }
+    }
+    nodes.sort((left, right) => left.score - right.score);
+    return nodes[0]?.node || null;
   }
 
   function expandableButtons(root) {
