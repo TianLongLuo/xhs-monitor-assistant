@@ -76,6 +76,27 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(1, repaired["downloadedCount"])
         self.assertEqual(1, repaired["skippedCount"])
 
+    def test_title_only_scan_prefers_existing_note_id_over_changed_title(self):
+        timestamp = "2026-08-21T12:00:00+08:00"
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes
+                (note_id, url, title, first_seen_at, last_seen_at, status, is_relevant, source,
+                 title_key, content_key, title_content_key, pull_status)
+                VALUES (?, ?, ?, ?, ?, 'known', 1, 'existing_xlsx', ?, '', '', 'synced')
+            """, ("existing123456", "https://www.xiaohongshu.com/explore/existing123456",
+                  "Excel保存的旧标题", timestamp, timestamp, "excel保存的旧标题"))
+        result = self.store.scan({
+            "titleOnly": True, "returnAllStatuses": True, "keyword": "origani",
+            "notes": [{"noteId": "existing123456", "url": "https://www.xiaohongshu.com/explore/existing123456",
+                       "title": "小红书当前展示的新标题", "content": ""}]
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, len(result["statuses"]))
+        self.assertTrue(result["statuses"][0]["inExcel"])
+        self.assertEqual("known", result["statuses"][0]["status"])
+        self.assertEqual("帖子ID", result["statuses"][0]["matchLabel"])
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"

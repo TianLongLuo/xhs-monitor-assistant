@@ -38,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.19.1"
+VERSION = "0.19.2"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -1014,8 +1014,15 @@ class MonitorStore:
                     relevant = True
                 elif stored_relevance == "irrelevant":
                     relevant = False
-                in_excel = bool(excel_existing is not None) if title_only else bool(
-                    existing is not None and str(existing["source"]) == "existing_xlsx"
+                # The lightweight card scan may see a shortened/current XHS
+                # title while Excel retains the title captured during the pull.
+                # A canonical note-ID hit is stronger evidence than title text
+                # and must keep the card aligned with the detail status endpoint.
+                in_excel = bool(
+                    existing is not None and (
+                        str(existing["source"]) == "existing_xlsx"
+                        or str(existing["pull_status"] or "") in {"synced", "partial"}
+                    )
                 )
                 if not relevant and not in_excel:
                     filtered_count += 1
