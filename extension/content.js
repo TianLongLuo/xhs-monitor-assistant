@@ -48,6 +48,8 @@
   let lastDetailSignal = "";
   let lastAutoScanFingerprint = "";
   let lastAutoScanResult = null;
+  let lastAutoScanFetchedAt = 0;
+  const STATUS_CACHE_TTL_MS = 1500;
   let dismissedDetailId = "";
 
   const PROCESS_STEPS = [
@@ -822,6 +824,11 @@
         note: { ...note, noteId, showProcess: true, process: true }
       });
       if (!result?.ok) throw new Error(result?.error || "拉取失败");
+      const freshStatus = { ...result, noteId, status: "known", inExcel: true,
+        pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true };
+      applyFreshStatusToCard({ ...note, ...(result.note || {}) }, freshStatus);
+      invalidateScanStatusCache(noteId, freshStatus);
+      scheduleScan(80);
     } catch (error) {
       updateProcessPanel({
         process: true,
@@ -1450,6 +1457,50 @@
     }).catch(() => {});
   }
 
+  function invalidateScanStatusCache(noteId = "", freshStatus = null) {
+    lastAutoScanFingerprint = "";
+    lastAutoScanFetchedAt = 0;
+    if (!lastAutoScanResult?.ok || !noteId || !freshStatus) return;
+    const statuses = Array.isArray(lastAutoScanResult.statuses) ? [...lastAutoScanResult.statuses] : [];
+    const index = statuses.findIndex((item) => item.noteId === noteId);
+    if (index >= 0) statuses[index] = { ...statuses[index], ...freshStatus, noteId };
+    else statuses.push({ ...freshStatus, noteId });
+    lastAutoScanResult = { ...lastAutoScanResult, statuses };
+  }
+
+  function cardForNote(note = {}) {
+    const noteId = clean(note.noteId, 128);
+    if (noteId) {
+      const exact = document.querySelector(`[${CARD_MARK}="${CSS.escape(noteId)}"]`);
+      if (exact) return exact;
+    }
+    const expectedTitle = clean(note.title, 1000).replace(/\s+/g, "").toLocaleLowerCase();
+    if (!expectedTitle) return null;
+    for (const card of document.querySelectorAll(`[${CARD_MARK}]`)) {
+      const title = extractTitle(card, card.querySelector?.(NOTE_LINK_SELECTOR) || card)
+        .replace(/\s+/g, "").toLocaleLowerCase();
+      if (title && (title === expectedTitle || title.slice(0, 36) === expectedTitle.slice(0, 36))) return card;
+    }
+    return null;
+  }
+
+  function applyFreshStatusToCard(note = {}, status = {}) {
+    const card = cardForNote(note);
+    if (!card) return false;
+    const noteId = clean(note.noteId, 128) || clean(card.getAttribute(CARD_MARK), 128);
+    const mergedNote = { ...note, noteId };
+    const inExcel = Boolean(status.inExcel || status.status === "known" || ["synced", "partial"].includes(status.pullStatus));
+    renderDecoration(card, mergedNote, {
+      ...status,
+      noteId,
+      inExcel,
+      isNew: !inExcel,
+      status: inExcel ? "known" : status.status || "new",
+      relevanceStatus: status.relevanceStatus || (inExcel ? "relevant" : "unknown")
+    });
+    return true;
+  }
+
   async function refreshProcessPanelStatus(panel, note) {
     if (!panel || !note?.noteId) return;
     if (Date.now() - Number(panel._statusFetchedAt || 0) < 1500) return;
@@ -1470,6 +1521,10 @@
       const relevanceLabel = rel === "relevant" ? "相关" : rel === "irrelevant" ? "不相关" : "相关性未知";
       if (relevance) { relevance.textContent = `相关性：${relevanceLabel.replace("相关性", "")}`; relevance.dataset.state = rel; }
       if (headRelevance) { headRelevance.textContent = relevanceLabel; headRelevance.dataset.state = rel; }
+      const freshStatus = { ...result, noteId: note.noteId, inExcel: Boolean(result.inExcel),
+        status: result.inExcel ? "known" : result.status || "new" };
+      applyFreshStatusToCard(note, freshStatus);
+      invalidateScanStatusCache(note.noteId, freshStatus);
     } catch (_error) {}
   }
 
@@ -2020,8 +2075,10 @@
         try {
           const result = await sendRuntime({ type: "pullNote", note: { ...note, showProcess: true, process: true } });
           if (!result?.ok) throw new Error(result?.error || "操作失败");
-          renderDecoration(card, note, { ...status, status: "known", inExcel: true, isNew: false,
-            pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true });
+          const freshStatus = { ...status, ...result, noteId: note.noteId, status: "known", inExcel: true, isNew: false,
+            pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true };
+          renderDecoration(card, note, freshStatus);
+          invalidateScanStatusCache(note.noteId, freshStatus);
         } catch (error) {
           renderDecoration(card, note, { ...status, status: "partial", pullStatus: "partial", pullError: error?.message || "拉取失败" });
         } finally { pullingNoteIds.delete(note.noteId); }
@@ -2076,7 +2133,8 @@
         warning: "当前页面未找到可识别的帖子卡片"
       };
     }
-    if (reason === "auto" && fingerprint === lastAutoScanFingerprint && lastAutoScanResult?.ok) {
+    if (reason === "auto" && fingerprint === lastAutoScanFingerprint && lastAutoScanResult?.ok
+      && Date.now() - lastAutoScanFetchedAt < STATUS_CACHE_TTL_MS) {
       const statuses = lastAutoScanResult.statuses || [];
       decorate(notes, statuses);
       return {
@@ -2105,6 +2163,7 @@
     if (result?.ok) {
       lastAutoScanFingerprint = fingerprint;
       lastAutoScanResult = result;
+      lastAutoScanFetchedAt = Date.now();
     }
     // A bridge timeout or an incomplete backend response must not remove the
     // visual affordance from cards that are already on screen. Keep the card
@@ -2200,6 +2259,14 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "pullProgress") {
       if (message.process || processPanel?.dataset.noteId === message.noteId) updateProcessPanel(message);
+      if (message.noteId && message.done && message.ok !== false) {
+        const note = { ...(message.note || {}), noteId: message.noteId };
+        const freshStatus = { ...message, noteId: message.noteId, status: "known", inExcel: true,
+          pullStatus: message.pullStatus || "synced", relevanceStatus: message.relevanceStatus || "relevant" };
+        applyFreshStatusToCard(note, freshStatus);
+        invalidateScanStatusCache(message.noteId, freshStatus);
+        scheduleScan(80);
+      }
       return false;
     }
     if (message.type === "scanNow") {
