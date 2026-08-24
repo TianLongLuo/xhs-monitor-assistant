@@ -1,7 +1,7 @@
 ﻿param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern('^[a-p]{32}$')]
-  [string]$ExtensionId,
+  [string[]]$ExtensionId,
   [string]$SeedXlsx = '',
   [int]$Port = 17881,
   [switch]$SkipSeed
@@ -64,7 +64,7 @@ $manifest = [ordered]@{
   description = 'Starts the XHS-Monitor local monitoring bridge on demand.'
   path = $hostExe
   type = 'stdio'
-  allowed_origins = @("chrome-extension://$ExtensionId/")
+  allowed_origins = @($ExtensionId | Select-Object -Unique | ForEach-Object { "chrome-extension://$_/" })
 }
 Write-Utf8NoBom -Path $hostManifest -Content ($manifest | ConvertTo-Json)
 
@@ -73,6 +73,6 @@ New-Item -Path $registryPath -Force | Out-Null
 Set-ItemProperty -Path $registryPath -Name '(default)' -Value $hostManifest
 
 Write-Output "Native Host 已注册。"
-Write-Output "插件 ID：$ExtensionId"
+Write-Output "插件 ID：$($ExtensionId -join ', ')"
 Write-Output "Host：$hostExe"
 Write-Output "点击插件图标打开侧边栏时，Bridge 才会启动。"

@@ -677,7 +677,12 @@ async function enrichCurrentDetail(note, loading = false) {
   if (!noteId) return;
   const result = await sendRuntime({ type: "getNoteStatus", noteId }).catch(() => null);
   if (!result?.ok || currentDetailNote?.noteId !== noteId) return;
-  renderCurrentDetail({ ...currentDetailNote, ...result, noteId }, loading);
+  const hydrated = { ...currentDetailNote, ...(result.note || {}), ...result, noteId };
+  renderCurrentDetail(hydrated, loading);
+  // The side panel and content script are separate extension contexts. Send
+  // the already-resolved local status back to the page so the docked Process
+  // panel does not depend on a second, timing-sensitive Bridge request.
+  sendToActiveTab({ type: "hydrateProcessPanel", note: hydrated, status: result }).catch(() => {});
 }
 
 async function pullCurrentDetail() {  const note = currentDetailNote;

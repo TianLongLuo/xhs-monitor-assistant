@@ -216,6 +216,29 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(["旧标题-图1.jpg"], result["mediaFiles"])
         self.assertGreater(result["excelRow"], 1)
 
+    def test_open_local_artifact_uses_hydrated_media_folder(self):
+        from unittest.mock import patch
+        note_id = "openmedia123456"
+        workbook_path = self.store.export_dir.parent / "open-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        folder = workbook_path.parent / "posts_materials" / f"素材__{note_id}"
+        folder.mkdir(parents=True)
+        (folder / "image-01.jpg").write_bytes(b"image")
+        timestamp = "2026-08-24T15:00:00+08:00"
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes
+                (note_id,url,title,first_seen_at,last_seen_at,status,is_relevant,source,
+                 title_key,content_key,title_content_key,pull_status,media_dir)
+                VALUES (?,?,?,?,?,'known',1,'existing_xlsx',?,'','','synced',?)
+            """, (note_id, f"https://www.xiaohongshu.com/explore/{note_id}", "素材帖子",
+                  timestamp, timestamp, "素材帖子", str(folder)))
+        with patch("server.os.startfile") as startfile:
+            result = self.store.open_local_artifact({"kind": "folder", "noteId": note_id})
+        self.assertTrue(result["ok"])
+        self.assertEqual(str(folder.resolve()), result["target"])
+        startfile.assert_called_once_with(str(folder.resolve()))
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"

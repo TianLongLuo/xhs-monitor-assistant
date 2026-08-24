@@ -11,10 +11,12 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 12000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
+const CONTENT_SCRIPT_VERSION = "0.20.2";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
 
 let nativeStartPromise = null;
+let bridgeEnsurePromise = null;
 let deepScanPromise = null;
 let pageTaskPromise = null;
 let deepScanCancelled = false;
@@ -372,7 +374,7 @@ function requestNativeBridge() {
       clearTimeout(timer);
       resolve(result);
     };
-    const timer = setTimeout(() => finish({ ok: false, nativeHost: false, error: "Native Host 启动超时" }), 15000);
+    const timer = setTimeout(() => finish({ ok: false, nativeHost: false, error: "Native Host 启动超时" }), 35000);
     chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { type: "ensure_bridge" }, (response) => {
       if (chrome.runtime.lastError) {
         finish({ ok: false, nativeHost: false, error: chrome.runtime.lastError.message });
@@ -386,22 +388,53 @@ function requestNativeBridge() {
   return nativeStartPromise;
 }
 
-async function ensureBridge() {
+async function waitForBridgeHealth(config, timeoutMs = 18000) {
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 18000);
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await checkBridgeHealth(config);
+    if (latest.ok) return latest;
+    await delay(420);
+  }
+  return latest || { ok: false, error: "Bridge 健康检查超时" };
+}
+
+async function ensureBridgeInternal() {
   const config = await getConfig();
   setBridgeState("connecting", { bridgeUrl: config.bridgeUrl, error: "" });
   const existing = await checkBridgeHealth(config);
   if (existing.ok) return { ok: true, started: false, alreadyRunning: true, ...existing };
 
-  const nativeResult = await requestNativeBridge();
-  if (!nativeResult?.ok) {
-    setBridgeState("error", { bridgeUrl: config.bridgeUrl, error: nativeResult?.error || "Native Host 启动失败" });
-    return { ...nativeResult, ...bridgeState };
+  let lastResult = existing;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    setBridgeState("connecting", {
+      bridgeUrl: config.bridgeUrl, error: "",
+      attempt, statusText: `正在启动本地 Bridge（${attempt}/3）`
+    });
+    const nativeResult = await requestNativeBridge();
+    lastResult = nativeResult;
+    if (nativeResult?.ok) {
+      const health = await waitForBridgeHealth(config, 18000);
+      if (health?.ok) return { ...nativeResult, ...health, ok: true, attempt };
+      lastResult = { ...nativeResult, ...health, ok: false };
+    }
+    const fatalNativeError = /host.*not found|未找到.*host|not registered|权限|forbidden/i.test(
+      String(nativeResult?.error || "")
+    );
+    if (fatalNativeError) break;
+    await delay(500 * attempt);
   }
-  const health = await checkBridgeHealth(config);
-  if (!health.ok) {
-    return { ok: false, started: Boolean(nativeResult.started), nativeHost: true, ...health };
-  }
-  return { ...nativeResult, ...health, ok: true };
+  const error = lastResult?.error || "Native Host 启动失败";
+  setBridgeState("error", { bridgeUrl: config.bridgeUrl, error });
+  return { ...(lastResult || {}), ...bridgeState, ok: false };
+}
+
+function ensureBridge() {
+  if (bridgeEnsurePromise) return bridgeEnsurePromise;
+  bridgeEnsurePromise = ensureBridgeInternal().finally(() => {
+    bridgeEnsurePromise = null;
+  });
+  return bridgeEnsurePromise;
 }
 
 async function getRelevanceGroups(force = false) {
@@ -436,7 +469,7 @@ async function scanPage(payload) {
     directRelevantCount: directlyRelevantNotes.length
   };
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/scan"), {
+    const result = await bridgeApi("/api/scan", {
       method: "POST",
       // Bridge must see every card. It checks Excel identity before applying
       // the relevance gate, otherwise an Excel row with an unloaded caption
@@ -557,21 +590,56 @@ function isInjectableXhsUrl(value) {
   } catch (_error) { return false; }
 }
 
+function reloadTabAndWait(tabId, timeoutMs = 18000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      if (error) reject(error);
+      else resolve();
+    };
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish();
+    };
+    const timer = setTimeout(() => finish(new Error("小红书页面自动刷新超时")), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId).catch(finish);
+  });
+}
+
 async function ensureContentInjected(tabId) {
   const safeTabId = Number(tabId) || 0;
   if (!safeTabId) throw new Error("没有找到当前小红书标签页");
   const tab = await chrome.tabs.get(safeTabId).catch(() => null);
   if (!tab || !isInjectableXhsUrl(tab.url)) throw new Error("当前标签页不是小红书页面");
   const ping = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
-  if (ping) return { ok: true, injected: false, tabId: safeTabId };
+  if (ping?.contentVersion === CONTENT_SCRIPT_VERSION) {
+    return { ok: true, injected: false, tabId: safeTabId, contentVersion: ping.contentVersion };
+  }
   if (contentInjectionTasks.has(safeTabId)) return contentInjectionTasks.get(safeTabId);
   const task = (async () => {
+    // An older content script cannot be safely overlaid: it owns observers and
+    // wheel/click handlers. Reload once so Chrome removes the old world and
+    // automatically injects this extension version—no manual refresh needed.
+    if (ping) {
+      await reloadTabAndWait(safeTabId);
+      await delay(180);
+      const reloaded = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+      if (reloaded?.contentVersion === CONTENT_SCRIPT_VERSION) {
+        return { ok: true, injected: true, reloaded: true, tabId: safeTabId, contentVersion: reloaded.contentVersion };
+      }
+    }
     await chrome.scripting.insertCSS({ target: { tabId: safeTabId }, files: CONTENT_STYLE_FILES }).catch(() => {});
     await chrome.scripting.executeScript({ target: { tabId: safeTabId }, files: CONTENT_SCRIPT_FILES });
-    await delay(80);
+    await delay(120);
     const ready = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
-    if (!ready) throw new Error("插件自动注入后尚未就绪，请稍后重试");
-    return { ok: true, injected: true, tabId: safeTabId };
+    if (!ready || ready.contentVersion !== CONTENT_SCRIPT_VERSION) {
+      throw new Error("插件自动注入后版本未就绪，请稍后重试");
+    }
+    return { ok: true, injected: true, tabId: safeTabId, contentVersion: ready.contentVersion };
   })();
   contentInjectionTasks.set(safeTabId, task);
   try { return await task; }
@@ -668,7 +736,7 @@ async function collectComments(note) {
     const config = await getConfig();
     chrome.runtime.sendMessage({ type: "commentCollectionProgress", noteId: note.noteId, status: "collecting", current: 0 }).catch(() => {});
     try {
-      await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/collection/start"), {
+      await bridgeApi("/api/comments/collection/start", {
         method: "POST", body: JSON.stringify({ noteId: note.noteId })
       });
       const activeTab = await activeXhsTab();
@@ -677,7 +745,7 @@ async function collectComments(note) {
         type: "readNoteInPage", note: { ...note, allComments: true }
       }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
       if (!extracted?.ok) throw new Error(extracted?.error || "评论区尚未加载完成");
-      const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/upsert"), {
+      const result = await bridgeApi("/api/comments/upsert", {
         method: "POST",
         body: JSON.stringify({
           noteId: note.noteId,
@@ -685,14 +753,15 @@ async function collectComments(note) {
           expectedCount: extracted.expectedCount || 0,
           status: extracted.status || "partial",
           collectedAt: new Date().toISOString()
-        })
-      }, 20000);
+        }),
+        timeoutMs: 20000
+      });
       const finalResult = { ...result, expandedCount: extracted.expandedCount || 0, expectedCount: extracted.expectedCount || 0 };
       chrome.runtime.sendMessage({ type: "commentCollectionProgress", noteId: note.noteId, done: true, ...finalResult }).catch(() => {});
       return finalResult;
     } catch (error) {
       const config = await getConfig();
-      await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/upsert"), {
+      await bridgeApi("/api/comments/upsert", {
         method: "POST",
         body: JSON.stringify({ noteId: note.noteId, comments: [], status: "failed", error: error.message, collectedAt: new Date().toISOString() })
       }).catch(() => {});
@@ -757,11 +826,12 @@ async function analyzeNoteRelevance(note, preferredTabId = null) {
       title: `正文与 ${comments.length} 条评论已读取，DeepSeek 正在判断相关性`,
       note: extracted.note, commentCount: comments.length }, activeTab.id);
     const config = await getConfig();
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/relevance/analyze"), {
+    const result = await bridgeApi("/api/relevance/analyze", {
       method: "POST", body: JSON.stringify({ note: extracted.note, comments,
         expectedCount: extracted.expectedCount || comments.length,
-        commentStatus: extracted.status || "partial" })
-    }, 120000);
+        commentStatus: extracted.status || "partial" }),
+      timeoutMs: 120000
+    });
     broadcastPullProgress({ noteId, phase: "done", process: true, mode: "relevance", done: true, ok: true,
       title: result.relevanceStatus === "relevant" ? "AI 判断：相关" : result.relevanceStatus === "irrelevant" ? "AI 判断：不相关，已写入不相关 Sheet" : "AI 证据不足：保持未知",
       relevanceStatus: result.relevanceStatus, note: extracted.note }, activeTab.id);
@@ -786,14 +856,15 @@ async function summarizeCurrentNote(note, preferredTabId = null) {
       throw new Error(extracted?.error || "正文尚未读取成功");
     }
     const config = await getConfig();
-    return fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ai/summary"), {
+    return bridgeApi("/api/ai/summary", {
       method: "POST",
       body: JSON.stringify({
         note: extracted.note,
         comments: Array.isArray(extracted.comments) ? extracted.comments : [],
         expectedCount: extracted.expectedCount || 0
-      })
-    }, 180000);
+      }),
+      timeoutMs: 180000
+    });
   });
 }
 
@@ -849,10 +920,11 @@ async function suggestCommentReply(payload, preferredTabId = null) {
     freshNote = extracted.note || note;
   }
   const config = await getConfig();
-  return fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ai/reply-suggestion"), {
+  return bridgeApi("/api/ai/reply-suggestion", {
     method: "POST",
-    body: JSON.stringify({ note: freshNote, comments, targetComment: payload.targetComment, persona: payload.persona })
-  }, 180000);
+    body: JSON.stringify({ note: freshNote, comments, targetComment: payload.targetComment, persona: payload.persona }),
+    timeoutMs: 180000
+  });
 }
 
 async function applyCommentReply(payload, preferredTabId = null) {
@@ -909,7 +981,7 @@ async function pullNote(note, preferredTabId = null) {
       // Let the content-side panel paint the media stage before the bridge
       // request begins the combined media/Excel/SQLite write.
       await delay(120);
-      const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/pull"), {
+      const result = await bridgeApi("/api/pull", {
         method: "POST",
         body: JSON.stringify({
           note: detail.note,
@@ -918,8 +990,9 @@ async function pullNote(note, preferredTabId = null) {
           commentStatus,
           commentError,
           collectedAt: new Date().toISOString()
-        })
-      }, 10 * 60 * 1000);
+        }),
+        timeoutMs: 10 * 60 * 1000
+      });
       broadcastPullProgress({
         noteId, phase: "excel", process: showProcess,
         title: "素材与 Excel / SQLite 已写入，正在核对结果",
@@ -964,9 +1037,25 @@ async function pullNote(note, preferredTabId = null) {
   });
 }
 
+function isBridgeConnectivityError(error) {
+  const message = String(error?.message || error || "");
+  return /failed to fetch|networkerror|network error|err_connection|connection refused|load failed|响应超时|fetch.*failed/i.test(message);
+}
+
 async function bridgeApi(path, options = {}) {
   const config = await getConfig();
-  return fetchJson(bridgeEndpoint(config.bridgeUrl, path), options, options.timeoutMs || REQUEST_TIMEOUT_MS);
+  const { timeoutMs = REQUEST_TIMEOUT_MS, noRecovery = false, ...fetchOptions } = options || {};
+  const endpoint = bridgeEndpoint(config.bridgeUrl, path);
+  try {
+    return await fetchJson(endpoint, fetchOptions, timeoutMs);
+  } catch (firstError) {
+    if (noRecovery || !isBridgeConnectivityError(firstError)) throw firstError;
+    const recovered = await ensureBridge();
+    if (!recovered?.ok) {
+      throw new Error(`Bridge 连接失败：${recovered?.error || firstError.message || "启动失败"}`);
+    }
+    return fetchJson(endpoint, fetchOptions, timeoutMs);
+  }
 }
 
 function broadcastDeepScanProgress(progress) {
@@ -1095,7 +1184,7 @@ async function confirmNote(note) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法收录" };
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/confirm"), {
+    const result = await bridgeApi("/api/confirm", {
       method: "POST",
       body: JSON.stringify(note)
     });
@@ -1111,7 +1200,7 @@ async function ignoreNote(note) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法忽略" };
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ignore"), {
+    const result = await bridgeApi("/api/ignore", {
       method: "POST",
       body: JSON.stringify(note)
     });
@@ -1126,7 +1215,7 @@ async function ignoreNote(note) {
 async function getStats() {
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/stats"));
+    const result = await bridgeApi("/api/stats");
     setBridgeState("online", { bridgeUrl: config.bridgeUrl, error: "", version: result.version || "" });
     return result;
   } catch (error) {

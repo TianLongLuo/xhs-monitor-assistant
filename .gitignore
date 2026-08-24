@@ -18,3 +18,8 @@ bridge/exports/
 *.tmp.xlsx
 node_modules/
 .playwright-cli/
+
+# Native Host 诊断与临时版本构建
+bridge/build-v*/
+bridge/dist-v*/
+bridge/native_host.log*

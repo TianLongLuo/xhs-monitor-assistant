@@ -1,7 +1,8 @@
 (function () {
   "use strict";
-  if (globalThis.__XHS_MONITOR_CONTENT_V0151__) return;
-  globalThis.__XHS_MONITOR_CONTENT_V0151__ = true;
+  const CONTENT_VERSION = "0.20.2";
+  if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) return;
+  globalThis.__XHS_MONITOR_CONTENT_VERSION__ = CONTENT_VERSION;
 
   const DEFAULT_CONFIG = { targetKeywords: ["品牌词"], enabled: true };
   let activeRelevanceGroups = null;
@@ -2437,6 +2438,46 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === "hydrateProcessPanel") {
+      const statusResult = message.status || {};
+      const note = { ...(message.note || {}), ...(statusResult.note || {}) };
+      const detail = currentDetailInfo();
+      if (!note.noteId || detail.note?.noteId !== note.noteId || !statusResult.ok) return false;
+      const panel = processPanel?.dataset.noteId === note.noteId ? processPanel : mountProcessPanel(note);
+      panel._autoDock = true;
+      panel._detailOpened = true;
+      const pulled = statusResult.inExcel || ["synced", "partial"].includes(statusResult.pullStatus);
+      if (pulled) {
+        renderProcessPanel({
+          process: true, noteId: note.noteId, note,
+          phase: "excel", done: true,
+          pullStatus: statusResult.pullStatus || "synced",
+          mediaDir: statusResult.mediaDir || note.mediaDir || "",
+          mediaFiles: statusResult.mediaFiles || note.mediaFiles || [],
+          excelPath: statusResult.excelPath || note.excelPath || "",
+          excelRow: statusResult.excelRow || note.excelRow || 0,
+          commentCount: statusResult.commentCount ?? note.commentCount ?? 0,
+          commentRows: Array.isArray(statusResult.commentRows) ? statusResult.commentRows : [],
+          aiStatus: statusResult.aiStatus || note.aiStatus || ""
+        });
+        const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+        const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
+        if (headPull) {
+          headPull.textContent = statusResult.pullStatus === "partial" ? "部分拉取" : "已拉取";
+          headPull.dataset.state = "pulled";
+        }
+        const relevance = statusResult.relevanceStatus || "unknown";
+        if (headRelevance) {
+          headRelevance.textContent = relevance === "relevant" ? "相关" : relevance === "irrelevant" ? "不相关" : "相关性未知";
+          headRelevance.dataset.state = relevance;
+        }
+        panel._processNote = note;
+        panel._statusFetchedAt = Date.now();
+        panel._statusRetryAttempts = 0;
+        positionProcessPanel();
+      }
+      return false;
+    }
     if (message.type === "pullProgress") {
       if (message.process || processPanel?.dataset.noteId === message.noteId) updateProcessPanel(message);
       if (message.noteId && message.done && message.ok !== false) {
@@ -2507,6 +2548,7 @@
       const currentDetail = currentDetailInfo();
       sendResponse({
         ok: true,
+        contentVersion: CONTENT_VERSION,
         url: location.href,
         keyword: currentKeyword(),
         isSearchPage: isSearchPage(),

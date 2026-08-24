@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import struct
 import subprocess
 import sys
@@ -62,11 +63,58 @@ def bridge_url(config: dict[str, Any]) -> str:
 
 def bridge_is_healthy(config: dict[str, Any]) -> bool:
     try:
-        with urllib.request.urlopen(f"{bridge_url(config)}/api/health", timeout=0.7) as response:
+        with urllib.request.urlopen(f"{bridge_url(config)}/api/health", timeout=1.2) as response:
             payload = json.loads(response.read().decode("utf-8"))
             return bool(payload.get("ok") and payload.get("service") == "xhs-monitor-bridge")
     except Exception:
         return False
+
+
+def runtime_log_path() -> Path:
+    return config_path().parent / "native_host.log"
+
+
+def log_event(message: str) -> None:
+    path = runtime_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 512 * 1024:
+            backup = path.with_suffix(".log.1")
+            backup.unlink(missing_ok=True)
+            path.replace(backup)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+
+def log_tail(limit: int = 1200) -> str:
+    try:
+        value = runtime_log_path().read_text(encoding="utf-8", errors="replace")
+        return value[-max(100, limit):]
+    except Exception:
+        return ""
+
+
+def port_is_open(config: dict[str, Any]) -> bool:
+    try:
+        with socket.create_connection(
+            (str(config.get("host", BRIDGE_HOST)), int(config.get("port", BRIDGE_PORT))),
+            timeout=0.7,
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def wait_for_bridge(config: dict[str, Any], timeout_seconds: float) -> bool:
+    deadline = time.time() + max(1.0, timeout_seconds)
+    while time.time() < deadline:
+        if bridge_is_healthy(config):
+            return True
+        time.sleep(0.35)
+    return False
 
 
 def start_bridge_process(config: dict[str, Any]) -> dict[str, Any]:
@@ -74,30 +122,84 @@ def start_bridge_process(config: dict[str, Any]) -> dict[str, Any]:
     if bridge_is_healthy(config):
         return {"ok": True, "started": False, "alreadyRunning": True, "bridgeUrl": url}
 
-    if getattr(sys, "frozen", False):
-        command = [sys.executable, "--bridge"]
-    else:
-        command = [sys.executable, str(Path(__file__).resolve()), "--bridge"]
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    lock_path = config_path().parent / f".bridge-starting-{int(config.get('port', BRIDGE_PORT))}.lock"
+    lock_fd: int | None = None
     try:
-        subprocess.Popen(
-            command,
-            cwd=str(base_dir()),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-    except Exception as exc:
-        return {"ok": False, "started": False, "error": f"无法启动 Bridge：{exc}"}
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(lock_fd, f"{os.getpid()} {time.time()}".encode("ascii"))
+        except FileExistsError:
+            # Another Native Messaging invocation is already starting the same
+            # Bridge. Wait for it instead of spawning a competing server.
+            if wait_for_bridge(config, 30):
+                return {"ok": True, "started": False, "alreadyRunning": True, "bridgeUrl": url}
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                age = 0
+            if age > 40:
+                lock_path.unlink(missing_ok=True)
+                return start_bridge_process(config)
+            return {
+                "ok": False, "started": False, "bridgeUrl": url,
+                "error": f"Bridge 启动进程未在预期时间内就绪：{url}",
+                "diagnostic": log_tail(),
+            }
 
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if bridge_is_healthy(config):
+        # A listening non-Bridge process must not be hidden behind a generic
+        # timeout. Give an in-flight Bridge a short grace period, then report
+        # the real port conflict.
+        if port_is_open(config) and not wait_for_bridge(config, 4):
+            return {
+                "ok": False, "started": False, "bridgeUrl": url,
+                "error": f"端口 {int(config.get('port', BRIDGE_PORT))} 已被其他程序占用",
+                "diagnostic": log_tail(),
+            }
+
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--bridge"]
+        else:
+            command = [sys.executable, str(Path(__file__).resolve()), "--bridge"]
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        log_stream = None
+        try:
+            log_stream = runtime_log_path().open("ab", buffering=0)
+            process = subprocess.Popen(
+                command,
+                cwd=str(base_dir()),
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+            log_event(f"spawned Bridge pid={process.pid} command={command!r}")
+        except Exception as exc:
+            log_event(f"Bridge spawn failed: {exc!r}")
+            return {"ok": False, "started": False, "error": f"无法启动 Bridge：{exc}", "diagnostic": log_tail()}
+        finally:
+            if log_stream is not None:
+                log_stream.close()
+
+        if wait_for_bridge(config, 30):
+            log_event(f"Bridge healthy at {url}")
             return {"ok": True, "started": True, "alreadyRunning": False, "bridgeUrl": url}
-        time.sleep(0.25)
-    return {"ok": False, "started": False, "error": f"Bridge 启动超时：{url}"}
+        log_event(f"Bridge startup timeout at {url}")
+        return {
+            "ok": False, "started": False, "error": f"Bridge 启动超时：{url}",
+            "diagnostic": log_tail(),
+        }
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            lock_path.unlink(missing_ok=True)
 
 
 def run_bridge_child() -> None:
@@ -110,19 +212,24 @@ def run_bridge_child() -> None:
         print("[native-host] a Bridge is already serving this port; exiting to avoid double-bind", file=sys.stderr, flush=True)
         return
     seed_xlsx = Path(config["seed_xlsx"]) if config.get("seed_xlsx") else None
-    server, _store, inserted = create_server(
-        str(config.get("host", BRIDGE_HOST)),
-        int(config.get("port", BRIDGE_PORT)),
-        Path(config["db"]),
-        Path(config["export_dir"]),
-        seed_xlsx,
-    )
-    assert isinstance(server, ThreadingHTTPServer)
-    print(f"[native-host] bridge child running; seeded={inserted}", file=sys.stderr, flush=True)
     try:
-        server.serve_forever()
-    finally:
-        server.server_close()
+        server, _store, inserted = create_server(
+            str(config.get("host", BRIDGE_HOST)),
+            int(config.get("port", BRIDGE_PORT)),
+            Path(config["db"]),
+            Path(config["export_dir"]),
+            seed_xlsx,
+        )
+        assert isinstance(server, ThreadingHTTPServer)
+        log_event(f"bridge child running; seeded={inserted}")
+        print(f"[native-host] bridge child running; seeded={inserted}", file=sys.stderr, flush=True)
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+    except Exception as exc:
+        log_event(f"bridge child failed: {exc!r}")
+        raise
 
 
 def read_exact(stream, size: int) -> bytes:
