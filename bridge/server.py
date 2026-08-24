@@ -38,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.19.2"
+VERSION = "0.19.3"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -1455,18 +1455,76 @@ class MonitorStore:
             raise ValueError("noteId is required")
         with self.lock, self._session() as db:
             row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            comment_rows = db.execute(
+                "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT 12", (note_id,)
+            ).fetchall() if row is not None else []
+            comment_count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)
+            ).fetchone()[0]) if row is not None else 0
         if row is None:
             return {"ok": True, "noteId": note_id, "found": False, "inExcel": False,
                     "pullStatus": "not_started", "relevanceStatus": "unknown"}
         item = dict(row)
         in_excel = item.get("source") == "existing_xlsx" or item.get("pull_status") in {"synced", "partial"}
         relevance_status = item.get("relevance_status") or ("relevant" if item.get("is_relevant") else "unknown")
-        return {"ok": True, "noteId": note_id, "found": True, "status": item.get("status", "new"),
-                "inExcel": bool(in_excel), "pullStatus": item.get("pull_status") or "not_started",
-                "pullError": item.get("pull_error") or "", "relevanceStatus": relevance_status,
-                "isRelevant": relevance_status == "relevant", "relevanceSource": item.get("relevance_source") or "",
-                "relevanceReason": item.get("relevance_reason") or "",
-                "relevanceConfidence": float(item.get("relevance_confidence") or 0)}
+        try:
+            note_payload = json.loads(item.get("payload_json") or "{}")
+            if not isinstance(note_payload, dict):
+                note_payload = {}
+        except (TypeError, ValueError):
+            note_payload = {}
+        media_dir = text(item.get("media_dir"), 2000)
+        media_files: list[str] = []
+        if media_dir:
+            try:
+                folder = Path(media_dir)
+                if folder.is_dir():
+                    media_files = sorted(path.name for path in folder.iterdir() if path.is_file())[:200]
+            except OSError:
+                media_files = []
+        stored_note = {
+            **note_payload,
+            "noteId": note_id,
+            "url": item.get("url") or note_payload.get("url") or "",
+            "title": item.get("title") or note_payload.get("title") or "",
+            "author": item.get("author") or note_payload.get("author") or "",
+            "content": item.get("content") or note_payload.get("content") or "",
+            "tags": note_payload.get("tags") or ([item.get("tags")] if item.get("tags") else []),
+            "keyword": item.get("keyword") or note_payload.get("keyword") or "",
+            "mediaDir": media_dir,
+            "mediaFiles": media_files,
+            "commentCount": comment_count or note_payload.get("commentCount") or 0,
+            "aiStatus": item.get("ai_analysis_status") or "",
+            "postSentiment": sentiment_label(item.get("post_sentiment")) if item.get("post_sentiment") else "",
+        }
+        comments: list[dict[str, Any]] = []
+        for comment_row in comment_rows:
+            stored = dict(comment_row)
+            try:
+                payload = json.loads(stored.get("payload_json") or "{}")
+                if not isinstance(payload, dict): payload = {}
+            except (TypeError, ValueError):
+                payload = {}
+            comments.append({
+                **payload,
+                "commentId": stored.get("comment_id") or payload.get("commentId") or "",
+                "parentCommentId": stored.get("parent_comment_id") or payload.get("parentCommentId") or "",
+                "author": stored.get("author") or payload.get("author") or "",
+                "content": stored.get("content") or payload.get("content") or "",
+                "publishedAt": stored.get("published_at") or payload.get("publishedAt") or "",
+            })
+        return {
+            "ok": True, "noteId": note_id, "found": True, "status": item.get("status", "new"),
+            "inExcel": bool(in_excel), "pullStatus": item.get("pull_status") or "not_started",
+            "pullError": item.get("pull_error") or "", "relevanceStatus": relevance_status,
+            "isRelevant": relevance_status == "relevant", "relevanceSource": item.get("relevance_source") or "",
+            "relevanceReason": item.get("relevance_reason") or "",
+            "relevanceConfidence": float(item.get("relevance_confidence") or 0),
+            "note": stored_note, "mediaDir": media_dir, "mediaFiles": media_files,
+            "excelPath": item.get("excel_sync_path") or (str(self.seed_xlsx_path) if self.seed_xlsx_path else ""),
+            "excelRow": 0, "commentCount": comment_count, "commentRows": comments,
+            "aiStatus": item.get("ai_analysis_status") or "",
+        }
 
     def _sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
         xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None

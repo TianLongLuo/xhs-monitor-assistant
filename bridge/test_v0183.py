@@ -97,6 +97,38 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("known", result["statuses"][0]["status"])
         self.assertEqual("帖子ID", result["statuses"][0]["matchLabel"])
 
+    def test_pulled_note_status_hydrates_artifacts_and_comments(self):
+        root = self.store.export_dir.parent
+        media_dir = root / "materials" / "pulled123456"
+        media_dir.mkdir(parents=True)
+        (media_dir / "image-01.jpg").write_bytes(b"image")
+        excel_path = root / "master.xlsx"
+        timestamp = "2026-08-24T12:00:00+08:00"
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes
+                (note_id, url, title, author, content, first_seen_at, last_seen_at, status,
+                 is_relevant, source, title_key, content_key, title_content_key, pull_status,
+                 media_dir, excel_sync_path, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'known', 1, 'existing_xlsx', ?, ?, '', 'synced', ?, ?, ?)
+            """, ("pulled123456", "https://www.xiaohongshu.com/explore/pulled123456",
+                  "已拉取帖子", "作者", "正文", timestamp, timestamp, "已拉取帖子", "正文",
+                  str(media_dir), str(excel_path), json.dumps({"likeCount": 8}, ensure_ascii=False)))
+            db.execute("""
+                INSERT INTO comments
+                (comment_id, note_id, content, author, first_seen_at, last_seen_at, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, ("comment-pulled-1", "pulled123456", "本地评论", "用户", timestamp, timestamp,
+                  json.dumps({"commentId": "comment-pulled-1", "content": "本地评论"}, ensure_ascii=False)))
+        result = self.store.note_status("pulled123456")
+        self.assertTrue(result["inExcel"])
+        self.assertEqual(str(media_dir), result["mediaDir"])
+        self.assertEqual(["image-01.jpg"], result["mediaFiles"])
+        self.assertEqual(str(excel_path), result["excelPath"])
+        self.assertEqual("pulled123456", result["note"]["noteId"])
+        self.assertEqual(1, result["commentCount"])
+        self.assertEqual("comment-pulled-1", result["commentRows"][0]["commentId"])
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"

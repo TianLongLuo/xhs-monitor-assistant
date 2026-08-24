@@ -1514,6 +1514,29 @@
       const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
       const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
       const pulled = result.inExcel || ["synced", "partial"].includes(result.pullStatus);
+      if (pulled) {
+        const storedNote = { ...note, ...(result.note || {}), noteId: note.noteId,
+          mediaDir: result.mediaDir || result.note?.mediaDir || "",
+          mediaFiles: result.mediaFiles || result.note?.mediaFiles || [] };
+        renderProcessPanel({
+          process: true,
+          noteId: note.noteId,
+          note: storedNote,
+          phase: "excel",
+          done: true,
+          pullStatus: result.pullStatus || "synced",
+          mediaDir: result.mediaDir || storedNote.mediaDir || "",
+          mediaFiles: result.mediaFiles || storedNote.mediaFiles || [],
+          excelPath: result.excelPath || "",
+          excelRow: result.excelRow || 0,
+          commentCount: result.commentCount ?? storedNote.commentCount ?? 0,
+          commentRows: Array.isArray(result.commentRows) ? result.commentRows : [],
+          aiStatus: result.aiStatus || storedNote.aiStatus || ""
+        });
+        panel._processNote = storedNote;
+        panel.dataset.mode = "done";
+        panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
+      }
       const pullLabel = pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
       if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
       if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = pulled ? "pulled" : "missing"; }
