@@ -38,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.20.0"
+VERSION = "0.20.1"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -708,6 +708,12 @@ class MonitorStore:
                 row_content = value(row, "笔记内容")
                 row_tags = value(row, "笔记话题")
                 row_title_key, row_content_key, row_combined_key = identity_keys(row_title, row_content)
+                row_media_dir = self._resolve_legacy_media_dir(
+                    value(row, "对应帖子文件夹地址"),
+                    [line.strip() for line in value(row, "文件夹内清单").splitlines() if line.strip()],
+                    note_id,
+                )
+                row_media_count = len([line for line in value(row, "文件夹内清单").splitlines() if line.strip()])
                 existing = db.execute("SELECT note_id,url,page_url FROM notes WHERE note_id = ?", (note_id,)).fetchone()
                 if existing:
                     # A note may have been discovered by the browser before it
@@ -746,6 +752,11 @@ class MonitorStore:
                             timestamp, note_id,
                         ),
                     )
+                    if row_media_dir:
+                        db.execute(
+                            "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
+                            (row_media_dir, row_media_count, note_id),
+                        )
                     continue
                 db.execute(
                     """
@@ -774,6 +785,11 @@ class MonitorStore:
                         json.dumps({"seed": "xlsx", "tags": row_tags}, ensure_ascii=False),
                     ),
                 )
+                if row_media_dir:
+                    db.execute(
+                        "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
+                        (row_media_dir, row_media_count, note_id),
+                    )
                 inserted += 1
 
             if 'sheet3_不相关帖子' in workbook.sheetnames:
@@ -1636,6 +1652,75 @@ class MonitorStore:
         return [dict(row) for row in rows]
 
 
+    def _excel_note_artifacts(self, note_id: str) -> tuple[str, list[str], int]:
+        """Read a legacy media-folder pointer directly from the configured workbook."""
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        if not xlsx_path or not xlsx_path.exists():
+            return "", [], 0
+        from openpyxl import load_workbook
+        workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+        try:
+            if "sheet1_笔记总表" not in workbook.sheetnames:
+                return "", [], 0
+            sheet = workbook["sheet1_笔记总表"]
+            headers = self._excel_headers(sheet)
+            id_column = headers.get("笔记ID")
+            if not id_column:
+                return "", [], 0
+            for row_number in range(2, sheet.max_row + 1):
+                if valid_note_id(sheet.cell(row_number, id_column).value) != note_id:
+                    continue
+                folder_column = headers.get("对应帖子文件夹地址")
+                files_column = headers.get("文件夹内清单")
+                raw_folder = text(sheet.cell(row_number, folder_column).value, 4000) if folder_column else ""
+                raw_files = text(sheet.cell(row_number, files_column).value, 30000) if files_column else ""
+                files = [line.strip() for line in raw_files.splitlines() if line.strip()]
+                return raw_folder, files, row_number
+            return "", [], 0
+        finally:
+            workbook.close()
+
+    def _resolve_legacy_media_dir(self, raw_folder: str, expected_files: list[str], note_id: str) -> str:
+        """Resolve stale pre-migration paths against the active posts_materials root."""
+        candidates: list[Path] = []
+        raw_path = Path(raw_folder).expanduser() if raw_folder else None
+        if raw_path:
+            candidates.append(raw_path)
+        media_root = self._media_root()
+        if raw_path:
+            candidates.append(media_root / raw_path.name)
+        if media_root.is_dir():
+            candidates.extend(path for path in media_root.iterdir()
+                              if path.is_dir() and (path.name.endswith(f"__{note_id}") or note_id in path.name))
+            if raw_path:
+                candidates.extend(path for path in media_root.glob(f"{raw_path.name}*") if path.is_dir())
+        expected = {Path(name).name for name in expected_files if name}
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        scored: list[tuple[int, Path]] = []
+        for candidate in unique:
+            try:
+                if not candidate.is_dir():
+                    continue
+                actual = {path.name for path in candidate.iterdir() if path.is_file()}
+                overlap = len(expected.intersection(actual))
+                score = overlap * 100 + (40 if candidate.name.endswith(f"__{note_id}") else 0)
+                if raw_path and candidate.name == raw_path.name:
+                    score += 20
+                scored.append((score, candidate.resolve()))
+            except OSError:
+                continue
+        if not scored:
+            return ""
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return str(scored[0][1])
+
     def note_status(self, note_id: str) -> dict[str, Any]:
         note_id = valid_note_id(note_id)
         if not note_id:
@@ -1660,7 +1745,23 @@ class MonitorStore:
                 note_payload = {}
         except (TypeError, ValueError):
             note_payload = {}
-        media_dir = text(item.get("media_dir"), 2000)
+        media_dir = text(item.get("media_dir"), 4000)
+        excel_media_dir, excel_media_files, excel_row = self._excel_note_artifacts(note_id)
+        current_folder_ok = False
+        if media_dir:
+            try:
+                current_folder_ok = Path(media_dir).is_dir()
+            except OSError:
+                current_folder_ok = False
+        if not current_folder_ok:
+            resolved_media_dir = self._resolve_legacy_media_dir(excel_media_dir or media_dir, excel_media_files, note_id)
+            if resolved_media_dir:
+                media_dir = resolved_media_dir
+                with self.lock, self._session() as db:
+                    db.execute(
+                        "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
+                        (media_dir, len(excel_media_files), note_id),
+                    )
         media_files: list[str] = []
         if media_dir:
             try:
@@ -1709,7 +1810,7 @@ class MonitorStore:
             "relevanceConfidence": float(item.get("relevance_confidence") or 0),
             "note": stored_note, "mediaDir": media_dir, "mediaFiles": media_files,
             "excelPath": item.get("excel_sync_path") or (str(self.seed_xlsx_path) if self.seed_xlsx_path else ""),
-            "excelRow": 0, "commentCount": comment_count, "commentRows": comments,
+            "excelRow": excel_row, "commentCount": comment_count, "commentRows": comments,
             "aiStatus": item.get("ai_analysis_status") or "",
         }
 

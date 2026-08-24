@@ -189,6 +189,33 @@ class V0183Tests(unittest.TestCase):
         workbook.close()
         self.assertEqual({"comment-kept", "comment-new"}, excel_ids)
 
+    def test_note_status_repairs_legacy_excel_media_path(self):
+        from openpyxl import load_workbook
+        note_id = "legacy123456"
+        workbook_path = self.store.export_dir.parent / "legacy-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        actual_folder = workbook_path.parent / "posts_materials" / "旧标题"
+        actual_folder.mkdir(parents=True)
+        (actual_folder / "旧标题-图1.jpg").write_bytes(b"image")
+        workbook = load_workbook(workbook_path)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        row = sheet.max_row + 1
+        sheet.cell(row, headers["笔记ID"]).value = note_id
+        sheet.cell(row, headers["笔记标题"]).value = "旧标题"
+        sheet.cell(row, headers["笔记url"]).value = f"https://www.xiaohongshu.com/explore/{note_id}"
+        sheet.cell(row, headers["对应帖子文件夹地址"]).value = "C:/removed-root/posts_materials/旧标题"
+        sheet.cell(row, headers["文件夹内清单"]).value = "旧标题-图1.jpg"
+        workbook.save(workbook_path)
+        workbook.close()
+        self.store.seed_from_xlsx(workbook_path)
+        result = self.store.note_status(note_id)
+        self.assertTrue(result["inExcel"])
+        self.assertEqual(str(actual_folder.resolve()), result["mediaDir"])
+        self.assertEqual(["旧标题-图1.jpg"], result["mediaFiles"])
+        self.assertGreater(result["excelRow"], 1)
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"

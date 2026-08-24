@@ -296,6 +296,10 @@
       clearInterval(processPanel._aiPollTimer);
       processPanel._aiPollTimer = null;
     }
+    if (processPanel?._statusRetryTimer) {
+      clearTimeout(processPanel._statusRetryTimer);
+      processPanel._statusRetryTimer = null;
+    }
     processPanelObserver?.disconnect?.();
     processPanelObserver = null;
     window.removeEventListener("resize", positionProcessPanel);
@@ -1616,13 +1620,40 @@
     }
   }
 
+  function cachedPulledStatus(noteId) {
+    const statuses = Array.isArray(lastAutoScanResult?.statuses) ? lastAutoScanResult.statuses : [];
+    const status = statuses.find((item) => item?.noteId === noteId);
+    return Boolean(status && (status.inExcel || status.status === "known" || ["synced", "partial"].includes(status.pullStatus)));
+  }
+
+  function retryProcessPanelStatus(panel, note, delay = 650) {
+    if (!panel || panel !== processPanel || panel.dataset.noteId !== note?.noteId) return;
+    const attempts = Number(panel._statusRetryAttempts || 0);
+    if (attempts >= 8 || panel._statusRetryTimer) return;
+    panel._statusRetryAttempts = attempts + 1;
+    panel._statusRetryTimer = setTimeout(() => {
+      panel._statusRetryTimer = null;
+      panel._statusFetchedAt = 0;
+      refreshProcessPanelStatus(panel, note);
+    }, Math.min(4000, delay + attempts * 420));
+  }
+
   async function refreshProcessPanelStatus(panel, note) {
     if (!panel || !note?.noteId) return;
     if (Date.now() - Number(panel._statusFetchedAt || 0) < 1500) return;
     panel._statusFetchedAt = Date.now();
     try {
       const result = await sendRuntime({ type: "getNoteStatus", noteId: note.noteId });
-      if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      if (panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      if (!result?.ok) {
+        retryProcessPanelStatus(panel, note);
+        return;
+      }
+      if (panel._statusRetryTimer) {
+        clearTimeout(panel._statusRetryTimer);
+        panel._statusRetryTimer = null;
+      }
+      panel._statusRetryAttempts = 0;
       panel._processNote = { ...panel._processNote, ...result, inExcel: Boolean(result.inExcel) };
       const pull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__state--pull`);
       const relevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__state--relevance`);
@@ -1664,7 +1695,10 @@
         status: result.inExcel ? "known" : result.status || "new" };
       applyFreshStatusToCard(note, freshStatus);
       invalidateScanStatusCache(note.noteId, freshStatus);
-    } catch (_error) {}
+      if (!pulled && cachedPulledStatus(note.noteId)) retryProcessPanelStatus(panel, note, 900);
+    } catch (_error) {
+      retryProcessPanelStatus(panel, note);
+    }
   }
 
   function syncDetailControl() {
@@ -1692,12 +1726,19 @@
       panel._autoDock = true;
       panel._detailOpened = true;
       panel.dataset.mode = "idle";
-      panel.classList.add(`${PROCESS_PANEL_CLASS}--collapsed`);
+      const cachedPulled = cachedPulledStatus(note.noteId);
+      if (!cachedPulled) panel.classList.add(`${PROCESS_PANEL_CLASS}--collapsed`);
       const heading = panel.querySelector(`.${PROCESS_PANEL_CLASS}__title`);
       const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
       const pullButton = panel.querySelector(`.${PROCESS_PANEL_CLASS}__pull`);
       if (heading) heading.textContent = "当前帖子";
-      if (status) status.textContent = info.loading ? "正文加载中，可直接开始拉取" : "点击拉取正文、图片与评论";
+      if (status) status.textContent = cachedPulled
+        ? "已在 Excel，正在读取本地素材"
+        : info.loading ? "正文加载中，可直接开始拉取" : "点击拉取正文、图片与评论";
+      if (cachedPulled) {
+        const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+        if (headPull) { headPull.textContent = "已拉取"; headPull.dataset.state = "pulled"; }
+      }
       if (pullButton) {
         pullButton.disabled = false;
         pullButton.textContent = "拉取";
