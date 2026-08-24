@@ -1052,3 +1052,80 @@
   border-radius: 999px;
   background-clip: padding-box;
 }
+
+/* v0.20.0 comment delta audit */
+.xhs-monitor-process__changes[hidden] { display: none !important; }
+.xhs-monitor-process__changes {
+  background: #fffaf0 !important;
+  border-top: 2px solid #e1a93a !important;
+}
+.xhs-monitor-process__change-count {
+  background: #fff0c8;
+  border: 1px solid #e4c06c;
+  border-radius: 999px;
+  color: #76500d;
+  font: 800 8px/1 "Microsoft YaHei", sans-serif;
+  padding: 4px 6px;
+}
+.xhs-monitor-process__change-intro {
+  color: #6d685c;
+  font: 500 8px/1.5 "Microsoft YaHei", sans-serif;
+  margin: 7px 0;
+}
+.xhs-monitor-process__change-list {
+  display: grid;
+  gap: 6px;
+  max-height: 210px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+  scrollbar-width: thin;
+}
+.xhs-monitor-process__change {
+  background: #fff;
+  border: 1px solid #e7dfcf;
+  border-left: 3px solid #2c7a67;
+  border-radius: 7px;
+  padding: 7px 8px;
+}
+.xhs-monitor-process__change[data-kind="removed"] { border-left-color: #c44f45; }
+.xhs-monitor-process__change[data-kind="changed"] { border-left-color: #d99b28; }
+.xhs-monitor-process__change-kind {
+  color: #2c7a67;
+  float: right;
+  font: 800 7px/1 "Microsoft YaHei", sans-serif;
+}
+.xhs-monitor-process__change[data-kind="removed"] .xhs-monitor-process__change-kind { color: #b8433b; }
+.xhs-monitor-process__change strong {
+  color: #183a31;
+  display: block;
+  font: 800 8px/1.3 "Microsoft YaHei", sans-serif;
+  padding-right: 36px;
+}
+.xhs-monitor-process__change p,
+.xhs-monitor-process__change small {
+  color: #3f4542;
+  display: block;
+  font: 500 8px/1.45 "Microsoft YaHei", sans-serif;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+.xhs-monitor-process__change small { color: #8a8170; }
+.xhs-monitor-process__update-comments {
+  background: #173f35;
+  border: 0;
+  border-radius: 7px;
+  color: #fff;
+  cursor: pointer;
+  font: 800 9px/1 "Microsoft YaHei", sans-serif;
+  margin-top: 8px;
+  min-height: 32px;
+  width: 100%;
+}
+.xhs-monitor-process__update-comments:hover:not(:disabled) { background: #245c4e; }
+.xhs-monitor-process__update-comments:disabled { cursor: default; opacity: .76; }
+.xhs-monitor-process__update-comments[data-state="updated"] {
+  background: #dceee6;
+  color: #17604f;
+  opacity: 1;
+}

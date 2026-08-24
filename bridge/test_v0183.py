@@ -129,6 +129,66 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(1, result["commentCount"])
         self.assertEqual("comment-pulled-1", result["commentRows"][0]["commentId"])
 
+    def _seed_pulled_note_with_comments(self):
+        note = {
+            "noteId": "audit123456", "url": "https://www.xiaohongshu.com/explore/audit123456",
+            "title": "评论变化测试", "content": "正文", "author": "博主", "detailRead": True,
+        }
+        self.store.confirm(note)
+        old = {"commentId": "comment-old", "author": "旧用户", "content": "已经消失", "publishedAt": "08-20"}
+        kept = {"commentId": "comment-kept", "author": "保留用户", "content": "仍然存在", "publishedAt": "08-21"}
+        self.store.upsert_comments({
+            "noteId": note["noteId"], "comments": [old, kept],
+            "expectedCount": 2, "status": "likely_complete"
+        })
+        return note, old, kept
+
+    def test_comment_compare_reports_new_and_confirmed_removed(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
+        result = self.store.compare_comments({
+            "noteId": note["noteId"], "comments": [kept, fresh],
+            "expectedCount": 2, "status": "likely_complete"
+        })
+        self.assertTrue(result["hasChanges"])
+        self.assertTrue(result["canPrune"])
+        self.assertEqual(1, result["newCount"])
+        self.assertEqual(1, result["removedCount"])
+        self.assertEqual("comment-old", result["removedComments"][0]["commentId"])
+
+    def test_partial_comment_compare_never_confirms_deletion(self):
+        note, _old, kept = self._seed_pulled_note_with_comments()
+        result = self.store.compare_comments({
+            "noteId": note["noteId"], "comments": [kept],
+            "expectedCount": 2, "status": "partial"
+        })
+        self.assertFalse(result["canPrune"])
+        self.assertEqual(0, result["removedCount"])
+        self.assertEqual(1, result["pendingRemovedCount"])
+        self.assertFalse(result["hasChanges"])
+
+    def test_comment_sync_updates_sqlite_and_excel_without_blank_rows(self):
+        from openpyxl import load_workbook
+        note, old, kept = self._seed_pulled_note_with_comments()
+        workbook_path = self.store.export_dir.parent / "comments-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
+        result = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [kept, fresh],
+            "expectedCount": 2, "status": "likely_complete"
+        })
+        self.assertEqual("latest", result["status"])
+        self.assertEqual((1, 1), (result["newCount"], result["removedCount"]))
+        ids = {row["comment_id"] for row in self.store.list_comments(note["noteId"])}
+        self.assertEqual({"comment-kept", "comment-new"}, ids)
+        workbook = load_workbook(workbook_path, read_only=True)
+        sheet = workbook["sheet2_评论总表"]
+        excel_ids = {sheet.cell(row, 3).value for row in range(2, sheet.max_row + 1)}
+        workbook.close()
+        self.assertEqual({"comment-kept", "comment-new"}, excel_ids)
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"

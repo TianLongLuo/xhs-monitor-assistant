@@ -810,6 +810,35 @@ async function readCurrentNoteComments(note, preferredTabId = null) {
   });
 }
 
+async function auditCurrentNoteComments(note, preferredTabId = null) {
+  const extracted = await readCurrentNoteComments(note, preferredTabId);
+  const snapshot = {
+    note: extracted.note || note,
+    comments: Array.isArray(extracted.comments) ? extracted.comments : [],
+    expectedCount: Number(extracted.expectedCount) || 0,
+    status: extracted.status || "partial"
+  };
+  const comparison = await bridgeApi("/api/comments/compare", {
+    method: "POST", body: JSON.stringify({ noteId: note.noteId, ...snapshot }), timeoutMs: 60000
+  });
+  return { ...comparison, snapshot };
+}
+
+async function syncCurrentNoteComments(payload) {
+  const snapshot = payload?.snapshot || {};
+  return bridgeApi("/api/comments/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      noteId: payload?.noteId || snapshot.note?.noteId || "",
+      note: snapshot.note || payload?.note || {},
+      comments: Array.isArray(snapshot.comments) ? snapshot.comments : [],
+      expectedCount: Number(snapshot.expectedCount) || 0,
+      status: snapshot.status || "partial"
+    }),
+    timeoutMs: 120000
+  });
+}
+
 async function suggestCommentReply(payload, preferredTabId = null) {
   const note = payload?.note || {};
   let comments = Array.isArray(payload?.comments) ? payload.comments : [];
@@ -1198,6 +1227,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);
     if (message.type === "summarizeCurrentNote") return summarizeCurrentNote(message.note || {}, sender.tab?.id || null);
     if (message.type === "getCurrentNoteComments") return readCurrentNoteComments(message.note || {}, sender.tab?.id || null);
+    if (message.type === "auditCurrentNoteComments") return auditCurrentNoteComments(message.note || {}, sender.tab?.id || null);
+    if (message.type === "syncCurrentNoteComments") return syncCurrentNoteComments(message);
     if (message.type === "suggestCommentReply") return suggestCommentReply(message, sender.tab?.id || null);
     if (message.type === "applyCommentReply") return applyCommentReply(message, sender.tab?.id || null);
     if (message.type === "getNoteSummary") {

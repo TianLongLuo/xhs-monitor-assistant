@@ -571,10 +571,14 @@
     comments.className = `${PROCESS_PANEL_CLASS}__comments`;
     commentSection.append(commentHead, comments);
 
+    const changeSection = document.createElement("section");
+    changeSection.className = `${PROCESS_PANEL_CLASS}__section ${PROCESS_PANEL_CLASS}__changes`;
+    changeSection.hidden = true;
+
     const foot = document.createElement("div");
     foot.className = `${PROCESS_PANEL_CLASS}__foot`;
     foot.textContent = "详情层保持打开；完成后可直接核对原文和评论";
-    panel.append(header, target, progress, steps, fieldSection, commentSection, foot);
+    panel.append(header, target, progress, steps, fieldSection, commentSection, changeSection, foot);
     (document.body || document.documentElement).append(panel);
     enableProcessPanelScroll(panel);
     processPanel = panel;
@@ -1501,6 +1505,117 @@
     return true;
   }
 
+  function commentChangeCard(kind, item) {
+    const row = kind === "changed" ? (item?.after || {}) : (item || {});
+    const card = document.createElement("article");
+    card.className = `${PROCESS_PANEL_CLASS}__change`;
+    card.dataset.kind = kind;
+    const label = document.createElement("span");
+    label.className = `${PROCESS_PANEL_CLASS}__change-kind`;
+    label.textContent = kind === "new" ? "新增" : kind === "removed" ? "已消失" : "内容变化";
+    const author = document.createElement("strong");
+    author.textContent = clean(row.author, 120) || "未知用户";
+    const content = document.createElement("p");
+    content.textContent = clean(row.content, 600) || "（无文本）";
+    card.append(label, author, content);
+    if (kind === "changed" && item?.before?.content && item.before.content !== row.content) {
+      const before = document.createElement("small");
+      before.textContent = `原文：${clean(item.before.content, 260)}`;
+      card.append(before);
+    }
+    return card;
+  }
+
+  function setProcessLatest(panel) {
+    const headPull = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+    const pull = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__state--pull`);
+    if (headPull) { headPull.textContent = "最新"; headPull.dataset.state = "pulled"; }
+    if (pull) { pull.textContent = "评论状态：最新"; pull.dataset.state = "pulled"; }
+  }
+
+  function renderCommentChanges(panel, result) {
+    const section = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__changes`);
+    if (!section) return;
+    if (!result?.hasChanges) {
+      section.hidden = true;
+      section.replaceChildren();
+      return;
+    }
+    panel._commentAudit = result;
+    section.hidden = false;
+    section.replaceChildren();
+
+    const head = document.createElement("div");
+    head.className = `${PROCESS_PANEL_CLASS}__section-head`;
+    const title = document.createElement("strong");
+    title.textContent = "评论区有变化";
+    const count = document.createElement("span");
+    count.className = `${PROCESS_PANEL_CLASS}__change-count`;
+    count.textContent = `新增 ${result.newCount || 0} · 消失 ${result.removedCount || 0} · 修改 ${result.changedCount || 0}`;
+    head.append(title, count);
+
+    const intro = document.createElement("p");
+    intro.className = `${PROCESS_PANEL_CLASS}__change-intro`;
+    intro.textContent = result.canPrune
+      ? "已展开全部可见评论并与本地 Excel / 数据库完成对比。"
+      : "已发现新内容；部分回复仍未完整加载，暂不删除本地疑似消失评论。";
+
+    const list = document.createElement("div");
+    list.className = `${PROCESS_PANEL_CLASS}__change-list`;
+    const entries = [
+      ...(result.newComments || []).map((item) => ["new", item]),
+      ...(result.removedComments || []).map((item) => ["removed", item]),
+      ...(result.changedComments || []).map((item) => ["changed", item])
+    ];
+    for (const [kind, item] of entries.slice(0, 30)) list.append(commentChangeCard(kind, item));
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `${PROCESS_PANEL_CLASS}__update-comments`;
+    button.textContent = "更新评论到 Excel / 数据库";
+    button.addEventListener("click", async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = "正在更新…";
+      try {
+        const response = await sendRuntime({
+          type: "syncCurrentNoteComments",
+          noteId: panel.dataset.noteId,
+          snapshot: result.snapshot
+        });
+        if (!response?.ok) throw new Error(response?.error || "更新失败");
+        button.textContent = "已更新";
+        button.dataset.state = "updated";
+        setProcessLatest(panel);
+        const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+        if (status) status.textContent = `评论已更新：新增 ${response.newCount || 0}，移除 ${response.removedCount || 0}`;
+        panel._commentAuditDone = true;
+        panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "更新失败，点击重试";
+        button.title = error?.message || "更新失败";
+      }
+    });
+    section.append(head, intro, list, button);
+    panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
+    positionProcessPanel();
+  }
+
+  async function auditPulledComments(panel, note) {
+    if (!panel || !note?.noteId || panel._commentAuditStarted) return;
+    panel._commentAuditStarted = true;
+    try {
+      const result = await sendRuntime({ type: "auditCurrentNoteComments", note });
+      if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      renderCommentChanges(panel, result);
+      panel._commentAuditDone = true;
+    } catch (error) {
+      panel._commentAuditStarted = false;
+      panel._commentAuditError = error?.message || "评论对比失败";
+    }
+  }
+
   async function refreshProcessPanelStatus(panel, note) {
     if (!panel || !note?.noteId) return;
     if (Date.now() - Number(panel._statusFetchedAt || 0) < 1500) return;
@@ -1536,6 +1651,7 @@
         panel._processNote = storedNote;
         panel.dataset.mode = "done";
         panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
+        auditPulledComments(panel, storedNote).catch(() => {});
       }
       const pullLabel = pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
       if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }

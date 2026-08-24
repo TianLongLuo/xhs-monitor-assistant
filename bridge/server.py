@@ -38,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.19.3"
+VERSION = "0.20.0"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -1421,6 +1421,193 @@ class MonitorStore:
                 self.enqueue_ai("comment", comment_id, priority=60)
         return {"ok": True, "noteId": note_id, "newCount": len(inserted_ids), "changedCount": len(changed_ids),
                 "collectedCount": count, "status": collection_status}
+
+    @staticmethod
+    def _comment_api_row(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "commentId": text(item.get("commentId") or item.get("comment_id"), 256),
+            "parentCommentId": text(item.get("parentCommentId") or item.get("parent_comment_id"), 256),
+            "author": text(item.get("author"), 500),
+            "content": text(item.get("content"), 8000),
+            "publishedAt": text(item.get("publishedAt") or item.get("published_at"), 100),
+            "commentLevel": max(1, min(int(item.get("commentLevel") or item.get("comment_level") or 1), 3)),
+            "likeCount": int(item.get("likeCount") or item.get("like_count") or 0),
+            "replyCount": int(item.get("replyCount") or item.get("reply_count") or 0),
+        }
+
+    def compare_comments(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Compare a fully expanded browser snapshot with local comments.
+
+        Missing rows are only confirmed as removed when collection is likely
+        complete, so a collapsed or slow reply thread is never deleted.
+        """
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        raw_comments = payload.get("comments") or []
+        if not isinstance(raw_comments, list):
+            raise ValueError("comments must be an array")
+        current = [self._comment_api_row(item) for item in raw_comments
+                   if isinstance(item, dict) and text(item.get("content"), 8000)]
+        local = [self._comment_api_row(item) for item in self.list_comments(note_id, 2000)]
+        by_id = {row["commentId"]: index for index, row in enumerate(local) if row["commentId"]}
+        by_exact = {(row["author"], row["content"], row["publishedAt"]): index
+                    for index, row in enumerate(local)}
+        by_loose = {(row["author"], row["content"]): index for index, row in enumerate(local)}
+        matched: set[int] = set()
+        new_comments: list[dict[str, Any]] = []
+        changed_comments: list[dict[str, Any]] = []
+        for row in current:
+            index = by_id.get(row["commentId"]) if row["commentId"] else None
+            if index is None:
+                index = by_exact.get((row["author"], row["content"], row["publishedAt"]))
+            if index is None:
+                index = by_loose.get((row["author"], row["content"]))
+            if index is None:
+                new_comments.append(row)
+                continue
+            matched.add(index)
+            previous = local[index]
+            if (previous["content"] != row["content"] or
+                    previous["parentCommentId"] != row["parentCommentId"] or
+                    previous["commentLevel"] != row["commentLevel"]):
+                changed_comments.append({"before": previous, "after": row})
+        missing = [row for index, row in enumerate(local) if index not in matched]
+        status = text(payload.get("status"), 30) or "partial"
+        expected_count = max(0, int(payload.get("expectedCount") or 0))
+        can_prune = status == "likely_complete" and (expected_count <= 0 or len(current) >= expected_count)
+        removed = missing if can_prune else []
+        pending_removed = [] if can_prune else missing
+        return {
+            "ok": True, "noteId": note_id, "status": status,
+            "expectedCount": expected_count, "currentCount": len(current), "localCount": len(local),
+            "canPrune": can_prune, "newCount": len(new_comments), "removedCount": len(removed),
+            "changedCount": len(changed_comments), "pendingRemovedCount": len(pending_removed),
+            "hasChanges": bool(new_comments or removed or changed_comments),
+            "newComments": new_comments, "removedComments": removed,
+            "changedComments": changed_comments, "pendingRemovedComments": pending_removed,
+        }
+
+    def _delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
+        if not removed:
+            return 0
+        xlsx_path = Path(getattr(self, "seed_xlsx_path", "") or "")
+        if not xlsx_path.exists():
+            return 0
+        from openpyxl import load_workbook
+        from openpyxl.utils.cell import get_column_letter, range_boundaries
+        removed_ids = {text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)}
+        removed_exact = {(text(item.get("author"), 500), text(item.get("content"), 8000),
+                          text(item.get("publishedAt"), 100)) for item in removed}
+        workbook = None
+        temporary_path: Path | None = None
+        try:
+            workbook = load_workbook(xlsx_path)
+            if "sheet2_评论总表" not in workbook.sheetnames:
+                return 0
+            sheet = workbook["sheet2_评论总表"]
+            headers = self._excel_headers(sheet)
+            id_col, url_col = headers.get("笔记评论ID"), headers.get("原笔记url")
+            author_col, content_col, time_col = (
+                headers.get("用户昵称"), headers.get("评论内容"), headers.get("评论时间")
+            )
+            deleted = 0
+            for row_number in range(sheet.max_row, 1, -1):
+                row_note_id = note_url_identity(sheet.cell(row_number, url_col).value) if url_col else ""
+                if row_note_id != note_id:
+                    continue
+                row_id = text(sheet.cell(row_number, id_col).value, 256) if id_col else ""
+                row_key = (
+                    text(sheet.cell(row_number, author_col).value, 500) if author_col else "",
+                    text(sheet.cell(row_number, content_col).value, 8000) if content_col else "",
+                    text(sheet.cell(row_number, time_col).value, 100) if time_col else "",
+                )
+                if row_id in removed_ids or row_key in removed_exact:
+                    sheet.delete_rows(row_number, 1)
+                    deleted += 1
+            if not deleted:
+                return 0
+            for table in sheet.tables.values():
+                min_col, min_row, max_col, _max_row = range_boundaries(table.ref)
+                table.ref = f"{get_column_letter(min_col)}{min_row}:{get_column_letter(max_col)}{max(min_row, sheet.max_row)}"
+            temporary_path = xlsx_path.with_name(
+                f".{xlsx_path.stem}.comment-sync-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.tmp.xlsx"
+            )
+            workbook.save(temporary_path)
+            workbook.close()
+            workbook = None
+            try:
+                os.replace(temporary_path, xlsx_path)
+            except PermissionError as exc:
+                raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试更新评论") from exc
+            temporary_path = None
+            return deleted
+        finally:
+            if workbook is not None:
+                workbook.close()
+            if temporary_path and temporary_path.exists():
+                temporary_path.unlink(missing_ok=True)
+
+    def sync_comment_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply a reviewed comment delta to SQLite, Excel and comments.json."""
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        comments = payload.get("comments") or []
+        if not isinstance(comments, list):
+            raise ValueError("comments must be an array")
+        with self.pull_lock:
+            comparison = self.compare_comments(payload)
+            with self.lock, self._session() as db:
+                stored = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            if stored is None:
+                raise ValueError("帖子尚未写入本地数据库")
+            stored_row = dict(stored)
+            try:
+                stored_payload = json.loads(stored_row.get("payload_json") or "{}")
+                if not isinstance(stored_payload, dict):
+                    stored_payload = {}
+            except (TypeError, ValueError):
+                stored_payload = {}
+            incoming_note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
+            note = {**stored_payload, **incoming_note, "noteId": note_id}
+            for field, column in (("url", "url"), ("title", "title"), ("content", "content"), ("author", "author")):
+                if not note.get(field):
+                    note[field] = stored_row.get(column) or ""
+            media_dir = text(stored_row.get("media_dir"), 4000)
+            media_files = sorted(item.name for item in Path(media_dir).iterdir() if item.is_file()) if media_dir and Path(media_dir).is_dir() else []
+            media_result = {"folder": media_dir, "files": media_files}
+            upserted = self.upsert_comments({
+                "noteId": note_id, "comments": comments,
+                "expectedCount": comparison["expectedCount"],
+                "status": text(payload.get("status"), 30) or "partial",
+                "collectedAt": now_iso(), "forceAutoAnalyze": True,
+            })
+            xlsx_result = self._sync_pull_to_xlsx(note, comments, media_result)
+            removed = comparison["removedComments"] if comparison["canPrune"] else []
+            excel_removed = self._delete_comment_rows_from_xlsx(note_id, removed)
+            removed_ids = [text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)]
+            with self.lock, self._session() as db:
+                if removed_ids:
+                    placeholders = ",".join("?" for _ in removed_ids)
+                    db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id IN ({placeholders})",
+                               (note_id, *removed_ids))
+                count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+                db.execute(
+                    "UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=? WHERE note_id=?",
+                    (count, "likely_complete" if comparison["canPrune"] else text(payload.get("status"), 30) or "partial",
+                     now_iso(), note_id),
+                )
+            if media_dir:
+                self._write_media_comments(media_result, comments)
+            return {
+                "ok": True, "noteId": note_id, "status": "latest",
+                "newCount": comparison["newCount"], "removedCount": len(removed),
+                "changedCount": comparison["changedCount"], "collectedCount": count,
+                "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
+                "excelRemoved": excel_removed, "canPrune": comparison["canPrune"],
+                "updatedAt": now_iso(),
+            }
 
     def start_comment_collection(self, payload: dict[str, Any]) -> dict[str, Any]:
         note_id = valid_note_id(payload.get("noteId"))
@@ -3660,6 +3847,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.export_pending()
             elif self.path == "/api/comments/upsert":
                 result = self.store.upsert_comments(payload)
+            elif self.path == "/api/comments/compare":
+                result = self.store.compare_comments(payload)
+            elif self.path == "/api/comments/sync":
+                result = self.store.sync_comment_snapshot(payload)
             elif self.path == "/api/comments/collection/start":
                 result = self.store.start_comment_collection(payload)
             elif self.path == "/api/excel/reload":
