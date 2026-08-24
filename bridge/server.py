@@ -38,7 +38,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.20.2"
+VERSION = "0.20.3"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -410,6 +410,13 @@ class MonitorStore:
         # can both inspect the same workbook before either atomic replace and
         # append duplicate rows despite row-level dedupe.
         self.pull_lock = threading.Lock()
+        # The search page can ask for dozens of note statuses at once. Loading
+        # the same workbook once per card creates a thundering herd, leaves the
+        # Process panel in its skeleton state, and can exhaust the HTTP worker
+        # threads. Keep one immutable index per workbook revision instead.
+        self._excel_artifact_cache_lock = threading.Lock()
+        self._excel_artifact_cache_key: tuple[str, int, int] | None = None
+        self._excel_artifact_cache: dict[str, tuple[str, list[str], int]] = {}
         self.seed_xlsx_path: Path | None = None
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
         self.ai_client = ai_client or DeepSeekClient()
@@ -1653,32 +1660,44 @@ class MonitorStore:
 
 
     def _excel_note_artifacts(self, note_id: str) -> tuple[str, list[str], int]:
-        """Read a legacy media-folder pointer directly from the configured workbook."""
+        """Return workbook artifacts from a revision-aware, process-local index."""
         xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
         if not xlsx_path or not xlsx_path.exists():
             return "", [], 0
-        from openpyxl import load_workbook
-        workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
         try:
-            if "sheet1_笔记总表" not in workbook.sheetnames:
-                return "", [], 0
-            sheet = workbook["sheet1_笔记总表"]
-            headers = self._excel_headers(sheet)
-            id_column = headers.get("笔记ID")
-            if not id_column:
-                return "", [], 0
-            for row_number in range(2, sheet.max_row + 1):
-                if valid_note_id(sheet.cell(row_number, id_column).value) != note_id:
-                    continue
-                folder_column = headers.get("对应帖子文件夹地址")
-                files_column = headers.get("文件夹内清单")
-                raw_folder = text(sheet.cell(row_number, folder_column).value, 4000) if folder_column else ""
-                raw_files = text(sheet.cell(row_number, files_column).value, 30000) if files_column else ""
-                files = [line.strip() for line in raw_files.splitlines() if line.strip()]
-                return raw_folder, files, row_number
+            stat = xlsx_path.stat()
+            cache_key = (str(xlsx_path.resolve()).casefold(), int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
             return "", [], 0
-        finally:
-            workbook.close()
+
+        with self._excel_artifact_cache_lock:
+            if self._excel_artifact_cache_key != cache_key:
+                from openpyxl import load_workbook
+                workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+                artifact_index: dict[str, tuple[str, list[str], int]] = {}
+                try:
+                    if "sheet1_笔记总表" in workbook.sheetnames:
+                        sheet = workbook["sheet1_笔记总表"]
+                        headers = self._excel_headers(sheet)
+                        id_column = headers.get("笔记ID")
+                        folder_column = headers.get("对应帖子文件夹地址")
+                        files_column = headers.get("文件夹内清单")
+                        if id_column:
+                            for row_number in range(2, sheet.max_row + 1):
+                                indexed_note_id = valid_note_id(sheet.cell(row_number, id_column).value)
+                                if not indexed_note_id:
+                                    continue
+                                raw_folder = text(sheet.cell(row_number, folder_column).value, 4000) if folder_column else ""
+                                raw_files = text(sheet.cell(row_number, files_column).value, 30000) if files_column else ""
+                                files = [line.strip() for line in raw_files.splitlines() if line.strip()]
+                                artifact_index[indexed_note_id] = (raw_folder, files, row_number)
+                finally:
+                    workbook.close()
+                self._excel_artifact_cache = artifact_index
+                self._excel_artifact_cache_key = cache_key
+            raw_folder, files, row_number = self._excel_artifact_cache.get(note_id, ("", [], 0))
+            # Return a fresh list so callers cannot mutate the shared cache.
+            return raw_folder, list(files), row_number
 
     def _resolve_legacy_media_dir(self, raw_folder: str, expected_files: list[str], note_id: str) -> str:
         """Resolve stale pre-migration paths against the active posts_materials root."""

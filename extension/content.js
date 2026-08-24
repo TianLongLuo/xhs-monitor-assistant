@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.20.2";
+  const CONTENT_VERSION = "0.20.3";
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) return;
   globalThis.__XHS_MONITOR_CONTENT_VERSION__ = CONTENT_VERSION;
 
@@ -1630,7 +1630,27 @@
   function retryProcessPanelStatus(panel, note, delay = 650) {
     if (!panel || panel !== processPanel || panel.dataset.noteId !== note?.noteId) return;
     const attempts = Number(panel._statusRetryAttempts || 0);
-    if (attempts >= 8 || panel._statusRetryTimer) return;
+    if (attempts >= 8) {
+      const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+      if (status) status.textContent = panel._lastStatusError
+        ? `本地 Bridge 连接失败：${panel._lastStatusError}`
+        : "本地 Bridge 尚未连接，侧边栏会继续自动重试";
+      panel.dataset.mode = "bridge-error";
+      panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
+      panel.classList.add(`${PROCESS_PANEL_CLASS}--error`);
+      const first = panel.querySelector(`.${PROCESS_PANEL_CLASS}__steps li`);
+      if (first) first.dataset.state = "error";
+      positionProcessPanel();
+      if (!panel._statusRetryTimer) {
+        panel._statusRetryTimer = setTimeout(() => {
+          panel._statusRetryTimer = null;
+          panel._statusFetchedAt = 0;
+          refreshProcessPanelStatus(panel, note);
+        }, 8000);
+      }
+      return;
+    }
+    if (panel._statusRetryTimer) return;
     panel._statusRetryAttempts = attempts + 1;
     panel._statusRetryTimer = setTimeout(() => {
       panel._statusRetryTimer = null;
@@ -1697,7 +1717,8 @@
       applyFreshStatusToCard(note, freshStatus);
       invalidateScanStatusCache(note.noteId, freshStatus);
       if (!pulled && cachedPulledStatus(note.noteId)) retryProcessPanelStatus(panel, note, 900);
-    } catch (_error) {
+    } catch (error) {
+      panel._lastStatusError = error?.message || "状态读取失败";
       retryProcessPanelStatus(panel, note);
     }
   }

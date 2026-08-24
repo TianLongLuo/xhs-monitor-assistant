@@ -216,6 +216,38 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(["旧标题-图1.jpg"], result["mediaFiles"])
         self.assertGreater(result["excelRow"], 1)
 
+    def test_excel_artifact_index_is_reused_until_workbook_changes(self):
+        from openpyxl import load_workbook
+        from unittest.mock import patch
+        note_id = "cache123456"
+        workbook_path = self.store.export_dir.parent / "cache-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        workbook = load_workbook(workbook_path)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        row = sheet.max_row + 1
+        sheet.cell(row, headers["笔记ID"]).value = note_id
+        sheet.cell(row, headers["对应帖子文件夹地址"]).value = "C:/materials/cache123456"
+        sheet.cell(row, headers["文件夹内清单"]).value = "image-01.jpg"
+        workbook.save(workbook_path)
+        workbook.close()
+
+        with patch("openpyxl.load_workbook", wraps=load_workbook) as mocked_load:
+            first = self.store._excel_note_artifacts(note_id)
+            second = self.store._excel_note_artifacts(note_id)
+            self.assertEqual(first, second)
+            self.assertEqual(1, mocked_load.call_count)
+
+            workbook = load_workbook(workbook_path)
+            sheet = workbook["sheet1_笔记总表"]
+            sheet.cell(row, headers["文件夹内清单"]).value = "image-01.jpg\nimage-02.jpg"
+            workbook.save(workbook_path)
+            workbook.close()
+            refreshed = self.store._excel_note_artifacts(note_id)
+            self.assertEqual(["image-01.jpg", "image-02.jpg"], refreshed[1])
+            self.assertEqual(2, mocked_load.call_count)
+
     def test_open_local_artifact_uses_hydrated_media_folder(self):
         from unittest.mock import patch
         note_id = "openmedia123456"

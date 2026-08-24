@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 12000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.20.2";
+const CONTENT_SCRIPT_VERSION = "0.20.3";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
 
@@ -424,9 +424,10 @@ async function ensureBridgeInternal() {
     if (fatalNativeError) break;
     await delay(500 * attempt);
   }
-  const error = lastResult?.error || "Native Host 启动失败";
-  setBridgeState("error", { bridgeUrl: config.bridgeUrl, error });
-  return { ...(lastResult || {}), ...bridgeState, ok: false };
+  const nativeError = lastResult?.error || "Native Host 启动失败";
+  const error = `${nativeError}（当前插件 ID：${chrome.runtime.id}）`;
+  setBridgeState("error", { bridgeUrl: config.bridgeUrl, error, extensionId: chrome.runtime.id });
+  return { ...(lastResult || {}), ...bridgeState, error, extensionId: chrome.runtime.id, ok: false };
 }
 
 function ensureBridge() {
