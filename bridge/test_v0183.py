@@ -255,11 +255,27 @@ class V0183Tests(unittest.TestCase):
         source.write_bytes(b"new")
         target.write_bytes(b"old")
         with patch("server.os.replace", side_effect=[PermissionError("busy"), PermissionError("busy"), None]) as replace, \
+             patch("server._reopen_saved_office_workbook_read_only", return_value=False), \
              patch("server.time.sleep") as sleep:
             attempts = replace_with_retry(source, target, attempts=4, initial_delay=0.01)
         self.assertEqual(3, attempts)
         self.assertEqual(3, replace.call_count)
         self.assertEqual(2, sleep.call_count)
+
+    def test_atomic_replace_converts_saved_wps_lock_then_retries(self):
+        from unittest.mock import patch
+        source = Path(self.tmp.name) / "source-wps.xlsx"
+        target = Path(self.tmp.name) / "target-wps.xlsx"
+        source.write_bytes(b"new")
+        target.write_bytes(b"old")
+        with patch("server.os.replace", side_effect=[PermissionError("wps busy"), None]) as replace, \
+             patch("server._reopen_saved_office_workbook_read_only", return_value=True) as recover, \
+             patch("server.time.sleep") as sleep:
+            attempts = replace_with_retry(source, target, attempts=3)
+        self.assertEqual(2, attempts)
+        recover.assert_called_once_with(target)
+        self.assertEqual(2, replace.call_count)
+        sleep.assert_not_called()
 
     def test_open_excel_prefers_wps_and_locates_note(self):
         import base64
@@ -274,7 +290,7 @@ class V0183Tests(unittest.TestCase):
             "note": {"noteId": note_id, "title": "WPS 定位测试", "content": "正文", "detailRead": True},
             "comments": [],
         })
-        completed = subprocess.CompletedProcess([], 0, stdout="WPS\r\n".encode("utf-16le"), stderr=b"")
+        completed = subprocess.CompletedProcess([], 0, stdout="WPS|True\r\n".encode("utf-16le"), stderr=b"")
         with patch("server.subprocess.run", return_value=completed) as run:
             result = self.store.open_local_artifact({
                 "kind": "excel", "noteId": note_id, "excelRow": pulled["excelRow"], "fieldName": "笔记标题"
@@ -282,8 +298,10 @@ class V0183Tests(unittest.TestCase):
         encoded_script = run.call_args.args[0][-1]
         script = base64.b64decode(encoded_script).decode("utf-16le")
         self.assertLess(script.index("ket.Application"), script.index("Excel.Application"))
+        self.assertIn("$app.Workbooks.Open($path, 0, $true)", script)
         self.assertIn("$app.Goto($cell, $true)", script)
         self.assertEqual("WPS", result["application"])
+        self.assertTrue(result["readOnly"])
         self.assertEqual(pulled["excelRow"], result["row"])
 
     def test_open_local_artifact_uses_hydrated_media_folder(self):

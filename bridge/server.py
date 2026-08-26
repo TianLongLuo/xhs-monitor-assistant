@@ -40,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.6"
+VERSION = "0.23.7"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -58,17 +58,72 @@ RELEVANCE_GROUPS = {
 _RESOLVED_RELEVANCE_GROUPS: dict[str, tuple[str, ...]] | None = None
 
 
-def replace_with_retry(source: Path, target: Path, attempts: int = 8, initial_delay: float = 0.12) -> int:
-    """Atomically replace a file, tolerating short WPS/antivirus sharing locks."""
+def _reopen_saved_office_workbook_read_only(target: Path) -> bool:
+    """Release a saved editable WPS/Excel handle without discarding user changes."""
+    if os.name != "nt":
+        return False
+    escaped_path = str(Path(target).resolve()).replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$path = [System.IO.Path]::GetFullPath('{escaped_path}')
+$result = 'NOT_OPEN'
+foreach ($progId in @('ket.Application', 'Excel.Application')) {{
+  try {{ $app = [Runtime.InteropServices.Marshal]::GetActiveObject($progId) }} catch {{ continue }}
+  foreach ($candidate in @($app.Workbooks)) {{
+    if (-not [System.String]::Equals([System.IO.Path]::GetFullPath($candidate.FullName), $path, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}
+    if ($candidate.ReadOnly) {{ $result = 'READ_ONLY'; break }}
+    if (-not $candidate.Saved) {{ $result = 'UNSAVED'; break }}
+    $sheetName = $candidate.ActiveSheet.Name
+    $rowNumber = 1
+    $columnNumber = 1
+    try {{ $rowNumber = $app.ActiveCell.Row; $columnNumber = $app.ActiveCell.Column }} catch {{}}
+    $candidate.Close($false)
+    $book = $app.Workbooks.Open($path, 0, $true)
+    $sheet = $book.Worksheets.Item($sheetName)
+    $sheet.Activate()
+    $cell = $sheet.Cells.Item($rowNumber, $columnNumber)
+    $cell.Select()
+    $app.Goto($cell, $true)
+    $result = 'REOPENED_READ_ONLY'
+    break
+  }}
+  if ($result -ne 'NOT_OPEN') {{ break }}
+}}
+Write-Output $result
+"""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = (completed.stdout or b"").decode("utf-16le", errors="ignore")
+    return completed.returncode == 0 and "REOPENED_READ_ONLY" in output
+
+
+def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_delay: float = 0.15) -> int:
+    """Atomically replace a file, tolerating WPS, cloud sync and antivirus sharing locks."""
     total_attempts = max(1, int(attempts))
+    office_recovery_attempted = False
     for attempt in range(total_attempts):
         try:
             os.replace(source, target)
             return attempt + 1
         except PermissionError:
+            if not office_recovery_attempted:
+                office_recovery_attempted = True
+                if _reopen_saved_office_workbook_read_only(target):
+                    continue
             if attempt + 1 >= total_attempts:
                 raise
-            time.sleep(min(initial_delay * (2 ** attempt), 1.2))
+            time.sleep(min(initial_delay * (2 ** attempt), 1.5))
     return total_attempts
 
 
@@ -4880,7 +4935,11 @@ foreach ($candidateApp in @(
     foreach ($candidate in $app.Workbooks) {{
       if ([System.String]::Equals([System.IO.Path]::GetFullPath($candidate.FullName), $path, [System.StringComparison]::OrdinalIgnoreCase)) {{ $book = $candidate; break }}
     }}
-    if ($null -eq $book) {{ $book = $app.Workbooks.Open($path) }}
+    if ($null -ne $book -and -not $book.ReadOnly -and $book.Saved) {{
+      $book.Close($false)
+      $book = $null
+    }}
+    if ($null -eq $book) {{ $book = $app.Workbooks.Open($path, 0, $true) }}
     $app.Visible = $true
     $app.WindowState = -4137
     $book.Activate()
@@ -4890,7 +4949,7 @@ foreach ($candidateApp in @(
     $cell.Select()
     $app.Goto($cell, $true)
     $app.UserControl = $true
-    $openedWith = $candidateApp.Name
+    $openedWith = $candidateApp.Name + '|' + [string]$book.ReadOnly
     break
   }} catch {{
     $errors += ($candidateApp.Name + ': ' + $_.Exception.Message)
@@ -4922,11 +4981,13 @@ Write-Output $openedWith
             detail = detail[-500:] if detail else "WPS/Excel COM 调用失败"
             raise ValueError(f"WPS/Excel 打开失败：{detail}")
         output = (completed.stdout or b"").decode("utf-16le", errors="ignore").strip()
-        opened_with = next((line.strip() for line in reversed(output.splitlines()) if line.strip() in {"WPS", "Excel"}), "WPS")
+        open_state = next((line.strip() for line in reversed(output.splitlines()) if line.strip().startswith(("WPS|", "Excel|"))), "WPS|True")
+        opened_with, _, read_only_text = open_state.partition("|")
         return {
             "ok": True,
             "kind": "excel",
             "application": opened_with,
+            "readOnly": read_only_text.casefold() == "true",
             "target": str(xlsx_path),
             "sheet": sheet_name,
             "row": excel_row,
