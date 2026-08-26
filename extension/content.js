@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.23.2";
+  const CONTENT_VERSION = "0.23.3";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -2085,10 +2085,35 @@
     throw new Error("帖子详情层未在当前页面加载完成");
   }
 
+  function prepareBatchProcessPanel(note = {}) {
+    const noteId = clean(note.noteId, 128);
+    if (!noteId) return { ok: false, expanded: false, error: "同步帖子缺少 ID" };
+    const panel = mountProcessPanel({ ...note, noteId });
+    panel._autoDock = true;
+    panel._detailOpened = true;
+    panel._detailMissingSince = 0;
+    panel._processNote = { ...panel._processNote, ...note, noteId };
+    panel.dataset.mode = "processing";
+    setProcessPanelCollapsed(panel, false);
+    updateProcessPanel({
+      process: true,
+      noteId,
+      phase: "open",
+      title: `正在同步“${note.title || "当前帖子"}”`,
+      note: panel._processNote
+    });
+    positionProcessPanel();
+    return {
+      ok: panel.isConnected,
+      expanded: panel.isConnected && !panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`),
+      noteId
+    };
+  }
+
   async function readNoteInPage(note = {}) {
     if (!note?.noteId) return { ok: false, error: "缺少帖子 ID" };
     const originalScrollY = window.scrollY;
-    const showProcess = Boolean(note.showProcess || note.process);
+    const showProcess = Boolean(note.showProcess || note.process || note.batchSync);
     let opened = false;
     if (showProcess) {
       const activePanel = mountProcessPanel(note);
@@ -2767,6 +2792,47 @@
       const noteId = clean(message.noteId, 128);
       const url = noteId ? bestLiveNoteUrl(noteId) : "";
       sendResponse({ ok: Boolean(url), url });
+      return false;
+    }
+    if (message.type === "prepareBatchProcess") {
+      sendResponse(prepareBatchProcessPanel(message.note || {}));
+      return false;
+    }
+    if (message.type === "batchSyncNoteProgress") {
+      const note = {
+        ...(processPanel?._processNote || {}),
+        ...(message.note || {}),
+        noteId: clean(message.noteId || message.note?.noteId, 128)
+      };
+      if (!note.noteId) {
+        sendResponse({ ok: false, error: "同步进度缺少帖子 ID" });
+        return false;
+      }
+      const panel = processPanel?.dataset.noteId === note.noteId
+        ? processPanel
+        : prepareBatchProcessPanel(note) && processPanel;
+      if (!panel) {
+        sendResponse({ ok: false, error: "同步进度窗口创建失败" });
+        return false;
+      }
+      setProcessPanelCollapsed(panel, false);
+      updateProcessPanel({
+        process: true,
+        noteId: note.noteId,
+        note,
+        phase: message.phase || "excel",
+        title: message.title || "正在同步本地数据",
+        done: Boolean(message.done),
+        error: message.error || "",
+        pullStatus: message.pullStatus || "synced",
+        commentCount: message.commentCount ?? note.commentCount ?? 0,
+        commentRows: Array.isArray(message.commentRows) ? message.commentRows : undefined
+      });
+      sendResponse({
+        ok: true,
+        expanded: !panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`),
+        noteId: note.noteId
+      });
       return false;
     }
     if (message.type === "expandVisibleComments") {

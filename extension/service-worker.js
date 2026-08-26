@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.2";
+const CONTENT_SCRIPT_VERSION = "0.23.3";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -1100,6 +1100,20 @@ async function readPulledNoteInReader(tabId, note) {
       await navigateBackgroundTab(tabId, candidate.url);
       await ensureContentInjected(tabId);
       await delay(candidate.waitForCard ? 650 : 220);
+      let prepared = await sendTabMessage(tabId, {
+        type: "prepareBatchProcess",
+        note: { ...note, noteId: note.noteId, batchSync: true }
+      }).catch(() => null);
+      if (!prepared?.ok || !prepared.expanded) {
+        await delay(140);
+        prepared = await sendTabMessage(tabId, {
+          type: "prepareBatchProcess",
+          note: { ...note, noteId: note.noteId, batchSync: true }
+        }).catch(() => null);
+      }
+      if (!prepared?.ok || !prepared.expanded) {
+        throw new Error("同步进度窗口尚未展开，已暂停本帖读取");
+      }
       const extracted = await sendTabMessage(tabId, {
         type: "readNoteInPage",
         note: {
@@ -1108,8 +1122,8 @@ async function readPulledNoteInReader(tabId, note) {
           allComments: true,
           batchSync: true,
           waitForCard: candidate.waitForCard,
-          showProcess: false,
-          process: false
+          showProcess: true,
+          process: true
         }
       });
       if (extracted?.ok) return { ...extracted, accessCandidate: candidate.source };
@@ -1147,6 +1161,15 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     expectedCount: Number(extracted.expectedCount) || 0,
     status: extracted.status || "partial"
   };
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    title: `已读取 ${snapshot.comments.length} 条评论，正在与本地数据对比`,
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
   let comparison;
   try {
     comparison = await bridgeApi("/api/comments/compare", {
@@ -1164,8 +1187,27 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     throw error;
   }
   if (!comparison.hasChanges) {
+    await sendTabMessage(tabId, {
+      type: "batchSyncNoteProgress",
+      noteId: note.noteId,
+      note: snapshot.note,
+      phase: "excel",
+      done: true,
+      title: "核对完成，本地评论已是最新",
+      commentCount: snapshot.comments.length,
+      commentRows: snapshot.comments.slice(0, 12)
+    }).catch(() => {});
     return { ok: true, changed: false, comparison, collectedCount: snapshot.comments.length };
   }
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    title: `发现 ${Number(comparison.newCount || 0) + Number(comparison.removedCount || 0) + Number(comparison.changedCount || 0)} 项变化，正在写入`,
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
   let synced;
   try {
     synced = await syncCurrentNoteComments({ noteId: note.noteId, snapshot, runId });
@@ -1178,6 +1220,16 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     error.syncStage = "sync";
     throw error;
   }
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    done: true,
+    title: "评论变化已同步完成",
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
   return { ok: true, changed: true, comparison, synced, collectedCount: synced.collectedCount || snapshot.comments.length };
 }
 
@@ -1238,6 +1290,15 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
         });
       } catch (error) {
         if (batchCommentSyncCancelled) break;
+        await sendTabMessage(reader.id, {
+          type: "batchSyncNoteProgress",
+          noteId: note.noteId,
+          note,
+          phase: error?.syncStage === "open" ? "open" : "excel",
+          done: true,
+          error: error?.message || "本帖同步失败",
+          title: "本帖同步暂停，已记录失败原因"
+        }).catch(() => {});
         const opened = error?.syncStage && error.syncStage !== "open";
         const accessStatus = opened ? "ok" : (error?.accessStatus === "unreachable" ? "unreachable" : "check_failed");
         const markedUnreachable = accessStatus === "unreachable";
@@ -1266,7 +1327,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           failures: [...batchCommentSyncState.failures, failure].slice(-1000)
         });
       }
-      if (!batchCommentSyncCancelled) await delay(260);
+      if (!batchCommentSyncCancelled) await delay(420);
     }
   } finally {
     if (accessUpdates.length) {
