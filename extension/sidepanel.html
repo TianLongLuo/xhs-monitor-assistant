@@ -121,6 +121,13 @@
           <div class="batch-sync-progress__track"><i id="batchSyncBar"></i></div>
           <p id="batchSyncCurrent">正在读取已拉取帖子列表…</p>
           <p id="batchSyncStats" class="batch-sync-progress__stats">有变化 0 · 无变化 0 · 打不开 0 · 其他失败 0</p>
+          <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="同步失败帖子">
+            <div class="batch-sync-failures__head">
+              <strong>失败帖子</strong>
+              <span id="batchSyncFailureCount">0 篇</span>
+            </div>
+            <ol id="batchSyncFailureList" class="batch-sync-failures__list"></ol>
+          </section>
           <button id="cancelBatchSync" class="batch-sync-progress__cancel" type="button">停止同步</button>
           <button id="retryBatchFailures" class="batch-sync-progress__retry" type="button" hidden>重新核验失败项</button>
         </section>

@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.3";
+const CONTENT_SCRIPT_VERSION = "0.23.4";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -51,7 +51,8 @@ const FLOATING_WINDOW_DEFAULTS = {
   floatingBallTop: 0,
   floatingBounds: { width: 400, height: 760 }
 };
-const FLOATING_BALL_SIZE = 92;
+const FLOATING_DOCK_WIDTH = 292;
+const FLOATING_DOCK_HEIGHT = 126;
 
 // AI 任务进度估算（Bridge 无实时进度事件，按状态+耗时估算，用于流式进度条）
 function estimateJobPercent(job, now = Date.now()) {
@@ -201,10 +202,10 @@ async function restoreSidePanel() {
   return closeFloatingWindow();
 }
 
-// 缩小为右侧吸附的圆形悬浮球（类 iPhone 辅助触控）
+// 缩小为右侧吸附的紧凑状态卡片
 async function openBallWindow() {
   if (!chrome.windows?.create) {
-    return { ok: false, error: "当前 Chrome 不支持悬浮球模式" };
+    return { ok: false, error: "当前 Chrome 不支持快捷悬浮窗模式" };
   }
   const saved = await chrome.storage.local.get(FLOATING_WINDOW_DEFAULTS);
   const existingId = Number(saved.floatingWindowId) || 0;
@@ -220,15 +221,15 @@ async function openBallWindow() {
     ? Number(saved.floatingBallTop)
     : Math.round(baseTop + baseHeight * 0.3);
   const popup = await chrome.windows.create({
-    width: FLOATING_BALL_SIZE,
-    height: FLOATING_BALL_SIZE,
-    left: Math.max(0, Math.round(baseLeft + baseWidth - FLOATING_BALL_SIZE - 6)),
+    width: FLOATING_DOCK_WIDTH,
+    height: FLOATING_DOCK_HEIGHT,
+    left: Math.max(0, Math.round(baseLeft + baseWidth - FLOATING_DOCK_WIDTH - 10)),
     top,
     focused: true,
     type: "popup",
     url: chrome.runtime.getURL("sidepanel.html?mode=ball")
   });
-  if (!popup?.id) return { ok: false, error: "悬浮球创建失败" };
+  if (!popup?.id) return { ok: false, error: "快捷悬浮窗创建失败" };
   await chrome.storage.local.set({
     floatingWindowId: popup.id,
     floatingWindowKind: "ball",
@@ -238,7 +239,7 @@ async function openBallWindow() {
   return { ok: true, windowId: popup.id, originWindowId: origin?.id || null };
 }
 
-// 点击悬浮球：展开为完整悬浮窗
+// 点击紧凑状态卡片：展开为完整悬浮窗
 async function expandBallWindow() {
   const saved = await chrome.storage.local.get(FLOATING_WINDOW_DEFAULTS);
   const ballId = Number(saved.floatingWindowId) || 0;
@@ -1310,6 +1311,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
         });
         const failure = {
           noteId: note.noteId,
+          url: note.url || `https://www.xiaohongshu.com/explore/${encodeURIComponent(note.noteId)}`,
           title: note.title || "未命名帖子",
           error: error?.message || "同步失败",
           stage: error?.syncStage || "unknown",

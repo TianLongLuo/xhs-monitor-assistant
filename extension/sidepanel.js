@@ -49,6 +49,9 @@ const elements = {
   batchSyncBar: document.getElementById("batchSyncBar"),
   batchSyncCurrent: document.getElementById("batchSyncCurrent"),
   batchSyncStats: document.getElementById("batchSyncStats"),
+  batchSyncFailures: document.getElementById("batchSyncFailures"),
+  batchSyncFailureCount: document.getElementById("batchSyncFailureCount"),
+  batchSyncFailureList: document.getElementById("batchSyncFailureList"),
   cancelBatchSync: document.getElementById("cancelBatchSync"),
   retryBatchFailures: document.getElementById("retryBatchFailures"),
   deleteUnreachable: document.getElementById("deleteUnreachable"),
@@ -190,7 +193,7 @@ if (floatingMode) {
   elements.toggleFloating?.setAttribute("title", "恢复到侧边栏");
   elements.toggleFloating?.setAttribute("aria-label", "恢复到侧边栏");
 } else if (ballMode) {
-  document.title = "XHS-Monitor 悬浮球";
+  document.title = "舆情雷达 · 快捷窗";
 } else {
   elements.toggleFloating?.setAttribute("title", "缩小为悬浮窗");
   elements.toggleFloating?.setAttribute("aria-label", "缩小为悬浮窗");
@@ -279,7 +282,7 @@ async function toggleFloatingWindow() {
       if (typeof window !== "undefined" && typeof window.close === "function") window.close();
       return;
     }
-    setStatus("已缩小为悬浮球，点击屏幕右侧的小球可展开悬浮窗", "success");
+    setStatus("已缩小为右侧快捷悬浮窗，点击卡片可展开完整面板", "success");
   } catch (error) {
     setStatus(error.message || "窗口切换失败", "error");
   } finally {
@@ -357,6 +360,49 @@ function batchSyncSummary(state) {
   return `有变化 ${Number(state.changedPosts) || 0} · 无变化 ${Number(state.unchangedPosts) || 0} · 可打开 ${accessible} · 待复核 ${review} · 打不开 ${unreachable} · 同步失败 ${processing}${writeFailures ? ` · 状态未写入 ${writeFailures}` : ""}`;
 }
 
+function failureNoteUrl(failure = {}) {
+  const storedUrl = String(failure.url || "").trim();
+  if (/^https:\/\/([a-z0-9-]+\.)?xiaohongshu\.com\//i.test(storedUrl)) return storedUrl;
+  const noteId = String(failure.noteId || "").trim();
+  return noteId ? `https://www.xiaohongshu.com/explore/${encodeURIComponent(noteId)}` : "";
+}
+
+function renderBatchFailures(failures = []) {
+  if (!elements.batchSyncFailures || !elements.batchSyncFailureList) return;
+  const items = Array.isArray(failures) ? failures.filter((item) => item?.noteId || item?.url) : [];
+  elements.batchSyncFailures.hidden = items.length === 0;
+  if (elements.batchSyncFailureCount) elements.batchSyncFailureCount.textContent = `${items.length} 篇`;
+  const fragment = document.createDocumentFragment();
+  items.forEach((failure, index) => {
+    const item = document.createElement("li");
+    item.className = "batch-sync-failure";
+    const link = document.createElement("a");
+    const url = failureNoteUrl(failure);
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = "在新标签页打开失败帖子";
+
+    const number = document.createElement("span");
+    number.className = "batch-sync-failure__number";
+    number.textContent = String(index + 1).padStart(2, "0");
+    const copy = document.createElement("span");
+    copy.className = "batch-sync-failure__copy";
+    const title = document.createElement("strong");
+    title.textContent = failure.title || "未命名帖子";
+    const reason = document.createElement("small");
+    reason.textContent = failure.error || "同步失败";
+    copy.append(title, reason);
+    const action = document.createElement("span");
+    action.className = "batch-sync-failure__action";
+    action.textContent = "打开 ↗";
+    link.append(number, copy, action);
+    item.append(link);
+    fragment.append(item);
+  });
+  elements.batchSyncFailureList.replaceChildren(fragment);
+}
+
 function renderBatchSync(state = {}, notify = false) {
   batchSyncViewState = { ...batchSyncViewState, ...(state || {}) };
   const view = batchSyncViewState;
@@ -389,6 +435,7 @@ function renderBatchSync(state = {}, notify = false) {
   if (elements.batchSyncStats) {
     elements.batchSyncStats.textContent = `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`;
   }
+  renderBatchFailures(view.failures);
   if (elements.cancelBatchSync) {
     elements.cancelBatchSync.hidden = !running;
     elements.cancelBatchSync.disabled = view.phase === "stopping";
@@ -457,7 +504,7 @@ async function retryFailedPulledSync() {
     changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
     accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
     statusSyncFailures: 0,
-    newComments: 0, removedComments: 0, changedComments: 0,
+    newComments: 0, removedComments: 0, changedComments: 0, failures: [],
     phase: "preparing", error: "", finishedAt: ""
   });
   setStatus(`正在重新核验上一轮 ${failedCount} 个失败项…`);
@@ -1993,7 +2040,10 @@ document.addEventListener("visibilitychange", () => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (ballMode) return false;
+  if (ballMode) {
+    if (message.type === "batchCommentSyncProgress") updateCompactFloatingState(message);
+    return false;
+  }
   if (message.type === "batchCommentSyncProgress") {
     renderBatchSync(message, Boolean(message.done));
     if (message.phase === "failed-note") refreshUnreachableNotes().catch(() => {});
@@ -2092,16 +2142,50 @@ async function initSidePanel() {
   detailRefreshTimer?.unref?.();
 }
 
+let compactFloatingElements = null;
+
+function updateCompactFloatingState(state = {}) {
+  if (!compactFloatingElements) return;
+  const running = Boolean(state.running);
+  const failed = Math.max(0, Number(state.failedPosts) || 0);
+  const current = Math.max(0, Number(state.current) || 0);
+  const total = Math.max(0, Number(state.total) || 0);
+  compactFloatingElements.widget.dataset.state = running ? "running" : (failed ? "warning" : "idle");
+  compactFloatingElements.title.textContent = running
+    ? `正在同步 ${current}/${total || "?"}`
+    : (state.done ? "同步已完成" : "舆情雷达");
+  compactFloatingElements.detail.textContent = running
+    ? (state.currentTitle || "正在准备下一篇帖子")
+    : (failed ? `${failed} 篇失败 · 点击查看详情` : "点击展开完整面板");
+  compactFloatingElements.badge.hidden = !failed;
+  compactFloatingElements.badge.textContent = String(failed);
+}
+
 async function initBallWidget() {
   const widget = document.createElement("div");
   widget.className = "ball-widget";
   const ball = document.createElement("button");
   ball.type = "button";
   ball.className = "ball-widget__ball";
-  ball.title = "点击展开悬浮窗；按住上下拖动调整位置";
-  ball.textContent = "O";
+  ball.title = "点击展开完整悬浮窗；按住上下拖动调整位置";
+  ball.innerHTML = `
+    <span class="ball-widget__mark" aria-hidden="true">O</span>
+    <span class="ball-widget__copy">
+      <strong>舆情雷达</strong>
+      <small>点击展开完整面板</small>
+    </span>
+    <span class="ball-widget__badge" hidden>0</span>
+    <span class="ball-widget__arrow" aria-hidden="true">›</span>`;
   widget.append(ball);
   document.body.append(widget);
+  compactFloatingElements = {
+    widget,
+    title: ball.querySelector("strong"),
+    detail: ball.querySelector("small"),
+    badge: ball.querySelector(".ball-widget__badge")
+  };
+  const initialState = await sendRuntime({ type: "getBatchCommentSyncState" }).catch(() => null);
+  if (initialState) updateCompactFloatingState(initialState);
 
   let dragging = false;
   let moved = false;
