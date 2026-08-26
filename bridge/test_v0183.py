@@ -384,14 +384,42 @@ class V0183Tests(unittest.TestCase):
             "status": "unreachable",
             "error": "两条独立证据确认内容已删除",
         })
+        with self.store._session() as db:
+            db.execute(
+                "INSERT INTO note_summaries(note_id,model,result_json,comment_count,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (note_id, "test", "{}", 1, "2026-08-26T16:00:00+08:00", "2026-08-26T16:00:00+08:00"),
+            )
+            db.execute(
+                "INSERT INTO reply_generation_history(note_id,comment_id,generated_reply,created_at) VALUES(?,?,?,?)",
+                (note_id, comment["commentId"], "测试回复", "2026-08-26T16:00:00+08:00"),
+            )
+            db.execute(
+                "INSERT INTO ai_analysis_records(target_type,target_id,status,created_at) VALUES('relevance',?,'completed',?)",
+                (note_id, "2026-08-26T16:00:00+08:00"),
+            )
+            db.execute(
+                "INSERT INTO change_events(note_id,event_type,created_at) VALUES(?,'access_status',?)",
+                (note_id, "2026-08-26T16:00:00+08:00"),
+            )
+            db.execute(
+                "INSERT INTO watchlist(note_id,created_at,updated_at) VALUES(?,?,?)",
+                (note_id, "2026-08-26T16:00:00+08:00", "2026-08-26T16:00:00+08:00"),
+            )
 
         deleted = self.store.delete_unreachable_notes({})
         self.assertTrue(deleted["ok"])
         self.assertEqual(1, deleted["deletedCount"])
         self.assertEqual(1, deleted["deletedDatabaseComments"])
+        self.assertTrue(deleted["excelVerified"])
+        self.assertTrue(deleted["databaseVerified"])
+        self.assertGreaterEqual(deleted["deletedLinkedDatabaseRecords"], 5)
         with self.store._session() as db:
             self.assertIsNone(db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone())
-            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+            for table in ("comments", "note_summaries", "reply_generation_history", "comment_collection_jobs", "change_events", "watchlist"):
+                self.assertEqual(0, db.execute(f"SELECT COUNT(*) FROM {table} WHERE note_id=?", (note_id,)).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM ai_analysis_records WHERE target_id=?", (note_id,)
+            ).fetchone()[0])
         workbook = load_workbook(workbook_path, read_only=True, data_only=True)
         note_sheet = workbook["sheet1_笔记总表"]
         comment_sheet = workbook["sheet2_评论总表"]

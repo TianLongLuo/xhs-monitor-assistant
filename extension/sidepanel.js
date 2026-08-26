@@ -567,7 +567,9 @@ async function deleteAllUnreachableNotes() {
     const deleted = Number(result?.deletedCount) || 0;
     const failed = Number(result?.failedCount) || 0;
     if (!result?.ok && !deleted) throw new Error(result?.error || "批量删除失败");
-    const message = `已删除 ${deleted} 篇帖子及 ${Number(result?.deletedCommentRows) || 0} 条评论${failed ? `；${failed} 篇失败` : ""}`;
+    const verified = Boolean(result?.excelVerified && result?.databaseVerified);
+    const linked = Number(result?.deletedLinkedDatabaseRecords) || 0;
+    const message = `已清理 ${deleted} 篇失效帖子、${Number(result?.deletedCommentRows) || 0} 条 Excel 评论及 ${linked} 条关联记录${verified ? "；Excel 与数据库校验通过" : ""}${failed ? `；${failed} 篇失败` : ""}`;
     setStatus(message, failed ? "warning" : "success");
     showToast(message, failed ? "error" : "success");
     await Promise.all([refreshAll({ quiet: true }), refreshUnreachableNotes()]);

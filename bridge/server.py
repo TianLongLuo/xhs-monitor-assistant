@@ -40,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.5"
+VERSION = "0.23.6"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -4397,6 +4397,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "failedCount": len(failures),
             "deletedCommentRows": sum(int(item.get("deletedCommentRows", 0) or 0) for item in deleted),
             "deletedDatabaseComments": sum(int(item.get("deletedDatabaseComments", 0) or 0) for item in deleted),
+            "deletedLinkedDatabaseRecords": sum(int(item.get("deletedLinkedDatabaseRecords", 0) or 0) for item in deleted),
+            "excelVerified": all(bool(item.get("excelVerified")) for item in deleted),
+            "databaseVerified": all(bool(item.get("databaseVerified")) for item in deleted),
             "deleted": deleted,
             "failures": failures,
             "error": "；".join(item["error"] for item in failures[:3]),
@@ -4496,6 +4499,20 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                         comment_sheet.delete_rows(row_number, 1)
                         deleted_comment_rows += 1
 
+                remaining_note_rows = [
+                    row_number for row_number in range(2, note_sheet.max_row + 1)
+                    if valid_note_id(note_sheet.cell(row_number, note_id_column).value) == note_id
+                ]
+                remaining_comment_rows = [
+                    row_number for row_number in range(2, comment_sheet.max_row + 1)
+                    if (
+                        (text(comment_sheet.cell(row_number, comment_id_column).value, 256) in comment_id_set)
+                        or (comment_url_column and note_url_identity(comment_sheet.cell(row_number, comment_url_column).value) == note_id)
+                    )
+                ]
+                if remaining_note_rows or remaining_comment_rows:
+                    raise ValueError("Excel 清理校验失败，已停止提交以防数据不一致")
+
                 for sheet in (note_sheet, comment_sheet):
                     for table in sheet.tables.values():
                         min_col, min_row, max_col, _max_row = range_boundaries(table.ref)
@@ -4517,17 +4534,41 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     raise ValueError("WPS/Excel 持续占用总表，请关闭表格窗口后重试删除") from exc
                 temporary_path = None
 
+                linked_database_records = 0
                 with self.lock, self._session() as db:
                     if comment_ids:
                         placeholders = ",".join("?" for _ in comment_ids)
-                        db.execute(f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids)
-                        db.execute(f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids)
-                    db.execute("DELETE FROM ai_jobs WHERE target_type='note' AND target_id=?", (note_id,))
-                    db.execute("DELETE FROM ai_analysis_records WHERE target_type='note' AND target_id=?", (note_id,))
-                    db.execute("DELETE FROM comment_collection_jobs WHERE note_id=?", (note_id,))
-                    db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
-                    db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
-                    db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
+                        linked_database_records += db.execute(
+                            f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids
+                        ).rowcount
+                        linked_database_records += db.execute(
+                            f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids
+                        ).rowcount
+                    linked_database_records += db.execute(
+                        "DELETE FROM ai_jobs WHERE target_type IN ('note','relevance') AND target_id=?", (note_id,)
+                    ).rowcount
+                    linked_database_records += db.execute(
+                        "DELETE FROM ai_analysis_records WHERE target_type IN ('note','relevance') AND target_id=?", (note_id,)
+                    ).rowcount
+                    linked_database_records += db.execute("DELETE FROM note_summaries WHERE note_id=?", (note_id,)).rowcount
+                    linked_database_records += db.execute("DELETE FROM reply_generation_history WHERE note_id=?", (note_id,)).rowcount
+                    linked_database_records += db.execute("DELETE FROM comment_collection_jobs WHERE note_id=?", (note_id,)).rowcount
+                    linked_database_records += db.execute("DELETE FROM change_events WHERE note_id=?", (note_id,)).rowcount
+                    linked_database_records += db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,)).rowcount
+                    deleted_database_comments = db.execute("DELETE FROM comments WHERE note_id=?", (note_id,)).rowcount
+                    deleted_database_notes = db.execute("DELETE FROM notes WHERE note_id=?", (note_id,)).rowcount
+                    if deleted_database_notes != 1:
+                        raise ValueError("SQLite 帖子清理校验失败，已停止提交")
+                    remaining_database_rows = sum([
+                        db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0],
+                        db.execute("SELECT COUNT(*) FROM note_summaries WHERE note_id=?", (note_id,)).fetchone()[0],
+                        db.execute("SELECT COUNT(*) FROM reply_generation_history WHERE note_id=?", (note_id,)).fetchone()[0],
+                        db.execute("SELECT COUNT(*) FROM comment_collection_jobs WHERE note_id=?", (note_id,)).fetchone()[0],
+                        db.execute("SELECT COUNT(*) FROM change_events WHERE note_id=?", (note_id,)).fetchone()[0],
+                        db.execute("SELECT COUNT(*) FROM watchlist WHERE note_id=?", (note_id,)).fetchone()[0],
+                    ])
+                    if remaining_database_rows:
+                        raise ValueError("SQLite 关联数据清理校验失败，已停止提交")
 
                 logical_delete_committed = True
                 cleanup_errors: list[str] = []
@@ -4550,7 +4591,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     "ok": True, "noteId": note_id, "excelPath": str(xlsx_path),
                     "deletedNoteRows": deleted_note_rows,
                     "deletedCommentRows": deleted_comment_rows,
-                    "deletedDatabaseComments": len(comment_ids),
+                    "deletedDatabaseComments": deleted_database_comments,
+                    "deletedLinkedDatabaseRecords": linked_database_records,
+                    "excelVerified": True,
+                    "databaseVerified": True,
                     "mediaDeleted": media_deleted,
                     "mediaCleanupWarning": media_cleanup_warning,
                     "mediaTombstone": ";".join(str(path) for _original, path in tombstones if path.exists()),
