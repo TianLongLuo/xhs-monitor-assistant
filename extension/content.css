@@ -1607,3 +1607,224 @@
     animation: none !important;
   }
 }
+
+/* v0.23.1 — magnetic panel layout repair
+   Keep the existing controls and handlers, but use one predictable scroll
+   surface and reveal detail sections only when their pipeline phase needs
+   them. This prevents loading placeholders from filling the full page rail. */
+.xhs-monitor-process,
+.xhs-monitor-process *,
+.xhs-monitor-process *::before,
+.xhs-monitor-process *::after {
+  box-sizing: border-box !important;
+}
+
+.xhs-monitor-process {
+  contain: layout paint style;
+  max-width: calc(100vw - 24px) !important;
+  min-width: 0 !important;
+  overscroll-behavior-y: auto !important;
+  scroll-padding-block: 72px 14px;
+}
+
+.xhs-monitor-process[data-position="outside"]::before {
+  display: none !important;
+}
+
+.xhs-monitor-process__head {
+  border-radius: 19px 19px 0 0;
+  min-width: 0;
+}
+
+.xhs-monitor-process__heading {
+  flex: 1 1 auto;
+  max-width: calc(100% - 106px);
+  min-width: 0;
+}
+
+.xhs-monitor-process__actions {
+  align-items: flex-start;
+  flex: 0 0 auto;
+}
+
+.xhs-monitor-process__target,
+.xhs-monitor-process__steps,
+.xhs-monitor-process__section,
+.xhs-monitor-process__foot {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.xhs-monitor-process__target-title {
+  display: -webkit-box !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: normal !important;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.xhs-monitor-process__fields,
+.xhs-monitor-process__comments {
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+.xhs-monitor-process__field > strong,
+.xhs-monitor-process__comment span {
+  overflow: visible !important;
+  text-overflow: clip !important;
+  white-space: normal !important;
+}
+
+.xhs-monitor-process[data-mode="idle"] [data-section],
+.xhs-monitor-process[data-mode="processing"][data-phase="open"] [data-section],
+.xhs-monitor-process[data-mode="processing"][data-phase="text"] [data-section],
+.xhs-monitor-process[data-mode="processing"][data-phase="comments"] [data-section="fields"],
+.xhs-monitor-process[data-mode="processing"][data-phase="media"] [data-section="fields"] {
+  display: none !important;
+}
+
+.xhs-monitor-process[data-mode="idle"] .xhs-monitor-process__foot,
+.xhs-monitor-process[data-mode="processing"] .xhs-monitor-process__foot {
+  display: none !important;
+}
+
+.xhs-monitor-process__section:has(> .xhs-monitor-process__fields:empty),
+.xhs-monitor-process__section:has(> .xhs-monitor-process__comments:empty) {
+  display: none !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__head {
+  gap: 7px !important;
+  padding: 11px 9px 10px 11px !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__heading {
+  max-width: calc(100% - 96px);
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__status {
+  max-width: 132px !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__pull {
+  min-width: 42px !important;
+  padding-inline: 8px !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__steps li {
+  min-height: 38px !important;
+  padding-block: 5px !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__step-copy small {
+  display: none !important;
+}
+
+.xhs-monitor-process[data-density="compact"] .xhs-monitor-process__field {
+  grid-template-columns: 62px minmax(0, 1fr) !important;
+  padding-inline: 8px !important;
+}
+
+.xhs-monitor-process--collapsed {
+  max-width: min(286px, calc(100vw - 24px)) !important;
+  min-width: 0 !important;
+}
+
+/* v0.23.2 — narrow magnetic rail
+   When Chrome's side panel leaves only ~200px beside the XHS dialog, keep the
+   Process panel in that rail instead of covering the post itself. */
+.xhs-monitor-process[data-position="outside"] {
+  min-width: 0 !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__head {
+  gap: 5px !important;
+  padding: 10px 8px 9px 10px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__heading {
+  max-width: calc(100% - 88px) !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__eyebrow,
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__step-copy small {
+  display: none !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__title {
+  font-size: 13px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__status {
+  font-size: 9px !important;
+  max-width: 102px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__actions {
+  gap: 3px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__pull,
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__collapse,
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__close {
+  height: 25px !important;
+  min-width: 25px !important;
+  width: 25px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__pull {
+  min-width: 38px !important;
+  padding-inline: 6px !important;
+  width: auto !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__head-states {
+  gap: 3px !important;
+  margin-top: 3px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__head-state {
+  font-size: 8px !important;
+  min-height: 18px !important;
+  padding-inline: 5px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__target,
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__steps {
+  margin-inline: 8px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__steps li {
+  gap: 7px !important;
+  grid-template-columns: 18px minmax(0, 1fr) auto !important;
+  min-height: 36px !important;
+  padding: 5px 8px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__step-marker {
+  height: 18px !important;
+  width: 18px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__step-copy strong,
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__section-head strong {
+  font-size: 10px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__step-open {
+  min-height: 25px !important;
+  min-width: 32px !important;
+  padding-inline: 6px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__section {
+  padding-inline: 8px !important;
+}
+
+.xhs-monitor-process[data-density="ultra"] .xhs-monitor-process__field {
+  grid-template-columns: 54px minmax(0, 1fr) !important;
+  gap: 6px !important;
+  padding-inline: 7px !important;
+}

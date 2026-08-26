@@ -9,9 +9,9 @@ const NATIVE_HOST_NAME = "com.xhsmonitor.bridge";
 const REQUEST_TIMEOUT_MS = 6500;
 const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
-const DETAIL_LOAD_TIMEOUT_MS = 12000;
+const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.0";
+const CONTENT_SCRIPT_VERSION = "0.23.2";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -1034,12 +1034,11 @@ function batchReaderUrl(value) {
 async function liveNoteUrlsFromOpenTabs(noteId, excludedTabId = 0) {
   if (!noteId) return [];
   const tabs = await chrome.tabs.query({}).catch(() => []);
-  const values = [];
-  for (const tab of tabs) {
-    if (!tab?.id || tab.id === excludedTabId || !isXhsPageUrl(tab.url || "")) continue;
-    const resolved = await sendTabMessage(tab.id, { type: "resolveNoteUrl", noteId }).catch(() => null);
-    if (desktopAccessibleUrl(resolved?.url)) values.push(resolved.url);
-  }
+  const eligible = tabs.filter((tab) => tab?.id && tab.id !== excludedTabId && isXhsPageUrl(tab.url || ""));
+  const resolvedUrls = await Promise.all(eligible.map((tab) =>
+    sendTabMessage(tab.id, { type: "resolveNoteUrl", noteId }).catch(() => null)
+  ));
+  const values = resolvedUrls.map((resolved) => resolved?.url).filter(desktopAccessibleUrl);
   return [...new Set(values)];
 }
 
@@ -1100,7 +1099,7 @@ async function readPulledNoteInReader(tabId, note) {
     try {
       await navigateBackgroundTab(tabId, candidate.url);
       await ensureContentInjected(tabId);
-      await delay(candidate.waitForCard ? 900 : 350);
+      await delay(candidate.waitForCard ? 650 : 220);
       const extracted = await sendTabMessage(tabId, {
         type: "readNoteInPage",
         note: {
@@ -1267,7 +1266,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           failures: [...batchCommentSyncState.failures, failure].slice(-1000)
         });
       }
-      if (!batchCommentSyncCancelled) await delay(750);
+      if (!batchCommentSyncCancelled) await delay(260);
     }
   } finally {
     if (accessUpdates.length) {
