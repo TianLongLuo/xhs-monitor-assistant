@@ -123,7 +123,7 @@
           <p id="batchSyncStats" class="batch-sync-progress__stats">有变化 0 · 无变化 0 · 打不开 0 · 其他失败 0</p>
           <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="同步失败帖子">
             <div class="batch-sync-failures__head">
-              <strong>失败帖子</strong>
+              <strong>未完成帖子诊断</strong>
               <span id="batchSyncFailureCount">0 篇</span>
             </div>
             <ol id="batchSyncFailureList" class="batch-sync-failures__list"></ol>
@@ -135,7 +135,7 @@
           <span class="unreachable-delete-button__glyph" aria-hidden="true">×</span>
           <span class="unreachable-delete-button__copy">
             <strong id="deleteUnreachableLabel">删除打不开帖子</strong>
-            <small>删除 Excel 帖子行、对应评论、SQLite 与素材</small>
+            <small id="unreachableHint">仅删除经双重证据确认失效的帖子及关联数据</small>
           </span>
           <span id="unreachableCount" class="unreachable-delete-button__count">0</span>
         </button>

@@ -794,6 +794,29 @@ body.is-floating .icon-button--float {
   font: 800 8px/1 ui-monospace, "Cascadia Mono", monospace;
 }
 .batch-sync-failure__copy { display: grid; gap: 3px; min-width: 0; }
+.batch-sync-failure__badge {
+  background: rgba(255, 159, 10, .12);
+  border-radius: 999px;
+  color: #9a6700;
+  font-size: 8px;
+  font-weight: 800;
+  justify-self: start;
+  padding: 2px 6px;
+}
+.batch-sync-failure[data-diagnosis="confirmed_unreachable"] .batch-sync-failure__badge {
+  background: rgba(215, 0, 21, .1);
+  color: #c21f30;
+}
+.batch-sync-failure[data-diagnosis="accessible_extraction_failed"] .batch-sync-failure__badge,
+.batch-sync-failure[data-diagnosis="stored_link_needs_refresh"] .batch-sync-failure__badge,
+.batch-sync-failure[data-diagnosis="stored_link_id_mismatch"] .batch-sync-failure__badge {
+  background: rgba(0, 113, 227, .1);
+  color: #0068c9;
+}
+.batch-sync-failure[data-diagnosis="mobile_only"] .batch-sync-failure__badge {
+  background: rgba(88, 86, 214, .11);
+  color: #514fc1;
+}
 .batch-sync-failure__copy strong,
 .batch-sync-failure__copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-sync-failure__copy strong { font-size: 9px; }

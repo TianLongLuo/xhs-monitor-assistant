@@ -57,6 +57,7 @@ const elements = {
   deleteUnreachable: document.getElementById("deleteUnreachable"),
   deleteUnreachableLabel: document.getElementById("deleteUnreachableLabel"),
   unreachableCount: document.getElementById("unreachableCount"),
+  unreachableHint: document.getElementById("unreachableHint"),
   status: document.getElementById("status"),
   scanStages: document.getElementById("scanStages"),
   newCount: document.getElementById("newCount"),
@@ -357,7 +358,7 @@ function batchSyncSummary(state) {
   const unreachable = Math.max(0, Number(state.unreachablePosts) || 0);
   const processing = Math.max(0, Number(state.processingFailedPosts) || 0);
   const writeFailures = Math.max(0, Number(state.statusSyncFailures) || 0);
-  return `有变化 ${Number(state.changedPosts) || 0} · 无变化 ${Number(state.unchangedPosts) || 0} · 可打开 ${accessible} · 待复核 ${review} · 打不开 ${unreachable} · 同步失败 ${processing}${writeFailures ? ` · 状态未写入 ${writeFailures}` : ""}`;
+  return `有变化 ${Number(state.changedPosts) || 0} · 无变化 ${Number(state.unchangedPosts) || 0} · 可打开 ${accessible} · 待复核 ${review} · 已确认失效 ${unreachable} · 读取未完成 ${processing}${writeFailures ? ` · 状态未写入 ${writeFailures}` : ""}`;
 }
 
 function failureNoteUrl(failure = {}) {
@@ -388,14 +389,20 @@ function renderBatchFailures(failures = []) {
     number.textContent = String(index + 1).padStart(2, "0");
     const copy = document.createElement("span");
     copy.className = "batch-sync-failure__copy";
+    const diagnosis = failure.diagnosis || {};
+    item.dataset.diagnosis = diagnosis.code || "unknown";
+    const badge = document.createElement("span");
+    badge.className = "batch-sync-failure__badge";
+    badge.textContent = diagnosis.label || (failure.markedUnreachable ? "已确认失效" : "同步未完成");
     const title = document.createElement("strong");
     title.textContent = failure.title || "未命名帖子";
     const reason = document.createElement("small");
-    reason.textContent = failure.error || "同步失败";
-    copy.append(title, reason);
+    reason.textContent = [diagnosis.summary, diagnosis.localSummary, failure.error].filter(Boolean).join(" · ") || "等待重新核验";
+    reason.title = reason.textContent;
+    copy.append(badge, title, reason);
     const action = document.createElement("span");
     action.className = "batch-sync-failure__action";
-    action.textContent = "打开 ↗";
+    action.textContent = failure.markedUnreachable ? "待清理" : "打开 ↗";
     link.append(number, copy, action);
     item.append(link);
     fragment.append(item);
@@ -445,13 +452,14 @@ function renderBatchSync(state = {}, notify = false) {
     const failedCount = Math.max(0, Number(view.failedPosts) || 0);
     elements.retryBatchFailures.hidden = running || failedCount === 0;
     elements.retryBatchFailures.disabled = running;
-    elements.retryBatchFailures.textContent = `重新核验 ${failedCount} 个失败项`;
+    elements.retryBatchFailures.textContent = `重新核验 ${failedCount} 个未完成项`;
     elements.retryBatchFailures.title = (view.failures || []).length < failedCount
       ? "旧批次未保存全部失败 ID，将自动重新核验全部已拉取帖子"
       : "只重新核验上一轮失败的帖子";
   }
   if (elements.deleteUnreachable) {
-    elements.deleteUnreachable.disabled = running || unreachableDeleteRunning || unreachableNotes.length === 0;
+    const reviewCount = (view.failures || []).filter((item) => !item?.markedUnreachable).length;
+    elements.deleteUnreachable.disabled = running || unreachableDeleteRunning || (unreachableNotes.length === 0 && reviewCount === 0);
   }
 
   if (!notify || running || !view.done) return;
@@ -531,15 +539,23 @@ async function cancelAllPulledSync() {
 function renderUnreachableNotes(result = {}) {
   unreachableNotes = Array.isArray(result.notes) ? result.notes : [];
   const count = Number(result.count ?? unreachableNotes.length) || 0;
-  if (elements.unreachableCount) elements.unreachableCount.textContent = String(count);
+  const reviewCount = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable).length;
+  if (elements.unreachableCount) elements.unreachableCount.textContent = String(count || reviewCount);
   if (elements.deleteUnreachableLabel) {
-    elements.deleteUnreachableLabel.textContent = count ? `删除打不开帖子（${count}）` : "删除打不开帖子";
+    elements.deleteUnreachableLabel.textContent = count
+      ? `清理已确认失效帖子（${count}）`
+      : reviewCount ? `重新诊断待复核帖子（${reviewCount}）` : "暂无已确认失效帖子";
+  }
+  if (elements.unreachableHint) {
+    elements.unreachableHint.textContent = count
+      ? "同步删除 Excel、评论、SQLite、分析记录与素材，并执行一致性校验"
+      : reviewCount ? "先查链接、扫码限制和本地素材；确认失效后才允许删除" : "仅删除经双重证据确认已删除或下架的帖子";
   }
   if (elements.deleteUnreachable) {
-    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || count === 0;
+    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || (count === 0 && reviewCount === 0);
     elements.deleteUnreachable.title = count
       ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n")
-      : "批量巡检遇到无法打开的帖子后，会在这里显示";
+      : reviewCount ? "点击重新核验待复核帖子，不会直接删除" : "当前没有经双重证据确认的失效帖子";
   }
 }
 
@@ -551,7 +567,12 @@ async function refreshUnreachableNotes() {
 }
 
 async function deleteAllUnreachableNotes() {
-  if (unreachableDeleteRunning || batchSyncViewState.running || !unreachableNotes.length) return;
+  if (unreachableDeleteRunning || batchSyncViewState.running) return;
+  if (!unreachableNotes.length) {
+    const reviewCount = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable).length;
+    if (reviewCount) return retryFailedPulledSync();
+    return;
+  }
   const count = unreachableNotes.length;
   const accepted = confirm(
     `确定删除 ${count} 篇标记为“打不开”的帖子吗？\n\n` +

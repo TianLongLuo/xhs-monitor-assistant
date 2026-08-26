@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.7";
+const CONTENT_SCRIPT_VERSION = "0.23.9";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -562,6 +562,16 @@ async function extractCommentsFromTab(tabId, note) {
   return { extracted, totalClicked };
 }
 
+function noteIdFromXhsUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    const match = url.pathname.match(/\/(?:search_result|explore|discovery\/item)\/([A-Za-z0-9_-]{6,128})/);
+    return match?.[1] || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function validXhsNoteUrl(value) {
   try {
     const url = new URL(String(value || ""));
@@ -1048,7 +1058,8 @@ function batchReaderCandidates(note = {}, liveUrls = []) {
   for (const url of liveUrls) {
     candidates.push({ url: batchReaderUrl(url), waitForCard: false, source: "live-tab-url" });
   }
-  if (validXhsNoteUrl(note.url)) {
+  const storedUrlId = noteIdFromXhsUrl(note.url);
+  if (validXhsNoteUrl(note.url) && (!storedUrlId || storedUrlId === note.noteId)) {
     candidates.push({ url: batchReaderUrl(note.url), waitForCard: false, source: "stored-url" });
   }
   if (note.noteId) {
@@ -1083,6 +1094,55 @@ function isBatchInfrastructureError(message) {
     .test(String(message || ""));
 }
 
+function accessFailureDiagnosis(error = {}, local = {}) {
+  const evidence = Array.isArray(error.accessEvidence) ? error.accessEvidence : [];
+  const states = new Set(evidence.map((item) => item?.state).filter(Boolean));
+  const mediaCount = Array.isArray(local.mediaFiles) ? local.mediaFiles.length : 0;
+  const commentCount = Math.max(0, Number(local.commentCount) || 0);
+  const hasLocalCopy = Boolean(local.found && (local.inExcel || local.note?.content || mediaCount || commentCount));
+  const linkMismatchSummary = states.has("link_id_mismatch") ? " · 保存链接指向其他帖子" : "";
+  const localSummary = hasLocalCopy
+    ? `本地已拉取${mediaCount ? ` · 素材 ${mediaCount} 个` : ""}${commentCount ? ` · 评论 ${commentCount} 条` : ""}${linkMismatchSummary}`
+    : `本地尚无完整副本${linkMismatchSummary}`;
+  let code = "link_needs_review";
+  let label = "链接待复核";
+  let summary = "桌面链接未能完成核验，禁止自动删除";
+  if (error.unreachable) {
+    code = "confirmed_unreachable";
+    label = "已确认失效";
+    summary = "至少两个独立详情入口明确显示已删除、下架或不存在";
+  } else if (states.has("accessible_surface") || error.opened) {
+    code = "accessible_extraction_failed";
+    label = "可打开，读取未完成";
+    summary = "帖子页面可访问，仅详情层提取失败，不属于失效帖子";
+  } else if (states.has("definitive_unreachable")) {
+    code = "suspected_unreachable";
+    label = "疑似删除/链接失效";
+    summary = "至少一个详情入口明确显示“页面不见了”，但证据尚未达到安全删除标准";
+  } else if (states.has("mobile_only")) {
+    code = "mobile_only";
+    label = "仅手机/扫码可看";
+    summary = "桌面端要求扫码，不能据此认定帖子已删除";
+  } else if (states.has("authentication_required")) {
+    code = "authentication_required";
+    label = "登录验证受限";
+    summary = "登录、验证码或风控阻止读取，不属于失效帖子";
+  } else if (states.has("temporary_blocked")) {
+    code = "temporary_blocked";
+    label = "桌面暂时受限";
+    summary = "页面暂时无法浏览，稍后应重新核验";
+  } else if (states.has("link_id_mismatch")) {
+    code = "stored_link_id_mismatch";
+    label = "本地链接串帖";
+    summary = "保存的链接指向另一篇帖子，已停止误读并尝试按原帖子 ID、作者页和标题重新找回";
+  } else if (hasLocalCopy) {
+    code = "stored_link_needs_refresh";
+    label = "本地有副本，链接待修复";
+    summary = "已找到本地正文、评论或素材，保留数据并重新解析有效链接";
+  }
+  return { code, label, summary, localSummary, hasLocalCopy, mediaCount, commentCount };
+}
+
 async function readPulledNoteInReader(tabId, note) {
   const liveUrls = await liveNoteUrlsFromOpenTabs(note.noteId, tabId);
   const candidates = batchReaderCandidates(note, liveUrls);
@@ -1094,7 +1154,16 @@ async function readPulledNoteInReader(tabId, note) {
   }
   let lastError = "帖子详情读取失败";
   let infrastructureFailure = false;
-  const accessEvidence = [];
+  const storedUrlId = noteIdFromXhsUrl(note.url);
+  const accessEvidence = storedUrlId && storedUrlId !== note.noteId
+    ? [{
+        source: "stored-url",
+        state: "link_id_mismatch",
+        marker: storedUrlId,
+        reason: `本地链接指向另一篇帖子 ${storedUrlId}`,
+        targetRoute: false
+      }]
+    : [];
   for (const candidate of candidates) {
     if (batchCommentSyncCancelled) throw new Error("用户已停止批量同步");
     try {
@@ -1130,8 +1199,14 @@ async function readPulledNoteInReader(tabId, note) {
       if (extracted?.ok) return { ...extracted, accessCandidate: candidate.source };
       lastError = extracted?.error || lastError;
       const evidence = extracted?.access || {};
-      accessEvidence.push({ source: candidate.source, state: evidence.state || "unknown", marker: evidence.marker || "" });
-      if (evidence.state === "temporary_blocked") infrastructureFailure = true;
+      accessEvidence.push({
+        source: candidate.source,
+        state: evidence.state || "unknown",
+        marker: evidence.marker || "",
+        reason: evidence.reason || "",
+        targetRoute: Boolean(evidence.targetRoute)
+      });
+      if (["temporary_blocked", "mobile_only", "authentication_required"].includes(evidence.state)) infrastructureFailure = true;
     } catch (error) {
       lastError = error?.message || lastError;
       infrastructureFailure = infrastructureFailure || isBatchInfrastructureError(lastError);
@@ -1142,8 +1217,10 @@ async function readPulledNoteInReader(tabId, note) {
   const explicitSources = new Set(
     accessEvidence.filter((item) => item.state === "definitive_unreachable").map((item) => item.source)
   );
-  error.unreachable = !infrastructureFailure && explicitSources.size >= 2;
-  error.accessStatus = error.unreachable ? "unreachable" : "check_failed";
+  const accessible = accessEvidence.some((item) => item.state === "accessible_surface" || item.state === "ok");
+  error.unreachable = !accessible && !infrastructureFailure && explicitSources.size >= 2;
+  error.opened = accessible;
+  error.accessStatus = error.unreachable ? "unreachable" : (accessible ? "ok" : "check_failed");
   error.accessEvidence = accessEvidence;
   throw error;
 }
@@ -1300,23 +1377,37 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           error: error?.message || "本帖同步失败",
           title: "本帖同步暂停，已记录失败原因"
         }).catch(() => {});
-        const opened = error?.syncStage && error.syncStage !== "open";
+        const opened = Boolean(error?.opened || (error?.syncStage && error.syncStage !== "open"));
         const accessStatus = opened ? "ok" : (error?.accessStatus === "unreachable" ? "unreachable" : "check_failed");
         const markedUnreachable = accessStatus === "unreachable";
+        const localStatus = await getNoteStatus(note.noteId).catch(() => ({ ok: false, found: false }));
+        const diagnosis = accessFailureDiagnosis({ ...error, opened, unreachable: markedUnreachable }, localStatus || {});
         accessUpdates.push({
           noteId: note.noteId,
           status: accessStatus,
-          result: opened ? "opened" : (markedUnreachable ? "confirmed_v2" : "inconclusive"),
-          error: opened ? "" : (error?.message || "本次访问核验未完成")
+          result: opened ? "opened_extract_failed" : (markedUnreachable ? "confirmed_v2" : diagnosis.code),
+          error: opened ? "" : `${diagnosis.label}：${diagnosis.summary}`
         });
         const failure = {
           noteId: note.noteId,
-          url: note.url || `https://www.xiaohongshu.com/explore/${encodeURIComponent(note.noteId)}`,
+          url: noteIdFromXhsUrl(note.url) === note.noteId
+            ? note.url
+            : `https://www.xiaohongshu.com/explore/${encodeURIComponent(note.noteId)}`,
+          storedUrl: note.url || "",
           title: note.title || "未命名帖子",
-          error: error?.message || "同步失败",
+          error: error?.message || "同步未完成",
           stage: error?.syncStage || "unknown",
           markedUnreachable,
           accessStatus,
+          diagnosis,
+          localEvidence: {
+            found: Boolean(localStatus?.found),
+            inExcel: Boolean(localStatus?.inExcel),
+            pullStatus: localStatus?.pullStatus || "",
+            mediaDir: localStatus?.mediaDir || "",
+            mediaCount: diagnosis.mediaCount,
+            commentCount: diagnosis.commentCount
+          },
           accessEvidence: error?.accessEvidence || []
         };
         await publishBatchCommentSync({

@@ -40,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.7"
+VERSION = "0.23.9"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")

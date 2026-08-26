@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.23.7";
+  const CONTENT_VERSION = "0.23.9";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -1196,6 +1196,7 @@
   }
 
   function detailCandidates() {
+    const activeNoteId = noteIdFromUrl(location.href);
     const candidates = new Set([
       ...document.querySelectorAll(
         '#noteContainer, [role="dialog"], .note-detail-mask .note-container, [class*="note-detail"], [class*="NoteDetail"], [class*="noteDetail"]'
@@ -1213,7 +1214,9 @@
       if (!visibleLargeElement(candidate)) return false;
       const rect = candidate.getBoundingClientRect();
       const isViewportMask = rect.width >= window.innerWidth * .97 && rect.height >= window.innerHeight * .95;
-      return !isViewportMask;
+      const marker = `${candidate.id || ""} ${typeof candidate.className === "string" ? candidate.className : ""}`;
+      const isFullPageNote = Boolean(activeNoteId && /note.?detail|notecontainer/i.test(marker));
+      return !isViewportMask || isFullPageNote;
     });
   }
 
@@ -1995,18 +1998,27 @@
     const targetRoute = Boolean(requestedId && currentPageId === requestedId);
     const definitive = [
       "该笔记已删除", "笔记已被删除", "内容已被删除", "该内容不存在",
-      "内容不存在", "该页面不存在", "笔记已失效", "内容已下架",
+      "内容不存在", "该页面不存在", "你访问的页面不见了", "访问的页面不见了", "页面不见了",
+      "笔记已失效", "内容已下架",
       "该笔记因违规", "作者已删除"
     ].find((marker) => bodyText.includes(marker));
     if (definitive && targetRoute) {
       return { state: "definitive_unreachable", marker: definitive, targetRoute: true };
     }
-    const temporary = [
-      "当前笔记暂时无法浏览", "笔记暂时无法浏览", "暂时无法浏览",
-      "请打开小红书App扫码查看", "请打开小红书 App 扫码查看",
-      "登录后查看", "安全验证", "验证码", "网络异常", "加载失败"
+    const mobileOnly = [
+      "请打开小红书App扫码查看", "请打开小红书 App 扫码查看", "扫码查看",
+      "打开小红书App查看", "打开小红书 App 查看"
     ].find((marker) => bodyText.includes(marker));
-    if (temporary) return { state: "temporary_blocked", marker: temporary, targetRoute };
+    if (mobileOnly) return { state: "mobile_only", marker: mobileOnly, targetRoute, reason: "桌面链接受限，手机扫码可能可打开" };
+    const authentication = ["登录后查看", "安全验证", "验证码"].find((marker) => bodyText.includes(marker));
+    if (authentication) return { state: "authentication_required", marker: authentication, targetRoute, reason: "登录或风控验证阻止读取" };
+    const temporary = [
+      "当前笔记暂时无法浏览", "笔记暂时无法浏览", "暂时无法浏览", "网络异常", "加载失败"
+    ].find((marker) => bodyText.includes(marker));
+    if (temporary) return { state: "temporary_blocked", marker: temporary, targetRoute, reason: "桌面页面暂时无法读取" };
+    const titlePrefix = clean(note.title, 1000).slice(0, 18);
+    const accessibleSurface = Boolean(targetRoute && titlePrefix && bodyText.includes(titlePrefix));
+    if (accessibleSurface) return { state: "accessible_surface", marker: "target_title_visible", targetRoute, reason: "帖子页面可打开，但详情提取未完成" };
     return { state: "unknown", marker: definitive || "", targetRoute };
   }
 

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "114",
   "name": "小红书舆情监控助手",
-  "version": "0.23.7",
+  "version": "0.23.9",
   "description": "为小红书帖子提供同页核对、Process 进度、图片/视频/评论完整采集，并幂等写入本地 Excel / SQLite。",
   "permissions": [
     "storage",
