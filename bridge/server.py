@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import html
 import json
 import mimetypes
 import os
@@ -21,10 +22,11 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.20.3"
+VERSION = "0.23.0"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -506,6 +508,10 @@ class MonitorStore:
                 "relevance_reason": "TEXT NOT NULL DEFAULT ''",
                 "relevance_confidence": "REAL NOT NULL DEFAULT 0",
                 "relevance_analyzed_at": "TEXT NOT NULL DEFAULT ''",
+                "access_status": "TEXT NOT NULL DEFAULT ''",
+                "access_error": "TEXT NOT NULL DEFAULT ''",
+                "last_access_checked_at": "TEXT NOT NULL DEFAULT ''",
+                "access_check_result": "TEXT NOT NULL DEFAULT ''",
             }
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(notes)").fetchall()}
             for column, definition in note_migrations.items():
@@ -518,6 +524,11 @@ class MonitorStore:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_negative ON notes(is_negative, ai_confidence)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_review ON notes(review_status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_relevance ON notes(relevance_status, source)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_access_status ON notes(access_status)")
+            db.execute("""UPDATE notes SET access_status='check_failed',
+                       access_error='旧版打不开判定已降级，等待重新同步核验',
+                       access_check_result='legacy_untrusted'
+                       WHERE access_status='unreachable' AND (access_check_result='' OR access_check_result IS NULL)""")
             db.execute("""UPDATE notes SET relevance_status=CASE
                 WHEN source='existing_xlsx' OR is_relevant=1 THEN 'relevant'
                 ELSE 'unknown' END
@@ -631,6 +642,68 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_comment_jobs_note
                     ON comment_collection_jobs(note_id, started_at);
+
+                CREATE TABLE IF NOT EXISTS sync_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_type TEXT NOT NULL DEFAULT 'single',
+                    status TEXT NOT NULL DEFAULT 'running',
+                    total_notes INTEGER NOT NULL DEFAULT 0,
+                    processed_notes INTEGER NOT NULL DEFAULT 0,
+                    changed_notes INTEGER NOT NULL DEFAULT 0,
+                    unchanged_notes INTEGER NOT NULL DEFAULT 0,
+                    failed_notes INTEGER NOT NULL DEFAULT 0,
+                    new_comments INTEGER NOT NULL DEFAULT 0,
+                    removed_comments INTEGER NOT NULL DEFAULT 0,
+                    changed_comments INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_sync_runs_started
+                    ON sync_runs(started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS change_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL DEFAULT 0,
+                    note_id TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    before_json TEXT NOT NULL DEFAULT '{}',
+                    after_json TEXT NOT NULL DEFAULT '{}',
+                    acknowledged INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_change_events_created
+                    ON change_events(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_change_events_note
+                    ON change_events(note_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_change_events_unread
+                    ON change_events(acknowledged, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    note_id TEXT PRIMARY KEY,
+                    priority TEXT NOT NULL DEFAULT 'normal',
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_watchlist_priority
+                    ON watchlist(priority, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS weekly_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    xlsx_path TEXT NOT NULL DEFAULT '',
+                    html_path TEXT NOT NULL DEFAULT '',
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    generated_at TEXT NOT NULL,
+                    UNIQUE(period_start, period_end)
+                );
+                CREATE INDEX IF NOT EXISTS idx_weekly_reports_generated
+                    ON weekly_reports(generated_at DESC);
                 """
             )
 
@@ -687,10 +760,48 @@ class MonitorStore:
                         ),
                     )
 
+    def _ensure_access_status_column(self, xlsx_path: Path) -> bool:
+        """Migrate an existing workbook so the access status is visible immediately."""
+        from openpyxl import load_workbook
+
+        xlsx_path = Path(xlsx_path)
+        workbook = None
+        temporary_path: Path | None = None
+        with self.pull_lock:
+            try:
+                workbook = load_workbook(xlsx_path)
+                if "sheet1_笔记总表" not in workbook.sheetnames:
+                    return False
+                sheet = workbook["sheet1_笔记总表"]
+                if "访问状态" in self._excel_headers(sheet):
+                    return False
+                self._ensure_excel_header(sheet, "访问状态")
+                temporary_path = xlsx_path.with_name(
+                    f".{xlsx_path.stem}.schema-{os.getpid()}-{time.time_ns()}.tmp{xlsx_path.suffix}"
+                )
+                workbook.save(temporary_path)
+                workbook.close()
+                workbook = None
+                try:
+                    os.replace(temporary_path, xlsx_path)
+                except PermissionError as exc:
+                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试") from exc
+                temporary_path = None
+                return True
+            finally:
+                if workbook is not None:
+                    workbook.close()
+                if temporary_path and temporary_path.exists():
+                    try:
+                        temporary_path.unlink()
+                    except OSError:
+                        pass
+
     def seed_from_xlsx(self, xlsx_path: Path) -> int:
         """Synchronize the Excel post index into the local comparison database."""
         from openpyxl import load_workbook
 
+        self._ensure_access_status_column(Path(xlsx_path))
         workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
         if "sheet1_笔记总表" not in workbook.sheetnames:
             raise ValueError("seed workbook is missing sheet1_笔记总表")
@@ -714,6 +825,7 @@ class MonitorStore:
                 row_title = value(row, "笔记标题")
                 row_content = value(row, "笔记内容")
                 row_tags = value(row, "笔记话题")
+                row_access_label = value(row, "访问状态").strip()
                 row_title_key, row_content_key, row_combined_key = identity_keys(row_title, row_content)
                 row_media_dir = self._resolve_legacy_media_dir(
                     value(row, "对应帖子文件夹地址"),
@@ -721,7 +833,21 @@ class MonitorStore:
                     note_id,
                 )
                 row_media_count = len([line for line in value(row, "文件夹内清单").splitlines() if line.strip()])
-                existing = db.execute("SELECT note_id,url,page_url FROM notes WHERE note_id = ?", (note_id,)).fetchone()
+                existing = db.execute(
+                    "SELECT note_id,url,page_url,access_status,access_check_result FROM notes WHERE note_id = ?",
+                    (note_id,),
+                ).fetchone()
+                confirmed_unreachable = bool(existing and existing["access_check_result"] == "confirmed_v2")
+                if row_access_label == "可打开":
+                    row_access_status, row_access_error, row_access_result = "ok", "", "opened"
+                elif row_access_label == "打不开" and confirmed_unreachable:
+                    row_access_status, row_access_error, row_access_result = "unreachable", "", "confirmed_v2"
+                elif row_access_label in {"打不开", "待复核", "检查失败"}:
+                    row_access_status, row_access_error, row_access_result = (
+                        "check_failed", "Excel 中的旧状态等待重新同步核验", "legacy_excel_unverified"
+                    )
+                else:
+                    row_access_status, row_access_error, row_access_result = "", "", ""
                 if existing:
                     # A note may have been discovered by the browser before it
                     # was manually added to Excel. Promote it on every reload
@@ -741,7 +867,7 @@ class MonitorStore:
                             title_key=CASE WHEN ? <> '' THEN ? ELSE title_key END,
                             content_key=CASE WHEN ? <> '' THEN ? ELSE content_key END,
                             title_content_key=CASE WHEN ? <> '' THEN ? ELSE title_content_key END,
-                            last_seen_at=?
+                            last_seen_at=?, access_status=?, access_error=?, access_check_result=?
                         WHERE note_id=?
                         """,
                         (
@@ -756,7 +882,7 @@ class MonitorStore:
                             row_title_key, row_title_key,
                             row_content_key, row_content_key,
                             row_combined_key, row_combined_key,
-                            timestamp, note_id,
+                            timestamp, row_access_status, row_access_error, row_access_result, note_id,
                         ),
                     )
                     if row_media_dir:
@@ -770,8 +896,9 @@ class MonitorStore:
                     INSERT INTO notes (
                         note_id, url, title, author, content, tags, keyword, page_url,
                         first_seen_at, last_seen_at, status, is_relevant, source,
-                        post_sentiment, title_key, content_key, title_content_key, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'known', ?, 'existing_xlsx', ?, ?, ?, ?, ?)
+                        post_sentiment, title_key, content_key, title_content_key, payload_json,
+                        access_status, access_error, access_check_result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'known', ?, 'existing_xlsx', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note_id,
@@ -790,6 +917,9 @@ class MonitorStore:
                         row_content_key,
                         row_combined_key,
                         json.dumps({"seed": "xlsx", "tags": row_tags}, ensure_ascii=False),
+                        row_access_status,
+                        row_access_error,
+                        row_access_result,
                     ),
                 )
                 if row_media_dir:
@@ -1188,10 +1318,6 @@ class MonitorStore:
         if inserted_notes or reason == "manual":
             export_path = self.export_dir / f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
             export_path.write_text(json.dumps(export_record, ensure_ascii=False, indent=2), encoding="utf-8")
-        settings = self.ai_settings.get(False)
-        if settings.get("configured") and settings.get("auto_analyze_posts"):
-            for note in inserted_notes:
-                self.enqueue_ai("note", note["noteId"], priority=50)
         return {
             "ok": True,
             "version": VERSION,
@@ -1299,11 +1425,12 @@ class MonitorStore:
         return {"ok": True, **self.ai_settings.get(False)}
 
     def save_ai_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return {"ok": True, **self.ai_settings.save(payload)}
+        sanitized = {**payload, "auto_analyze_posts": False, "auto_analyze_comments": False}
+        return {"ok": True, **self.ai_settings.save(sanitized)}
 
     def test_ai_connection(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if payload:
-            self.ai_settings.save(payload)
+            self.ai_settings.save({**payload, "auto_analyze_posts": False, "auto_analyze_comments": False})
         settings = self.ai_settings.get(True)
         result = self.ai_client.complete_json(settings, [
             {"role": "system", "content": "Return valid json only."},
@@ -1437,11 +1564,6 @@ class MonitorStore:
                     (note_id, collection_status, count, len(inserted_ids), expected_count,
                      text(payload.get("error"), 1000), timestamp, timestamp),
                 )
-        settings = self.ai_settings.get(False)
-        # 拉取流程强制自动分析新评论（不受设置页“自动分析新评论”开关限制）
-        if settings.get("configured") and (settings.get("auto_analyze_comments") or payload.get("forceAutoAnalyze")):
-            for comment_id in inserted_ids + changed_ids:
-                self.enqueue_ai("comment", comment_id, priority=60)
         return {"ok": True, "noteId": note_id, "newCount": len(inserted_ids), "changedCount": len(changed_ids),
                 "collectedCount": count, "status": collection_status}
 
@@ -1473,6 +1595,35 @@ class MonitorStore:
         current = [self._comment_api_row(item) for item in raw_comments
                    if isinstance(item, dict) and text(item.get("content"), 8000)]
         local = [self._comment_api_row(item) for item in self.list_comments(note_id, 2000)]
+        incoming_note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
+        with self.lock, self._session() as db:
+            stored_note_row = db.execute(
+                "SELECT title,content,author,url,payload_json FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        stored_note = dict(stored_note_row) if stored_note_row else {}
+        try:
+            stored_payload = json.loads(stored_note.get("payload_json") or "{}")
+            if not isinstance(stored_payload, dict):
+                stored_payload = {}
+        except (TypeError, ValueError):
+            stored_payload = {}
+        previous_note = {**stored_payload, **{key: value for key, value in stored_note.items() if key != "payload_json" and value}}
+        note_fields = (
+            ("title", "标题"), ("content", "正文"), ("likeCount", "点赞量"),
+            ("collectCount", "收藏量"), ("commentCount", "评论量"), ("shareCount", "分享量"),
+            ("publishedAt", "发布时间"), ("updatedAt", "更新时间"),
+        )
+        note_changes: list[dict[str, Any]] = []
+        missing_markers = {"", "待读取", "未显示", "未知", "none", "null"}
+        for field, label in note_fields:
+            if field not in incoming_note:
+                continue
+            after = incoming_note.get(field)
+            if text(after, 2000).lower() in missing_markers:
+                continue
+            before = previous_note.get(field)
+            if str(before if before is not None else "") != str(after if after is not None else ""):
+                note_changes.append({"field": field, "label": label, "before": before, "after": after})
         by_id = {row["commentId"]: index for index, row in enumerate(local) if row["commentId"]}
         by_exact = {(row["author"], row["content"], row["publishedAt"]): index
                     for index, row in enumerate(local)}
@@ -1506,7 +1657,8 @@ class MonitorStore:
             "expectedCount": expected_count, "currentCount": len(current), "localCount": len(local),
             "canPrune": can_prune, "newCount": len(new_comments), "removedCount": len(removed),
             "changedCount": len(changed_comments), "pendingRemovedCount": len(pending_removed),
-            "hasChanges": bool(new_comments or removed or changed_comments),
+            "hasChanges": bool(new_comments or removed or changed_comments or note_changes),
+            "noteChanged": bool(note_changes), "noteChanges": note_changes,
             "newComments": new_comments, "removedComments": removed,
             "changedComments": changed_comments, "pendingRemovedComments": pending_removed,
         }
@@ -1604,7 +1756,7 @@ class MonitorStore:
                 "noteId": note_id, "comments": comments,
                 "expectedCount": comparison["expectedCount"],
                 "status": text(payload.get("status"), 30) or "partial",
-                "collectedAt": now_iso(), "forceAutoAnalyze": True,
+                "collectedAt": now_iso(),
             })
             xlsx_result = self._sync_pull_to_xlsx(note, comments, media_result)
             removed = comparison["removedComments"] if comparison["canPrune"] else []
@@ -1616,19 +1768,47 @@ class MonitorStore:
                     db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id IN ({placeholders})",
                                (note_id, *removed_ids))
                 count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+                checked_at = now_iso()
                 db.execute(
-                    "UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=? WHERE note_id=?",
+                    """UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=?,
+                       access_status='ok',access_error='',last_access_checked_at=?,access_check_result='opened',
+                       title=CASE WHEN ?<>'' THEN ? ELSE title END,
+                       content=CASE WHEN ?<>'' THEN ? ELSE content END,
+                       author=CASE WHEN ?<>'' THEN ? ELSE author END,
+                       url=CASE WHEN ?<>'' THEN ? ELSE url END,
+                       payload_json=?,last_seen_at=?
+                       WHERE note_id=?""",
                     (count, "likely_complete" if comparison["canPrune"] else text(payload.get("status"), 30) or "partial",
-                     now_iso(), note_id),
+                     checked_at, checked_at,
+                     text(note.get("title"), 1000), text(note.get("title"), 1000),
+                     text(note.get("content"), 20000), text(note.get("content"), 20000),
+                     text(note.get("author"), 500), text(note.get("author"), 500),
+                     text(note.get("url"), 4000), text(note.get("url"), 4000),
+                     json.dumps(note, ensure_ascii=False), checked_at, note_id),
                 )
             if media_dir:
                 self._write_media_comments(media_result, comments)
+            change_result = self._record_comment_change_events(
+                note_id,
+                comparison,
+                text(note.get("title"), 1000) or text(stored_row.get("title"), 1000),
+                max(0, int(payload.get("runId") or 0)),
+            )
+            note_change_result = self._record_note_change_event(
+                note_id,
+                comparison.get("noteChanges") or [],
+                text(note.get("title"), 1000) or text(stored_row.get("title"), 1000),
+                int(change_result.get("runId") or payload.get("runId") or 0),
+            )
             return {
                 "ok": True, "noteId": note_id, "status": "latest",
                 "newCount": comparison["newCount"], "removedCount": len(removed),
                 "changedCount": comparison["changedCount"], "collectedCount": count,
                 "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
                 "excelRemoved": excel_removed, "canPrune": comparison["canPrune"],
+                "runId": note_change_result.get("runId") or change_result.get("runId", 0),
+                "changeEventCount": int(change_result.get("eventCount", 0)) + int(note_change_result.get("eventCount", 0)),
+                "noteChanged": bool(comparison.get("noteChanged")),
                 "updatedAt": now_iso(),
             }
 
@@ -1746,6 +1926,9 @@ class MonitorStore:
             raise ValueError("noteId is required")
         with self.lock, self._session() as db:
             row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            watch_row = db.execute(
+                "SELECT priority,reason,created_at,updated_at FROM watchlist WHERE note_id=?", (note_id,)
+            ).fetchone() if row is not None else None
             comment_rows = db.execute(
                 "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT 12", (note_id,)
             ).fetchall() if row is not None else []
@@ -1803,6 +1986,8 @@ class MonitorStore:
             "commentCount": comment_count or note_payload.get("commentCount") or 0,
             "aiStatus": item.get("ai_analysis_status") or "",
             "postSentiment": sentiment_label(item.get("post_sentiment")) if item.get("post_sentiment") else "",
+            "accessStatus": item.get("access_status") or "",
+            "accessError": item.get("access_error") or "",
         }
         comments: list[dict[str, Any]] = []
         for comment_row in comment_rows:
@@ -1831,6 +2016,12 @@ class MonitorStore:
             "excelPath": item.get("excel_sync_path") or (str(self.seed_xlsx_path) if self.seed_xlsx_path else ""),
             "excelRow": excel_row, "commentCount": comment_count, "commentRows": comments,
             "aiStatus": item.get("ai_analysis_status") or "",
+            "accessStatus": item.get("access_status") or "",
+            "accessError": item.get("access_error") or "",
+            "lastAccessCheckedAt": item.get("last_access_checked_at") or "",
+            "watched": bool(watch_row),
+            "watchPriority": watch_row["priority"] if watch_row else "",
+            "watchReason": watch_row["reason"] if watch_row else "",
         }
 
     def _sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
@@ -1989,10 +2180,14 @@ class MonitorStore:
             worker.start()
 
     def _recover_jobs(self) -> None:
+        # Generic post/comment sentiment analysis was removed in v0.22.3.
+        # Preserve completed labels and history for audit, while cancelling
+        # unfinished work so a Bridge restart cannot revive the old queue.
+        self.ai_settings.save({"auto_analyze_posts": False, "auto_analyze_comments": False})
         with self.lock, self._session() as db:
-            db.execute("UPDATE ai_jobs SET status='queued', available_at=0 WHERE status='analyzing'")
-            db.execute("UPDATE notes SET ai_analysis_status='queued' WHERE ai_analysis_status='analyzing'")
-            db.execute("UPDATE comments SET ai_analysis_status='queued' WHERE ai_analysis_status='analyzing'")
+            db.execute("DELETE FROM ai_jobs WHERE status IN ('queued','analyzing')")
+            db.execute("UPDATE notes SET ai_analysis_status='not_analyzed' WHERE ai_analysis_status IN ('queued','analyzing')")
+            db.execute("UPDATE comments SET ai_analysis_status='not_analyzed' WHERE ai_analysis_status IN ('queued','analyzing')")
 
     def ai_status(self) -> dict[str, Any]:
         settings = self.ai_settings.get(False)
@@ -2661,6 +2856,629 @@ class MonitorStore:
                 rows = db.execute("SELECT * FROM notes ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        run_type = text(payload.get("runType"), 40) or "single"
+        if run_type not in {"single", "batch", "repair"}:
+            raise ValueError("runType must be single, batch or repair")
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            cursor = db.execute(
+                """INSERT INTO sync_runs(run_type,status,total_notes,detail_json,started_at)
+                   VALUES (?,'running',?,?,?)""",
+                (
+                    run_type,
+                    max(0, int(payload.get("totalNotes") or 0)),
+                    json.dumps(payload.get("detail") or {}, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+        return {"ok": True, "runId": run_id, "startedAt": timestamp}
+
+    def finish_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        run_id = max(0, int(payload.get("runId") or 0))
+        if not run_id:
+            raise ValueError("runId is required")
+        status = text(payload.get("status"), 30) or "completed"
+        if status not in {"completed", "cancelled", "failed", "partial"}:
+            raise ValueError("无效的同步状态")
+        finished_at = now_iso()
+        values = {
+            "processed_notes": max(0, int(payload.get("processedNotes") or 0)),
+            "changed_notes": max(0, int(payload.get("changedNotes") or 0)),
+            "unchanged_notes": max(0, int(payload.get("unchangedNotes") or 0)),
+            "failed_notes": max(0, int(payload.get("failedNotes") or 0)),
+            "new_comments": max(0, int(payload.get("newComments") or 0)),
+            "removed_comments": max(0, int(payload.get("removedComments") or 0)),
+            "changed_comments": max(0, int(payload.get("changedComments") or 0)),
+        }
+        with self.lock, self._session() as db:
+            updated = db.execute(
+                """UPDATE sync_runs SET status=?,processed_notes=?,changed_notes=?,unchanged_notes=?,
+                   failed_notes=?,new_comments=?,removed_comments=?,changed_comments=?,detail_json=?,finished_at=?
+                   WHERE id=?""",
+                (
+                    status, values["processed_notes"], values["changed_notes"], values["unchanged_notes"],
+                    values["failed_notes"], values["new_comments"], values["removed_comments"],
+                    values["changed_comments"], json.dumps(payload.get("detail") or {}, ensure_ascii=False),
+                    finished_at, run_id,
+                ),
+            ).rowcount
+        if not updated:
+            raise ValueError("同步批次不存在")
+        return {"ok": True, "runId": run_id, "status": status, "finishedAt": finished_at, **values}
+
+    def _record_comment_change_events(
+        self,
+        note_id: str,
+        comparison: dict[str, Any],
+        note_title: str = "",
+        run_id: int = 0,
+    ) -> dict[str, Any]:
+        total = int(comparison.get("newCount") or 0) + int(comparison.get("removedCount") or 0) + int(comparison.get("changedCount") or 0)
+        if not total:
+            return {"runId": run_id, "eventCount": 0}
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            if run_id:
+                exists = db.execute("SELECT 1 FROM sync_runs WHERE id=?", (run_id,)).fetchone()
+                if not exists:
+                    run_id = 0
+            if not run_id:
+                cursor = db.execute(
+                    """INSERT INTO sync_runs(run_type,status,total_notes,processed_notes,changed_notes,
+                       new_comments,removed_comments,changed_comments,started_at,finished_at)
+                       VALUES ('single','completed',1,1,1,?,?,?,?,?)""",
+                    (
+                        int(comparison.get("newCount") or 0),
+                        int(comparison.get("removedCount") or 0),
+                        int(comparison.get("changedCount") or 0),
+                        timestamp, timestamp,
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+
+            def add_event(event_type: str, target: dict[str, Any], before: Any, after: Any, verb: str) -> None:
+                target_id = text(target.get("commentId"), 256)
+                author = text(target.get("author"), 120) or "匿名用户"
+                content = text(target.get("content"), 180)
+                summary = f"{verb} · {author}：{content or '无文本'}"
+                db.execute(
+                    """INSERT INTO change_events
+                       (run_id,note_id,event_type,target_id,title,summary,before_json,after_json,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id, note_id, event_type, target_id, text(note_title, 1000), text(summary, 1000),
+                        json.dumps(before or {}, ensure_ascii=False),
+                        json.dumps(after or {}, ensure_ascii=False), timestamp,
+                    ),
+                )
+
+            for item in comparison.get("newComments") or []:
+                if isinstance(item, dict):
+                    add_event("comment_added", item, {}, item, "新增评论")
+            for item in comparison.get("removedComments") or []:
+                if isinstance(item, dict):
+                    add_event("comment_removed", item, item, {}, "评论已删除")
+            for item in comparison.get("changedComments") or []:
+                if not isinstance(item, dict):
+                    continue
+                before = item.get("before") if isinstance(item.get("before"), dict) else {}
+                after = item.get("after") if isinstance(item.get("after"), dict) else {}
+                add_event("comment_changed", after or before, before, after, "评论已修改")
+        return {"runId": run_id, "eventCount": total}
+
+    def _record_note_change_event(
+        self,
+        note_id: str,
+        changes: list[dict[str, Any]],
+        note_title: str = "",
+        run_id: int = 0,
+    ) -> dict[str, Any]:
+        if not changes:
+            return {"runId": run_id, "eventCount": 0}
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            if run_id and not db.execute("SELECT 1 FROM sync_runs WHERE id=?", (run_id,)).fetchone():
+                run_id = 0
+            if not run_id:
+                cursor = db.execute(
+                    """INSERT INTO sync_runs(run_type,status,total_notes,processed_notes,changed_notes,
+                       started_at,finished_at) VALUES ('single','completed',1,1,1,?,?)""",
+                    (timestamp, timestamp),
+                )
+                run_id = int(cursor.lastrowid)
+            labels = [text(item.get("label"), 40) for item in changes if text(item.get("label"), 40)]
+            before = {text(item.get("field"), 60): item.get("before") for item in changes}
+            after = {text(item.get("field"), 60): item.get("after") for item in changes}
+            db.execute(
+                """INSERT INTO change_events
+                   (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    run_id, note_id, "note_fields_changed", text(note_title, 1000),
+                    text("帖子字段变化：" + "、".join(labels), 1000),
+                    json.dumps(before, ensure_ascii=False), json.dumps(after, ensure_ascii=False), timestamp,
+                ),
+            )
+        return {"runId": run_id, "eventCount": 1}
+
+    def list_change_events(self, limit: int = 100, unread_only: bool = False) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 100), 500))
+        where = "WHERE e.acknowledged=0" if unread_only else ""
+        with self.lock, self._session() as db:
+            rows = db.execute(
+                f"""SELECT e.*,n.url,n.author,w.priority AS watch_priority
+                    FROM change_events e
+                    LEFT JOIN notes n ON n.note_id=e.note_id
+                    LEFT JOIN watchlist w ON w.note_id=e.note_id
+                    {where}
+                    ORDER BY e.created_at DESC,e.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            unread = int(db.execute("SELECT COUNT(*) FROM change_events WHERE acknowledged=0").fetchone()[0])
+            total = int(db.execute("SELECT COUNT(*) FROM change_events").fetchone()[0])
+            counts = db.execute(
+                "SELECT event_type,COUNT(*) count FROM change_events GROUP BY event_type"
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("before_json", "after_json"):
+                try:
+                    item[key.removesuffix("_json")] = json.loads(item.get(key) or "{}")
+                except (TypeError, ValueError):
+                    item[key.removesuffix("_json")] = {}
+            events.append(item)
+        return {
+            "ok": True,
+            "events": events,
+            "unread": unread,
+            "total": total,
+            "byType": {str(row["event_type"]): int(row["count"]) for row in counts},
+        }
+
+    def acknowledge_change_events(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_ids = payload.get("ids") if isinstance(payload.get("ids"), list) else []
+        ids = sorted({int(value) for value in raw_ids if str(value).isdigit() and int(value) > 0})
+        with self.lock, self._session() as db:
+            if payload.get("all"):
+                updated = db.execute("UPDATE change_events SET acknowledged=1 WHERE acknowledged=0").rowcount
+            elif ids:
+                placeholders = ",".join("?" for _ in ids)
+                updated = db.execute(
+                    f"UPDATE change_events SET acknowledged=1 WHERE id IN ({placeholders})", ids
+                ).rowcount
+            else:
+                updated = 0
+        return {"ok": True, "updated": int(updated or 0)}
+
+    def set_watchlist(self, payload: dict[str, Any]) -> dict[str, Any]:
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        watched = payload.get("watched") is not False
+        priority = text(payload.get("priority"), 20) or "normal"
+        if priority not in {"high", "normal", "low"}:
+            raise ValueError("priority must be high, normal or low")
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            if not db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone():
+                raise ValueError("请先扫描或拉取该帖子，再加入观察名单")
+            if watched:
+                db.execute(
+                    """INSERT INTO watchlist(note_id,priority,reason,created_at,updated_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(note_id) DO UPDATE SET priority=excluded.priority,
+                       reason=excluded.reason,updated_at=excluded.updated_at""",
+                    (note_id, priority, text(payload.get("reason"), 1000), timestamp, timestamp),
+                )
+            else:
+                db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
+        return {"ok": True, "noteId": note_id, "watched": watched, "priority": priority, "updatedAt": timestamp}
+
+    def list_watchlist(self, limit: int = 200) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 200), 500))
+        with self.lock, self._session() as db:
+            rows = db.execute(
+                """SELECT w.*,n.title,n.author,n.url,n.status,n.pull_status,n.access_status,
+                   n.comment_count_collected,n.last_comment_collected_at,
+                   (SELECT MAX(created_at) FROM change_events e WHERE e.note_id=w.note_id) AS last_change_at,
+                   (SELECT COUNT(*) FROM change_events e WHERE e.note_id=w.note_id AND e.acknowledged=0) AS unread_changes
+                   FROM watchlist w JOIN notes n ON n.note_id=w.note_id
+                   ORDER BY CASE w.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                   COALESCE(last_change_at,w.updated_at) DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return {"ok": True, "count": len(rows), "items": [dict(row) for row in rows]}
+
+    def data_health(self) -> dict[str, Any]:
+        issues: list[dict[str, Any]] = []
+
+        def add_issue(issue_id: str, severity: str, title: str, detail: str, count: int = 1,
+                      repairable: bool = False, samples: list[str] | None = None) -> None:
+            if count <= 0:
+                return
+            issues.append({
+                "id": issue_id, "severity": severity, "title": title, "detail": detail,
+                "count": int(count), "repairable": bool(repairable), "samples": (samples or [])[:8],
+            })
+
+        with self.lock, self._session() as db:
+            note_rows = [dict(row) for row in db.execute(
+                """SELECT note_id,title,url,source,pull_status,media_status,media_dir,media_file_count,
+                   comment_count_collected,access_status FROM notes"""
+            ).fetchall()]
+            db_note_ids = {row["note_id"] for row in note_rows}
+            pulled_ids = {
+                row["note_id"] for row in note_rows
+                if row["source"] == "existing_xlsx" or row["pull_status"] in {"synced", "partial"}
+            }
+            db_comment_count = int(db.execute("SELECT COUNT(*) FROM comments").fetchone()[0])
+            actual_comment_counts = {
+                str(row["note_id"]): int(row["count"])
+                for row in db.execute("SELECT note_id,COUNT(*) count FROM comments GROUP BY note_id").fetchall()
+            }
+            orphan_comments = int(db.execute(
+                "SELECT COUNT(*) FROM comments c LEFT JOIN notes n ON n.note_id=c.note_id WHERE n.note_id IS NULL"
+            ).fetchone()[0])
+            orphan_watch = int(db.execute(
+                "SELECT COUNT(*) FROM watchlist w LEFT JOIN notes n ON n.note_id=w.note_id WHERE n.note_id IS NULL"
+            ).fetchone()[0])
+
+        mismatched_counts = [
+            row["note_id"] for row in note_rows
+            if int(row.get("comment_count_collected") or 0) != actual_comment_counts.get(row["note_id"], 0)
+        ]
+        missing_core = [
+            row["note_id"] for row in note_rows
+            if row["note_id"] in pulled_ids and (not text(row.get("title"), 1000) or not text(row.get("url"), 4000))
+        ]
+        missing_media = []
+        pending_media = []
+        for row in note_rows:
+            if int(row.get("media_file_count") or 0) <= 0:
+                continue
+            folder = text(row.get("media_dir"), 4000)
+            try:
+                exists = bool(folder and Path(folder).is_dir())
+            except OSError:
+                exists = False
+            if not exists:
+                (pending_media if row.get("media_status") == "partial" else missing_media).append(row["note_id"])
+        review_access = [row["note_id"] for row in note_rows if row.get("access_status") == "check_failed"]
+
+        add_issue("orphan_comments", "critical", "存在孤立评论", "评论在 SQLite 中找不到所属帖子。", orphan_comments, False)
+        add_issue("comment_count_mismatch", "warning", "评论计数不一致", "帖子计数与实际 SQLite 评论数量不同。",
+                  len(mismatched_counts), True, mismatched_counts)
+        add_issue("missing_core", "warning", "帖子核心字段缺失", "已拉取帖子缺少标题或可用链接。",
+                  len(missing_core), False, missing_core)
+        add_issue("missing_media", "warning", "素材目录缺失", "数据库记录了素材，但对应目录已经不存在。",
+                  len(missing_media), True, missing_media)
+        add_issue("media_pending_repair", "info", "素材等待补采", "数据体检已标记素材缺失；下次打开帖子时可补采。",
+                  len(pending_media), False, pending_media)
+        add_issue("access_review", "info", "帖子等待访问复核", "这些帖子上次未完成访问核验，不等于打不开。",
+                  len(review_access), False, review_access)
+        add_issue("orphan_watchlist", "warning", "观察名单存在失效引用", "观察名单关联的帖子已经不在数据库中。",
+                  orphan_watch, True)
+
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        excel_note_ids: list[str] = []
+        excel_comment_rows = 0
+        if not xlsx_path or not xlsx_path.exists():
+            add_issue("excel_missing", "critical", "Excel 总表不存在", "当前配置路径下没有找到 Excel 总表。", 1, False)
+        else:
+            try:
+                from openpyxl import load_workbook
+                workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+                try:
+                    if "sheet1_笔记总表" not in workbook.sheetnames or "sheet2_评论总表" not in workbook.sheetnames:
+                        add_issue("excel_schema", "critical", "Excel 工作表结构不完整", "缺少帖子总表或评论总表。", 1, False)
+                    else:
+                        note_sheet = workbook["sheet1_笔记总表"]
+                        note_headers = self._excel_headers(note_sheet)
+                        note_col = note_headers.get("笔记ID")
+                        if not note_col:
+                            add_issue("excel_note_id_column", "critical", "Excel 缺少笔记ID列", "无法可靠对齐帖子。", 1, False)
+                        else:
+                            excel_note_ids = [
+                                valid_note_id(note_sheet.cell(row, note_col).value)
+                                for row in range(2, note_sheet.max_row + 1)
+                            ]
+                            excel_note_ids = [value for value in excel_note_ids if value]
+                        comment_sheet = workbook["sheet2_评论总表"]
+                        excel_comment_rows = max(0, comment_sheet.max_row - 1)
+                finally:
+                    workbook.close()
+            except Exception as exc:
+                add_issue("excel_read", "critical", "Excel 总表读取失败", text(exc, 500), 1, False)
+
+        excel_note_set = set(excel_note_ids)
+        duplicate_excel = len(excel_note_ids) - len(excel_note_set)
+        missing_excel = sorted(pulled_ids - excel_note_set)
+        excel_only = sorted(excel_note_set - db_note_ids)
+        add_issue("excel_duplicate_notes", "critical", "Excel 存在重复帖子行", "同一笔记 ID 在帖子总表重复出现。",
+                  duplicate_excel, False)
+        add_issue("pulled_missing_excel", "critical", "已拉取帖子未写入 Excel", "SQLite 标记已拉取，但 Excel 找不到对应帖子行。",
+                  len(missing_excel), False, missing_excel)
+        add_issue("excel_missing_sqlite", "warning", "Excel 帖子未进入 SQLite", "重新载入 Excel 可修复本地索引。",
+                  len(excel_only), True, excel_only)
+
+        weights = {"critical": 24, "warning": 7, "info": 1}
+        score = max(0, 100 - sum(weights.get(item["severity"], 1) for item in issues))
+        status = "critical" if any(item["severity"] == "critical" for item in issues) \
+            else "warning" if any(item["severity"] == "warning" for item in issues) else "healthy"
+        return {
+            "ok": True, "status": status, "score": score, "checkedAt": now_iso(), "issues": issues,
+            "summary": {
+                "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
+                "excelNotes": len(excel_note_ids), "excelComments": excel_comment_rows,
+                "pulledNotes": len(pulled_ids), "issueCount": len(issues),
+                "repairableCount": sum(1 for item in issues if item["repairable"]),
+            },
+        }
+
+    def repair_data_health(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        actions: list[str] = []
+        warnings: list[str] = []
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        if xlsx_path and xlsx_path.exists():
+            try:
+                inserted = self.seed_from_xlsx(xlsx_path)
+                actions.append(f"重新载入 Excel，补充 {inserted} 条本地索引")
+            except Exception as exc:
+                warnings.append(f"Excel 重载失败：{text(exc, 500)}")
+        with self.lock, self._session() as db:
+            db.execute(
+                """UPDATE notes SET comment_count_collected=(
+                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+            )
+            actions.append("重算全部帖子评论计数")
+            media_rows = db.execute(
+                "SELECT note_id,media_dir,media_file_count FROM notes WHERE media_file_count>0"
+            ).fetchall()
+            media_fixed = 0
+            for row in media_rows:
+                folder = text(row["media_dir"], 4000)
+                try:
+                    exists = bool(folder and Path(folder).is_dir())
+                except OSError:
+                    exists = False
+                if not exists:
+                    db.execute(
+                        "UPDATE notes SET media_status='partial',media_error='数据体检：素材目录缺失' WHERE note_id=?",
+                        (row["note_id"],),
+                    )
+                    media_fixed += 1
+            if media_fixed:
+                actions.append(f"标记 {media_fixed} 篇素材缺失帖子，等待补采")
+            orphan_watch = db.execute(
+                "DELETE FROM watchlist WHERE note_id NOT IN (SELECT note_id FROM notes)"
+            ).rowcount
+            if orphan_watch:
+                actions.append(f"清理 {orphan_watch} 条观察名单失效引用")
+        try:
+            migrated = self.reconcile_legacy_access_statuses()
+            if migrated.get("updated"):
+                actions.append(f"迁移 {migrated['updated']} 条旧访问状态")
+        except Exception as exc:
+            warnings.append(f"访问状态 Excel 回写失败：{text(exc, 500)}")
+        return {"ok": True, "actions": actions, "warnings": warnings, "health": self.data_health()}
+
+    @staticmethod
+    def _report_period(payload: dict[str, Any]) -> tuple[str, str]:
+        today = datetime.now().astimezone().date()
+        default_start = today - timedelta(days=6)
+        start_raw = text(payload.get("startDate"), 10)
+        end_raw = text(payload.get("endDate"), 10)
+        try:
+            start = datetime.strptime(start_raw, "%Y-%m-%d").date() if start_raw else default_start
+            end = datetime.strptime(end_raw, "%Y-%m-%d").date() if end_raw else today
+        except ValueError as exc:
+            raise ValueError("周报日期格式应为 YYYY-MM-DD") from exc
+        if end < start:
+            raise ValueError("周报结束日期不得早于开始日期")
+        if (end - start).days > 31:
+            raise ValueError("单次周报范围最多 31 天")
+        return start.isoformat(), end.isoformat()
+
+    @staticmethod
+    def _safe_report_cell(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
+
+    def generate_weekly_report(self, payload: dict[str, Any]) -> dict[str, Any]:
+        period_start, period_end = self._report_period(payload)
+        with self.lock, self._session() as db:
+            notes = [dict(row) for row in db.execute(
+                """SELECT note_id,title,author,url,keyword,status,pull_status,access_status,
+                   comment_count_collected,first_seen_at,last_seen_at
+                   FROM notes WHERE is_relevant=1 AND status<>'ignored'
+                   AND substr(first_seen_at,1,10) BETWEEN ? AND ?
+                   ORDER BY first_seen_at DESC""",
+                (period_start, period_end),
+            ).fetchall()]
+            changes = [dict(row) for row in db.execute(
+                """SELECT e.*,n.url FROM change_events e LEFT JOIN notes n ON n.note_id=e.note_id
+                   WHERE substr(e.created_at,1,10) BETWEEN ? AND ?
+                   ORDER BY e.created_at DESC,e.id DESC""",
+                (period_start, period_end),
+            ).fetchall()]
+            watch_items = [dict(row) for row in db.execute(
+                """SELECT w.*,n.title,n.author,n.url,n.access_status,n.comment_count_collected
+                   FROM watchlist w JOIN notes n ON n.note_id=w.note_id
+                   ORDER BY CASE w.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,w.updated_at DESC"""
+            ).fetchall()]
+        event_counts = Counter(item.get("event_type") or "unknown" for item in changes)
+        issue_counts: Counter[str] = Counter()
+        for item in changes:
+            if item.get("event_type") != "comment_added":
+                continue
+            try:
+                after = json.loads(item.get("after_json") or "{}")
+                if not isinstance(after, dict):
+                    after = {}
+            except (TypeError, ValueError):
+                after = {}
+            content = text(after.get("content"), 8000)
+            if content:
+                issue_counts[classify_reply_context(content)[0]] += 1
+        summary = {
+            "periodStart": period_start,
+            "periodEnd": period_end,
+            "newNotes": len(notes),
+            "changedNotes": len({item.get("note_id") for item in changes if item.get("note_id")}),
+            "newComments": int(event_counts.get("comment_added", 0)),
+            "removedComments": int(event_counts.get("comment_removed", 0)),
+            "changedComments": int(event_counts.get("comment_changed", 0)),
+            "watchlistCount": len(watch_items),
+            "issueCategories": dict(issue_counts.most_common()),
+        }
+        report_dir = self.export_dir / "weekly_reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"ORIGANI舆情周报_{period_start.replace('-', '')}_{period_end.replace('-', '')}"
+        xlsx_path = report_dir / f"{base_name}.xlsx"
+        html_path = report_dir / f"{base_name}.html"
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        workbook = Workbook()
+        overview = workbook.active
+        overview.title = "周报总览"
+        overview.append(["ORIGANI 小红书舆情周报", f"{period_start} 至 {period_end}"])
+        overview.append(["指标", "数量"])
+        for label, value in (
+            ("新增帖子", summary["newNotes"]), ("发生变化帖子", summary["changedNotes"]),
+            ("新增评论", summary["newComments"]), ("删除评论", summary["removedComments"]),
+            ("修改评论", summary["changedComments"]), ("重点观察", summary["watchlistCount"]),
+        ):
+            overview.append([label, value])
+        overview.append([])
+        overview.append(["评论问题分类", "数量"])
+        for label, value in issue_counts.most_common():
+            overview.append([label, value])
+
+        def add_sheet(name: str, headers: list[str], rows: list[list[Any]]) -> None:
+            sheet = workbook.create_sheet(name)
+            sheet.append(headers)
+            for row in rows:
+                sheet.append([self._safe_report_cell(value) for value in row])
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="176B56")
+            sheet.freeze_panes = "A2"
+            for index, header in enumerate(headers, 1):
+                values = [len(str(sheet.cell(row, index).value or "")) for row in range(1, min(sheet.max_row, 100) + 1)]
+                sheet.column_dimensions[get_column_letter(index)].width = min(60, max(len(header) + 2, max(values, default=8) + 2))
+                for row in range(2, sheet.max_row + 1):
+                    sheet.cell(row, index).alignment = Alignment(vertical="top", wrap_text=True)
+
+        add_sheet("新增帖子", ["首次发现", "标题", "作者", "来源词", "评论数", "访问状态", "链接", "笔记ID"], [
+            [item.get("first_seen_at"), item.get("title"), item.get("author"), item.get("keyword"),
+             item.get("comment_count_collected"), item.get("access_status"), item.get("url"), item.get("note_id")]
+            for item in notes
+        ])
+        add_sheet("同步变化", ["时间", "类型", "帖子", "变化内容", "链接", "笔记ID"], [
+            [item.get("created_at"), item.get("event_type"), item.get("title"), item.get("summary"),
+             item.get("url"), item.get("note_id")]
+            for item in changes
+        ])
+        add_sheet("重点观察", ["优先级", "帖子", "作者", "观察原因", "评论数", "访问状态", "链接", "笔记ID"], [
+            [item.get("priority"), item.get("title"), item.get("author"), item.get("reason"),
+             item.get("comment_count_collected"), item.get("access_status"), item.get("url"), item.get("note_id")]
+            for item in watch_items
+        ])
+        overview["A1"].font = Font(size=16, bold=True, color="176B56")
+        overview.column_dimensions["A"].width = 24
+        overview.column_dimensions["B"].width = 24
+        temporary_xlsx = xlsx_path.with_name(f".{xlsx_path.stem}.{os.getpid()}.tmp.xlsx")
+        workbook.save(temporary_xlsx)
+        workbook.close()
+        os.replace(temporary_xlsx, xlsx_path)
+
+        def table_rows(items: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
+            rendered = []
+            for item in items:
+                cells = "".join(f"<td>{html.escape(str(item.get(key) or ''))}</td>" for key, _label in columns)
+                rendered.append(f"<tr>{cells}</tr>")
+            return "".join(rendered) or f"<tr><td colspan='{len(columns)}'>本周期暂无记录</td></tr>"
+
+        change_columns = [("created_at", "时间"), ("title", "帖子"), ("summary", "变化")]
+        watch_columns = [("priority", "级别"), ("title", "帖子"), ("reason", "原因")]
+        issue_html = "".join(
+            f"<li><span>{html.escape(label)}</span><strong>{count}</strong></li>" for label, count in issue_counts.most_common()
+        ) or "<li><span>暂无分类评论</span><strong>0</strong></li>"
+        html_text = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>
+<title>{html.escape(base_name)}</title><style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;margin:0;background:#f5f5f7;color:#1d1d1f}}
+main{{max-width:1080px;margin:32px auto;padding:0 20px}}header{{background:#173f35;color:white;padding:32px;border-radius:22px}}
+h1{{margin:6px 0 0;font-size:30px}}.meta{{opacity:.72}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}}
+.metric,section{{background:white;border:1px solid #e5e5e7;border-radius:18px;padding:18px}}.metric strong{{display:block;font-size:28px;color:#176b56}}
+section{{margin-top:14px}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:10px;border-bottom:1px solid #eee;vertical-align:top}}
+th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #eee}}
+@media(max-width:720px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
+</style></head><body><main><header><div class='meta'>ORIGANI RADAR · WEEKLY BRIEF</div><h1>小红书舆情周报</h1><p>{period_start} 至 {period_end}</p></header>
+<div class='grid'>
+<div class='metric'><span>新增帖子</span><strong>{summary['newNotes']}</strong></div>
+<div class='metric'><span>发生变化帖子</span><strong>{summary['changedNotes']}</strong></div>
+<div class='metric'><span>新增评论</span><strong>{summary['newComments']}</strong></div>
+<div class='metric'><span>删除评论</span><strong>{summary['removedComments']}</strong></div>
+<div class='metric'><span>修改评论</span><strong>{summary['changedComments']}</strong></div>
+<div class='metric'><span>重点观察</span><strong>{summary['watchlistCount']}</strong></div></div>
+<section><h2>评论问题分类</h2><ul>{issue_html}</ul></section>
+<section><h2>同步变化</h2><table><thead><tr>{''.join(f'<th>{label}</th>' for _key,label in change_columns)}</tr></thead><tbody>{table_rows(changes[:80], change_columns)}</tbody></table></section>
+<section><h2>重点观察</h2><table><thead><tr>{''.join(f'<th>{label}</th>' for _key,label in watch_columns)}</tr></thead><tbody>{table_rows(watch_items, watch_columns)}</tbody></table></section>
+</main></body></html>"""
+        temporary_html = html_path.with_name(f".{html_path.stem}.{os.getpid()}.tmp.html")
+        temporary_html.write_text(html_text, encoding="utf-8")
+        os.replace(temporary_html, html_path)
+
+        generated_at = now_iso()
+        with self.lock, self._session() as db:
+            db.execute(
+                """INSERT INTO weekly_reports(period_start,period_end,xlsx_path,html_path,summary_json,generated_at)
+                   VALUES (?,?,?,?,?,?) ON CONFLICT(period_start,period_end) DO UPDATE SET
+                   xlsx_path=excluded.xlsx_path,html_path=excluded.html_path,
+                   summary_json=excluded.summary_json,generated_at=excluded.generated_at""",
+                (period_start, period_end, str(xlsx_path), str(html_path), json.dumps(summary, ensure_ascii=False), generated_at),
+            )
+        return {"ok": True, "summary": summary, "xlsxPath": str(xlsx_path), "htmlPath": str(html_path), "generatedAt": generated_at}
+
+    def latest_weekly_report(self) -> dict[str, Any]:
+        with self.lock, self._session() as db:
+            row = db.execute("SELECT * FROM weekly_reports ORDER BY generated_at DESC,id DESC LIMIT 1").fetchone()
+        if not row:
+            return {"ok": True, "found": False}
+        item = dict(row)
+        try:
+            summary = json.loads(item.get("summary_json") or "{}")
+        except (TypeError, ValueError):
+            summary = {}
+        return {"ok": True, "found": True, "report": {**item, "summary": summary}}
+
+    def open_weekly_report(self, payload: dict[str, Any]) -> dict[str, Any]:
+        latest = self.latest_weekly_report()
+        if not latest.get("found"):
+            raise ValueError("尚未生成周报")
+        report = latest["report"]
+        target_type = text(payload.get("target"), 20) or "html"
+        report_root = (self.export_dir / "weekly_reports").resolve()
+        if target_type == "folder":
+            target = report_root
+        elif target_type == "excel":
+            target = Path(report.get("xlsx_path") or "").resolve()
+        else:
+            target = Path(report.get("html_path") or "").resolve()
+        if target != report_root and report_root not in target.parents:
+            raise ValueError("周报路径不在允许范围内")
+        if not target.exists():
+            raise ValueError("周报文件不存在，请重新生成")
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return {"ok": True, "target": str(target), "kind": target_type}
+
     @staticmethod
     def _excel_headers(worksheet: Any) -> dict[str, int]:
         return {
@@ -2668,6 +3486,35 @@ class MonitorStore:
             for cell in worksheet[1]
             if cell.value is not None and str(cell.value).strip()
         }
+
+    @staticmethod
+    def _ensure_excel_header(worksheet: Any, name: str) -> int:
+        """Add one styled header and keep existing Excel tables covering it."""
+        from openpyxl.utils.cell import get_column_letter, range_boundaries
+
+        headers = MonitorStore._excel_headers(worksheet)
+        if name in headers:
+            return headers[name]
+        column = worksheet.max_column + 1
+        source = worksheet.cell(1, max(1, column - 1))
+        target = worksheet.cell(1, column)
+        target.value = name
+        if source.has_style:
+            target._style = copy(source._style)
+        if source.alignment:
+            target.alignment = copy(source.alignment)
+        previous_letter = get_column_letter(max(1, column - 1))
+        target_letter = get_column_letter(column)
+        previous_width = worksheet.column_dimensions[previous_letter].width
+        worksheet.column_dimensions[target_letter].width = previous_width or 14
+        for table in worksheet.tables.values():
+            min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+            if column > max_col:
+                table.ref = (
+                    f"{get_column_letter(min_col)}{min_row}:"
+                    f"{get_column_letter(column)}{max_row}"
+                )
+        return column
 
     @staticmethod
     def _copy_excel_row_style(worksheet: Any, source_row: int, target_row: int) -> None:
@@ -3126,6 +3973,7 @@ class MonitorStore:
 
             note_sheet = workbook["sheet1_笔记总表"]
             comment_sheet = workbook["sheet2_评论总表"]
+            self._ensure_excel_header(note_sheet, "访问状态")
             note_headers = self._excel_headers(note_sheet)
             comment_headers = self._excel_headers(comment_sheet)
             if "笔记ID" not in note_headers:
@@ -3210,6 +4058,8 @@ class MonitorStore:
             }
             for name, value in note_fields.items():
                 set_note_value(name, value)
+            # A successful DOM read proves the note is reachable again.
+            note_sheet.cell(note_row, note_headers["访问状态"]).value = "可打开"
             self._extend_excel_tables(note_sheet, note_row)
 
             comment_id_column = comment_headers["笔记评论ID"]
@@ -3331,6 +4181,7 @@ class MonitorStore:
             "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
             "图片数量", "发布日期", "来源词", "笔记ID", "博主ID",
             "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "帖子好坏",
+            "访问状态",
         ]
         comment_headers = [
             "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
@@ -3351,6 +4202,191 @@ class MonitorStore:
         workbook.save(xlsx_path)
         workbook.close()
         print(f"[bridge] 已自动创建 Excel 总表：{xlsx_path}")
+
+    def set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist one sync run's reachability results in one Excel transaction."""
+        raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        deduplicated: dict[str, dict[str, Any]] = {}
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            note_id = valid_note_id(raw.get("noteId"))
+            if note_id:
+                deduplicated[note_id] = raw
+        if not deduplicated:
+            raise ValueError("items must contain at least one noteId")
+
+        labels = {"ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""}
+        normalized: list[dict[str, Any]] = []
+        for note_id, raw in deduplicated.items():
+            requested = text(raw.get("status"), 40).strip().lower()
+            if requested == "suspected":
+                requested = "check_failed"
+            if requested not in labels:
+                raise ValueError("status must be ok, check_failed, unreachable or empty")
+            check_result = text(raw.get("result"), 80) or {
+                "ok": "opened",
+                "check_failed": "inconclusive",
+                "unreachable": "confirmed_v2",
+                "": "",
+            }[requested]
+            normalized.append({
+                "noteId": note_id,
+                "status": requested,
+                "excelStatus": labels[requested],
+                "error": "" if requested == "ok" else text(raw.get("error"), 1000),
+                "result": check_result,
+                "checkedAt": text(raw.get("checkedAt"), 80) or now_iso(),
+            })
+
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        if not xlsx_path or not xlsx_path.exists():
+            raise ValueError("Excel 总表不存在")
+
+        from openpyxl import load_workbook
+
+        workbook = None
+        temporary_path: Path | None = None
+        total_rows = 0
+        with self.pull_lock:
+            try:
+                workbook = load_workbook(xlsx_path)
+                if "sheet1_笔记总表" not in workbook.sheetnames:
+                    raise ValueError("Excel 总表缺少 sheet1_笔记总表")
+                sheet = workbook["sheet1_笔记总表"]
+                status_column = self._ensure_excel_header(sheet, "访问状态")
+                headers = self._excel_headers(sheet)
+                note_id_column = headers.get("笔记ID")
+                if not note_id_column:
+                    raise ValueError("Excel 总表缺少笔记ID列")
+                rows_by_id: dict[str, list[int]] = {}
+                for row_number in range(2, sheet.max_row + 1):
+                    row_id = valid_note_id(sheet.cell(row_number, note_id_column).value)
+                    if row_id:
+                        rows_by_id.setdefault(row_id, []).append(row_number)
+                with self.lock, self._session() as db:
+                    for item in normalized:
+                        stored = db.execute(
+                            "SELECT title,access_status FROM notes WHERE note_id=?", (item["noteId"],)
+                        ).fetchone()
+                        if not stored:
+                            raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
+                        item["previousStatus"] = text(stored["access_status"], 40)
+                        item["title"] = text(stored["title"], 1000)
+                        rows = rows_by_id.get(item["noteId"], [])
+                        for row_number in rows:
+                            sheet.cell(row_number, status_column).value = item["excelStatus"]
+                        item["excelRows"] = len(rows)
+                        total_rows += len(rows)
+                temporary_path = xlsx_path.with_name(
+                    f".{xlsx_path.stem}.access-{os.getpid()}-{time.time_ns()}.tmp{xlsx_path.suffix}"
+                )
+                workbook.save(temporary_path)
+                workbook.close()
+                workbook = None
+                try:
+                    os.replace(temporary_path, xlsx_path)
+                except PermissionError as exc:
+                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试") from exc
+                temporary_path = None
+                with self.lock, self._session() as db:
+                    for item in normalized:
+                        db.execute(
+                            """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?
+                               WHERE note_id=?""",
+                            (item["status"], item["error"], item["checkedAt"], item["result"], item["noteId"]),
+                        )
+                        previous = item.get("previousStatus") or ""
+                        current = item["status"]
+                        meaningful = previous != current and bool(
+                            previous or current in {"check_failed", "unreachable"}
+                        )
+                        if meaningful:
+                            human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
+                            db.execute(
+                                """INSERT INTO change_events
+                                   (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
+                                   VALUES (?,?,?,?,?,?,?,?)""",
+                                (
+                                    max(0, int(payload.get("runId") or 0)), item["noteId"], "access_status_changed",
+                                    item.get("title") or "", f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}",
+                                    json.dumps({"status": previous}, ensure_ascii=False),
+                                    json.dumps({"status": current, "error": item["error"]}, ensure_ascii=False),
+                                    item["checkedAt"],
+                                ),
+                            )
+            finally:
+                if workbook is not None:
+                    workbook.close()
+                if temporary_path and temporary_path.exists():
+                    try:
+                        temporary_path.unlink()
+                    except OSError:
+                        pass
+        by_status: dict[str, int] = {}
+        for item in normalized:
+            by_status[item["status"]] = by_status.get(item["status"], 0) + 1
+        return {"ok": True, "updated": len(normalized), "excelRows": total_rows,
+                "byStatus": by_status, "items": normalized}
+
+    def set_note_access_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = self.set_note_access_statuses({"items": [payload], "runId": payload.get("runId")})
+        item = result["items"][0]
+        return {"ok": True, "noteId": item["noteId"], "accessStatus": item["status"],
+                "excelStatus": item["excelStatus"], "excelRows": item["excelRows"],
+                "checkedAt": item["checkedAt"]}
+
+    def reconcile_legacy_access_statuses(self) -> dict[str, Any]:
+        """Downgrade statuses produced by the pre-v0.22.4 loose detector."""
+        with self.lock, self._session() as db:
+            rows = db.execute(
+                """SELECT note_id,access_error FROM notes
+                   WHERE access_status='check_failed'
+                     AND access_check_result IN ('legacy_untrusted','legacy_excel_unverified')"""
+            ).fetchall()
+        if not rows:
+            return {"ok": True, "updated": 0, "items": []}
+        return self.set_note_access_statuses({"items": [
+            {"noteId": row["note_id"], "status": "check_failed",
+             "result": "legacy_recheck", "error": row["access_error"] or "旧版判定等待重新核验"}
+            for row in rows
+        ]})
+
+    def list_unreachable_notes(self) -> list[dict[str, Any]]:
+        with self.lock, self._session() as db:
+            rows = db.execute(
+                """SELECT note_id,title,url,access_error,last_access_checked_at
+                   FROM notes WHERE access_status='unreachable'
+                   ORDER BY last_access_checked_at DESC, first_seen_at DESC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_unreachable_notes(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delete every note marked unreachable, including comments and managed media."""
+        targets = self.list_unreachable_notes()
+        deleted: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for item in targets:
+            try:
+                result = self.delete_pulled_note({"noteId": item["note_id"]})
+                deleted.append({"noteId": item["note_id"], "title": item.get("title") or "", **result})
+            except Exception as exc:
+                failures.append({
+                    "noteId": item["note_id"],
+                    "title": item.get("title") or "",
+                    "error": text(exc, 1000),
+                })
+        return {
+            "ok": not failures,
+            "targetCount": len(targets),
+            "deletedCount": len(deleted),
+            "failedCount": len(failures),
+            "deletedCommentRows": sum(int(item.get("deletedCommentRows", 0) or 0) for item in deleted),
+            "deletedDatabaseComments": sum(int(item.get("deletedDatabaseComments", 0) or 0) for item in deleted),
+            "deleted": deleted,
+            "failures": failures,
+            "error": "；".join(item["error"] for item in failures[:3]),
+        }
 
     def delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Physically remove one pulled note from Excel, SQLite and its media folder."""
@@ -3475,6 +4511,7 @@ class MonitorStore:
                     db.execute("DELETE FROM ai_jobs WHERE target_type='note' AND target_id=?", (note_id,))
                     db.execute("DELETE FROM ai_analysis_records WHERE target_type='note' AND target_id=?", (note_id,))
                     db.execute("DELETE FROM comment_collection_jobs WHERE note_id=?", (note_id,))
+                    db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
                     db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
                     db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
 
@@ -3607,7 +4644,6 @@ class MonitorStore:
                 "status": "failed" if comment_status == "failed" else comment_status,
                 "error": comment_error,
                 "collectedAt": text(payload.get("collectedAt"), 80) or now_iso(),
-                "forceAutoAnalyze": True,
             })
             try:
                 media_result = self._download_note_media(note)
@@ -3622,18 +4658,6 @@ class MonitorStore:
                     "videoCount": 0,
                     "error": text(exc, 1000),
                 }
-            settings = self.ai_settings.get(False)
-            with self.lock, self._session() as db:
-                existing_analysis = db.execute(
-                    "SELECT ai_analysis_status,post_sentiment FROM notes WHERE note_id=?",
-                    (note_id,),
-                ).fetchone()
-            if existing_analysis and existing_analysis["post_sentiment"]:
-                note["postSentiment"] = sentiment_label(existing_analysis["post_sentiment"])
-            elif settings.get("configured"):
-                note["postSentiment"] = "AI排队中"
-            else:
-                note["postSentiment"] = "AI未配置"
             xlsx_result = self._sync_pull_to_xlsx(note, comments, media_result)
         except Exception as exc:
             with self.lock, self._session() as db:
@@ -3658,20 +4682,15 @@ class MonitorStore:
             db.execute(
                 """UPDATE notes SET status='known', is_relevant=1, source='existing_xlsx', relevance_status='relevant', relevance_source='pull',
                    pull_status=?, pull_error=?, last_pull_at=?, excel_synced_at=?,
-                   excel_sync_path=?, media_status=?, media_dir=?, media_file_count=?, media_error=?
+                   excel_sync_path=?, media_status=?, media_dir=?, media_file_count=?, media_error=?,
+                   access_status='ok', access_error='', last_access_checked_at=?, access_check_result='opened'
                    WHERE note_id=?""",
                 (
                     final_status, final_error, timestamp, timestamp, xlsx_result["path"],
                     media_result.get("status", "failed"), media_result.get("folder", ""),
-                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), note_id,
+                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp, note_id,
                 ),
             )
-        ai_status = "not_configured"
-        if settings.get("configured") and settings.get("auto_analyze_posts"):
-            ai_result = self.enqueue_ai("note", note_id, priority=10, force=True)
-            ai_status = text(ai_result.get("status"), 30) or "queued"
-        elif settings.get("configured"):
-            ai_status = "manual"
         return {
             "ok": True,
             "noteId": note_id,
@@ -3703,7 +4722,6 @@ class MonitorStore:
             "mediaFiles": media_result.get("files", []) or [],
             "mediaError": media_result.get("error", ""),
             "pullError": final_error,
-            "aiStatus": ai_status,
         }
 
     def open_local_artifact(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3900,6 +4918,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 status = text(query.get("status", [""])[0], 30)
                 limit = int(query.get("limit", [100])[0])
                 self._send_json(200, {"ok": True, "notes": self.store.list_notes(status, limit)})
+            elif parsed.path == "/api/notes/unreachable":
+                notes = self.store.list_unreachable_notes()
+                self._send_json(200, {"ok": True, "count": len(notes), "notes": notes})
+            elif parsed.path == "/api/data-health":
+                self._send_json(200, self.store.data_health())
+            elif parsed.path == "/api/changes":
+                query = parse_qs(parsed.query)
+                limit = int(query.get("limit", [100])[0])
+                unread_only = text(query.get("unreadOnly", [""])[0], 10).lower() in {"1", "true", "yes"}
+                self._send_json(200, self.store.list_change_events(limit, unread_only))
+            elif parsed.path == "/api/watchlist":
+                query = parse_qs(parsed.query)
+                limit = int(query.get("limit", [200])[0])
+                self._send_json(200, self.store.list_watchlist(limit))
+            elif parsed.path == "/api/reports/weekly/latest":
+                self._send_json(200, self.store.latest_weekly_report())
             elif parsed.path == "/api/note/status":
                 query = parse_qs(parsed.query)
                 self._send_json(200, self.store.note_status(text(query.get("noteId", [""])[0], 128)))
@@ -3953,6 +4987,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.pull_to_excel(payload)
             elif self.path == "/api/note/delete":
                 result = self.store.delete_pulled_note(payload)
+            elif self.path == "/api/note/access-status":
+                result = self.store.set_note_access_status(payload)
+            elif self.path == "/api/notes/access-status/batch":
+                result = self.store.set_note_access_statuses(payload)
+            elif self.path == "/api/notes/unreachable/delete":
+                result = self.store.delete_unreachable_notes(payload)
+            elif self.path == "/api/data-health/repair":
+                result = self.store.repair_data_health(payload)
+            elif self.path == "/api/changes/ack":
+                result = self.store.acknowledge_change_events(payload)
+            elif self.path == "/api/watchlist":
+                result = self.store.set_watchlist(payload)
+            elif self.path == "/api/sync-runs/start":
+                result = self.store.start_sync_run(payload)
+            elif self.path == "/api/sync-runs/finish":
+                result = self.store.finish_sync_run(payload)
+            elif self.path == "/api/reports/weekly":
+                result = self.store.generate_weekly_report(payload)
+            elif self.path == "/api/reports/weekly/open":
+                result = self.store.open_weekly_report(payload)
             elif self.path == "/api/relevance/analyze":
                 result = self.store.analyze_relevance(payload)
             elif self.path == "/api/open":
@@ -3977,7 +5031,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 seed_path = getattr(self.store, "seed_xlsx_path", None)
                 if not seed_path:
                     raise ValueError("未配置 Excel 总表路径")
-                result = {"ok": True, "inserted": self.store.seed_from_xlsx(Path(seed_path)), "path": str(seed_path)}
+                inserted = self.store.seed_from_xlsx(Path(seed_path))
+                access_migration: dict[str, Any] = {"updated": 0}
+                migration_error = ""
+                try:
+                    access_migration = self.store.reconcile_legacy_access_statuses()
+                except Exception as exc:
+                    # Database statuses were already made conservative by the
+                    # schema migration. Keep reload usable when Excel happens
+                    # to be open; the next sync/reload will retry the label.
+                    migration_error = text(exc, 1000)
+                result = {"ok": True, "inserted": inserted, "path": str(seed_path),
+                          "accessMigration": access_migration.get("updated", 0),
+                          "accessMigrationError": migration_error}
             elif self.path == "/api/ai/settings":
                 result = self.store.save_ai_settings(payload)
             elif self.path == "/api/ai/test":
@@ -4055,6 +5121,10 @@ def create_server(host: str, port: int, db_path: Path, export_dir: Path, seed_xl
     inserted = 0
     if seed_xlsx and Path(seed_xlsx).is_file():
         inserted = store.seed_from_xlsx(seed_xlsx)
+        try:
+            store.reconcile_legacy_access_statuses()
+        except Exception as exc:
+            print(f"[bridge] 旧版访问状态已在数据库降级；Excel 标签稍后重试：{exc}")
     server = ThreadingHTTPServer((host, port), BridgeHandler)
     server.store = store  # type: ignore[attr-defined]
     return server, store, inserted
@@ -4083,8 +5153,13 @@ def main() -> None:
         if not args.seed_xlsx:
             raise SystemExit("--seed-only requires --seed-xlsx")
         store = MonitorStore(args.db, args.export_dir)
+        store.seed_xlsx_path = args.seed_xlsx  # type: ignore[attr-defined]
         inserted = store.seed_from_xlsx(args.seed_xlsx)
-        print(f"[bridge] seeded {inserted} existing note IDs from {args.seed_xlsx}")
+        migration = store.reconcile_legacy_access_statuses()
+        print(
+            f"[bridge] seeded {inserted} existing note IDs from {args.seed_xlsx}; "
+            f"downgraded {migration.get('updated', 0)} legacy access statuses"
+        )
         return
 
     if _port_already_serves_bridge(args.host, args.port):

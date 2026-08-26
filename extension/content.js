@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.20.3";
+  const CONTENT_VERSION = "0.23.0";
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) return;
   globalThis.__XHS_MONITOR_CONTENT_VERSION__ = CONTENT_VERSION;
 
@@ -68,8 +68,7 @@
     ["分享量", "shareCount"], ["发布时间", "publishedAt"], ["更新时间", "updatedAt"],
     ["IP地址", "ipLocation"], ["图片数量", "imageCount"], ["视频数量", "videoCount"], ["发布日期", "publishedAt"],
     ["来源词", "keyword"], ["笔记ID", "noteId"], ["博主ID", "authorId"],
-    ["对应帖子文件夹地址", "mediaDir"], ["文件夹内清单", "mediaFiles"],
-    ["AI情绪判断", "postSentiment"], ["帖子好坏", "postSentiment"]
+    ["对应帖子文件夹地址", "mediaDir"], ["文件夹内清单", "mediaFiles"]
   ];
 
   function sendRuntime(message) {
@@ -269,13 +268,6 @@
       if (label === "视频数量" && value === undefined) value = source.videoUrls?.length || 0;
       if (label === "发布日期") value = processValue(source.publishedAt, 100).slice(0, 10);
       if (label === "文件夹内清单" && Array.isArray(value)) value = value.join("\n");
-      if ((label === "AI情绪判断" || label === "帖子好坏") && !value) {
-        const aiLabels = {
-          queued: "AI 排队中", analyzing: "AI 分析中", completed: "AI 已完成",
-          failed: "AI 分析失败", manual: "AI 待手动分析", not_configured: "AI 未配置"
-        };
-        value = aiLabels[source.aiStatus] || "";
-      }
       fields[label] = processValue(value, label === "笔记内容" ? 520 : 220);
     }
     return fields;
@@ -293,10 +285,6 @@
   }
 
   function removeProcessPanel() {
-    if (processPanel?._aiPollTimer) {
-      clearInterval(processPanel._aiPollTimer);
-      processPanel._aiPollTimer = null;
-    }
     if (processPanel?._statusRetryTimer) {
       clearTimeout(processPanel._statusRetryTimer);
       processPanel._statusRetryTimer = null;
@@ -327,27 +315,56 @@
     return button;
   }
 
+  function setProcessPanelCollapsed(panel, collapsed) {
+    if (!panel) return;
+    panel.classList.toggle(`${PROCESS_PANEL_CLASS}--collapsed`, Boolean(collapsed));
+    const button = panel.querySelector(`.${PROCESS_PANEL_CLASS}__collapse`);
+    if (button) {
+      button.textContent = collapsed ? "+" : "−";
+      button.setAttribute("aria-expanded", String(!collapsed));
+      button.setAttribute("aria-label", collapsed ? "展开 Process" : "折叠 Process");
+      button.title = collapsed ? "展开详细进度" : "折叠详细进度";
+    }
+  }
+
+  function consumeProcessScroll(viewport, delta) {
+    if (!viewport || !Number.isFinite(delta) || delta === 0) return delta;
+    const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    if (!maxScroll) return delta;
+    const before = Math.max(0, Math.min(maxScroll, Number(viewport.scrollTop) || 0));
+    const after = Math.max(0, Math.min(maxScroll, before + delta));
+    if (Math.abs(after - before) < 0.01) return delta;
+    viewport.scrollTop = after;
+    return delta - (after - before);
+  }
+
   function enableProcessPanelScroll(panel) {
     if (!panel || panel._scrollShielded) return;
     panel._scrollShielded = true;
-    // Xiaohongshu's detail layer installs its own wheel handlers. Shield the
-    // Process panel and perform the vertical scroll locally so the page/modal
-    // cannot swallow the gesture or trigger a new card scan.
+    // Xiaohongshu's detail layer installs its own wheel handlers. Keep wheel
+    // handling local, but chain any unconsumed delta from an inner field /
+    // comment viewport into the outer Process panel. This lets the user keep
+    // the pointer in place instead of moving it after the inner list reaches
+    // its top or bottom edge.
     panel.addEventListener("wheel", (event) => {
       if (panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`)) return;
       const origin = event.target instanceof Element ? event.target : panel;
       const nested = origin.closest(
-        `.${PROCESS_PANEL_CLASS}__fields, .${PROCESS_PANEL_CLASS}__comments`
+        `.${PROCESS_PANEL_CLASS}__fields, .${PROCESS_PANEL_CLASS}__comments, .${PROCESS_PANEL_CLASS}__change-list`
       );
       const viewport = nested && panel.contains(nested) ? nested : panel;
       const delta = event.deltaMode === 1 ? event.deltaY * 16
         : event.deltaMode === 2 ? event.deltaY * viewport.clientHeight
           : event.deltaY;
-      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-      if (!maxScroll || !Number.isFinite(delta) || delta === 0) return;
+      if (!Number.isFinite(delta) || delta === 0) return;
+      let remaining = consumeProcessScroll(viewport, delta);
+      if (viewport !== panel && Math.abs(remaining) >= 0.01) {
+        remaining = consumeProcessScroll(panel, remaining);
+      }
+      const consumed = Math.abs(delta - remaining) >= 0.01;
+      if (!consumed) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      viewport.scrollTop = Math.max(0, Math.min(maxScroll, viewport.scrollTop + delta));
     }, { capture: true, passive: false });
     panel.addEventListener("touchmove", (event) => event.stopPropagation(), { capture: true, passive: true });
   }
@@ -423,8 +440,8 @@
     const panel = document.createElement("aside");
     panel.className = PROCESS_PANEL_CLASS;
     panel.dataset.noteId = note.noteId || "";
-    panel.setAttribute("role", "status");
-    panel.setAttribute("aria-live", "polite");
+    panel.setAttribute("role", "complementary");
+    panel.setAttribute("aria-label", "帖子拉取与核对 Process");
     panel._processNote = { ...note };
     panel._detailOpened = false;
 
@@ -441,6 +458,7 @@
     const status = document.createElement("small");
     status.className = `${PROCESS_PANEL_CLASS}__status`;
     status.textContent = "准备打开帖子";
+    status.setAttribute("aria-live", "polite");
     const headStates = document.createElement("div");
     headStates.className = `${PROCESS_PANEL_CLASS}__head-states`;
     const headPullState = document.createElement("span");
@@ -458,10 +476,12 @@
     });
     pullButton.textContent = "拉取";
     const collapseButton = processButton("折叠或展开 Process", `${PROCESS_PANEL_CLASS}__collapse`, () => {
-      panel.classList.toggle(`${PROCESS_PANEL_CLASS}--collapsed`);
+      setProcessPanelCollapsed(panel, !panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`));
       positionProcessPanel();
     });
     collapseButton.textContent = "−";
+    collapseButton.setAttribute("aria-expanded", "true");
+    collapseButton.title = "折叠详细进度";
     const closeButton = processButton("关闭 Process", `${PROCESS_PANEL_CLASS}__close`, dismissProcessPanel);
     closeButton.textContent = "×";
     actions.append(pullButton, collapseButton, closeButton);
@@ -595,83 +615,6 @@
     return panel;
   }
 
-  function renderProcessAIBars(panel, status, percent) {
-    const rows = panel?.querySelectorAll(`.${PROCESS_PANEL_CLASS}__field[data-ai-field]`) || [];
-    const safePercent = Math.max(3, Math.min(100, Number(percent) || 0));
-    rows.forEach((row) => {
-      const strong = row.querySelector("strong");
-      if (!strong) return;
-      strong.className = "";
-      if (status === "completed") {
-        row.dataset.state = "ready";
-        strong.classList.add(`${PROCESS_PANEL_CLASS}__ai-done`);
-        strong.textContent = "✓ AI 已完成，已写入 Excel";
-      } else if (status === "failed") {
-        row.dataset.state = "ready";
-        strong.classList.add(`${PROCESS_PANEL_CLASS}__ai-fail`);
-        strong.textContent = "AI 分析失败，可在侧边栏重试";
-      } else if (status === "queued" || status === "analyzing") {
-        row.dataset.state = "ready";
-        strong.classList.add(`${PROCESS_PANEL_CLASS}__ai-progress`);
-        strong.replaceChildren();
-        const track = document.createElement("span");
-        track.className = `${PROCESS_PANEL_CLASS}__ai-track`;
-        const fill = document.createElement("i");
-        fill.style.width = `${safePercent}%`;
-        track.append(fill);
-        const label = document.createElement("em");
-        label.textContent = `${status === "queued" ? "排队中" : "分析中"} ${safePercent}%`;
-        strong.append(track, label);
-      } else {
-        strong.textContent = "后台 AI";
-      }
-    });
-  }
-
-  function startProcessAIPoll(panel, noteId, aiStatus) {
-    if (panel?._aiPollTimer) {
-      clearInterval(panel._aiPollTimer);
-      panel._aiPollTimer = null;
-    }
-    if (!panel || !noteId) return;
-    const active = aiStatus === "queued" || aiStatus === "analyzing";
-    if (aiStatus === "completed" || aiStatus === "failed") {
-      renderProcessAIBars(panel, aiStatus, 100);
-      return;
-    }
-    if (!active) return;
-    renderProcessAIBars(panel, aiStatus, 8);
-    const startedAt = Date.now();
-    panel._aiPollTimer = setInterval(() => {
-      try {
-        chrome.runtime.sendMessage({ type: "getNoteAIProgress", noteId }, (response) => {
-          if (chrome.runtime.lastError || processPanel !== panel) {
-            clearInterval(panel._aiPollTimer);
-            panel._aiPollTimer = null;
-            return;
-          }
-          if (Date.now() - startedAt > 10 * 60 * 1000) {
-            clearInterval(panel._aiPollTimer);
-            panel._aiPollTimer = null;
-            return;
-          }
-          const status = response?.status || "";
-          const percent = Number(response?.percent) || 0;
-          if (status === "completed" || status === "failed") {
-            renderProcessAIBars(panel, status, 100);
-            clearInterval(panel._aiPollTimer);
-            panel._aiPollTimer = null;
-          } else if (status) {
-            renderProcessAIBars(panel, status, percent);
-          }
-        });
-      } catch (_error) {
-        clearInterval(panel._aiPollTimer);
-        panel._aiPollTimer = null;
-      }
-    }, 2500);
-  }
-
   function renderProcessPanel(message = {}) {
     const note = {
       ...(processPanel?._processNote || {}), ...(message.note || {}),
@@ -681,7 +624,7 @@
     const panel = mountProcessPanel({ ...note, noteId: message.noteId || note.noteId });
     panel._processNote = note;
     panel.dataset.mode = message.done ? "done" : "processing";
-    panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
+    setProcessPanelCollapsed(panel, false);
     const pullButton = panel.querySelector(`.${PROCESS_PANEL_CLASS}__pull`);
     if (pullButton) {
       pullButton.disabled = !message.done;
@@ -728,7 +671,6 @@
     if (message.commentCount !== undefined) merged.commentCount = message.commentCount;
     if (message.excelPath) merged.excelPath = message.excelPath;
     if (message.excelRow) merged.excelRow = message.excelRow;
-    if (message.aiStatus) merged.aiStatus = message.aiStatus;
     panel._processArtifacts = {
       ...(panel._processArtifacts || {}),
       noteId: merged.noteId || message.noteId || "",
@@ -746,27 +688,23 @@
     let filled = 0;
     if (fieldRoot) {
       fieldRoot.replaceChildren();
-      const deferredFields = new Set(["AI情绪判断", "帖子好坏"]);
       for (const [label] of PROCESS_NOTE_FIELDS) {
         const value = fieldMap[label] || "";
-        if (value && !deferredFields.has(label)) filled += 1;
-        const deferred = deferredFields.has(label) && !value;
+        if (value) filled += 1;
         const row = document.createElement("div");
         row.className = `${PROCESS_PANEL_CLASS}__field`;
-        if (deferredFields.has(label)) row.dataset.aiField = "1";
-        row.dataset.state = value ? "ready" : deferred ? "deferred" : "pending";
+        row.dataset.state = value ? "ready" : "pending";
         const name = document.createElement("span");
         name.textContent = label;
         const content = document.createElement("strong");
-        content.textContent = value || (deferred ? "后台 AI" : "待读取");
+        content.textContent = value || "待读取";
         if (value) content.title = value;
         row.append(name, content);
         fieldRoot.append(row);
       }
     }
     const fieldCount = panel.querySelector(`.${PROCESS_PANEL_CLASS}__field-count`);
-    if (fieldCount) fieldCount.textContent = `${filled}/${PROCESS_NOTE_FIELDS.length - 2} 已拉取 · AI 2 项后台`;
-    startProcessAIPoll(panel, merged.noteId || "", merged.aiStatus || "");
+    if (fieldCount) fieldCount.textContent = `${filled}/${PROCESS_NOTE_FIELDS.length} 已拉取`;
 
     const rows = Array.isArray(message.commentRows) ? message.commentRows : null;
     const commentRoot = panel.querySelector(`.${PROCESS_PANEL_CLASS}__comments`);
@@ -1540,11 +1478,11 @@
 
   function renderCommentChanges(panel, result) {
     const section = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__changes`);
-    if (!section) return;
+    if (!section) return null;
     if (!result?.hasChanges) {
       section.hidden = true;
       section.replaceChildren();
-      return;
+      return null;
     }
     panel._commentAudit = result;
     section.hidden = false;
@@ -1577,34 +1515,49 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = `${PROCESS_PANEL_CLASS}__update-comments`;
-    button.textContent = "更新评论到 Excel / 数据库";
-    button.addEventListener("click", async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      button.textContent = "正在更新…";
-      try {
-        const response = await sendRuntime({
-          type: "syncCurrentNoteComments",
-          noteId: panel.dataset.noteId,
-          snapshot: result.snapshot
-        });
-        if (!response?.ok) throw new Error(response?.error || "更新失败");
-        button.textContent = "已更新";
-        button.dataset.state = "updated";
-        setProcessLatest(panel);
-        const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
-        if (status) status.textContent = `评论已更新：新增 ${response.newCount || 0}，移除 ${response.removedCount || 0}`;
-        panel._commentAuditDone = true;
-        panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
-      } catch (error) {
-        button.disabled = false;
-        button.textContent = "更新失败，点击重试";
-        button.title = error?.message || "更新失败";
-      }
-    });
+    button.textContent = "准备自动同步…";
+    let syncPromise = null;
+    const syncChanges = (automatic = false) => {
+      if (button.dataset.state === "updated") return Promise.resolve(null);
+      if (syncPromise) return syncPromise;
+      syncPromise = (async () => {
+        button.disabled = true;
+        button.textContent = automatic ? "正在自动同步…" : "正在更新…";
+        try {
+          const response = await sendRuntime({
+            type: "syncCurrentNoteComments",
+            noteId: panel.dataset.noteId,
+            snapshot: result.snapshot
+          });
+          if (!response?.ok) throw new Error(response?.error || "更新失败");
+          button.textContent = automatic ? "已自动同步" : "已更新";
+          button.dataset.state = "updated";
+          section.dataset.state = "updated";
+          setProcessLatest(panel);
+          const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+          if (status) status.textContent = `评论同步成功：新增 ${response.newCount || 0}，移除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}`;
+          panel._commentAuditDone = true;
+          panel._commentAudit = { ...result, synced: response };
+          panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
+          showPageToast(`评论同步成功 · 新增 ${response.newCount || 0} · 移除 ${response.removedCount || 0} · 修改 ${response.changedCount || 0}`);
+          return response;
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "同步失败，点击重试";
+          button.title = error?.message || "同步失败";
+          showPageToast(`评论自动同步失败：${error?.message || "请点击重试"}`, "error");
+          throw error;
+        } finally {
+          syncPromise = null;
+        }
+      })();
+      return syncPromise;
+    };
+    button.addEventListener("click", () => syncChanges(false).catch(() => {}));
     section.append(head, intro, list, button);
     panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
     positionProcessPanel();
+    return syncChanges;
   }
 
   async function auditPulledComments(panel, note) {
@@ -1613,8 +1566,9 @@
     try {
       const result = await sendRuntime({ type: "auditCurrentNoteComments", note });
       if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
-      renderCommentChanges(panel, result);
-      panel._commentAuditDone = true;
+      const syncChanges = renderCommentChanges(panel, result);
+      if (result.hasChanges && syncChanges) await syncChanges(true);
+      else panel._commentAuditDone = true;
     } catch (error) {
       panel._commentAuditStarted = false;
       panel._commentAuditError = error?.message || "评论对比失败";
@@ -1697,13 +1651,14 @@
           excelPath: result.excelPath || "",
           excelRow: result.excelRow || 0,
           commentCount: result.commentCount ?? storedNote.commentCount ?? 0,
-          commentRows: Array.isArray(result.commentRows) ? result.commentRows : [],
-          aiStatus: result.aiStatus || storedNote.aiStatus || ""
+          commentRows: Array.isArray(result.commentRows) ? result.commentRows : []
         });
         panel._processNote = storedNote;
         panel.dataset.mode = "done";
         panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
-        auditPulledComments(panel, storedNote).catch(() => {});
+        if (document.visibilityState === "visible" && !isBatchAutomationSurface()) {
+          auditPulledComments(panel, storedNote).catch(() => {});
+        }
       }
       const pullLabel = pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
       if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
@@ -1789,6 +1744,25 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function isBatchAutomationSurface() {
+    try { return new URL(location.href).searchParams.get("xhs_monitor_batch") === "1"; }
+    catch (_error) { return false; }
+  }
+
+  function showPageToast(message, variant = "success") {
+    document.querySelectorAll(".xhs-monitor-page-toast").forEach((item) => item.remove());
+    const toast = document.createElement("div");
+    toast.className = `xhs-monitor-page-toast xhs-monitor-page-toast--${variant}`;
+    toast.setAttribute("role", variant === "error" ? "alert" : "status");
+    toast.textContent = clean(message, 500);
+    document.documentElement.append(toast);
+    requestAnimationFrame(() => toast.classList.add("is-visible"));
+    setTimeout(() => {
+      toast.classList.remove("is-visible");
+      setTimeout(() => toast.remove(), 240);
+    }, 4200);
+  }
+
   function findNoteAnchor(noteId) {
     const markedCard = document.querySelector(`[${CARD_MARK}="${CSS.escape(noteId)}"]`);
     if (markedCard?.matches?.("a[href]")) return markedCard;
@@ -1807,11 +1781,60 @@
     })[0] || null;
   }
 
+  function findNoteAnchorByTitle(note = {}) {
+    const expected = clean(note.title, 1000).toLocaleLowerCase();
+    if (!expected) return null;
+    const expectedPrefix = expected.slice(0, Math.min(24, expected.length));
+    const candidates = Array.from(document.querySelectorAll(NOTE_LINK_SELECTOR))
+      .filter((anchor) => {
+        const candidateId = noteIdFromUrl(anchor.href);
+        if (candidateId && candidateId !== note.noteId) return false;
+        const card = candidateCard(anchor);
+        const candidateTitle = clean(extractTitle(card, anchor), 1000).toLocaleLowerCase();
+        return Boolean(candidateTitle && (
+          candidateTitle === expected
+          || candidateTitle.includes(expectedPrefix)
+          || expected.includes(candidateTitle.slice(0, Math.min(24, candidateTitle.length)))
+        ));
+      });
+    return candidates.sort((left, right) => {
+      const score = (anchor) => (anchor.offsetParent === null ? 0 : 10)
+        + (noteIdFromUrl(anchor.href) === note.noteId ? 20 : 0)
+        + (anchor.href.includes("xsec_token=") ? 5 : 0);
+      return score(right) - score(left);
+    })[0] || null;
+  }
+
+  function pageAccessEvidence(note = {}) {
+    const bodyText = clean(document.body?.innerText, 12000);
+    const requestedId = clean(note.noteId, 128);
+    const currentPageId = noteIdFromUrl(location.href);
+    // Only a target-specific detail URL may prove that a note is gone. Search
+    // results and profile pages can contain the same empty-state copy for an
+    // unrelated card, so their text is never accepted as deletion evidence.
+    const targetRoute = Boolean(requestedId && currentPageId === requestedId);
+    const definitive = [
+      "该笔记已删除", "笔记已被删除", "内容已被删除", "该内容不存在",
+      "内容不存在", "该页面不存在", "笔记已失效", "内容已下架",
+      "该笔记因违规", "作者已删除"
+    ].find((marker) => bodyText.includes(marker));
+    if (definitive && targetRoute) {
+      return { state: "definitive_unreachable", marker: definitive, targetRoute: true };
+    }
+    const temporary = [
+      "当前笔记暂时无法浏览", "笔记暂时无法浏览", "暂时无法浏览",
+      "请打开小红书App扫码查看", "请打开小红书 App 扫码查看",
+      "登录后查看", "安全验证", "验证码", "网络异常", "加载失败"
+    ].find((marker) => bodyText.includes(marker));
+    if (temporary) return { state: "temporary_blocked", marker: temporary, targetRoute };
+    return { state: "unknown", marker: definitive || "", targetRoute };
+  }
+
   function currentDetailMatches(note) {
     const root = detailRootForNote(note);
     if (!root) return false;
     const currentId = noteIdFromUrl(location.href) || clean(root.getAttribute?.("note-id"), 128);
-    if (currentId && currentId === note.noteId) return true;
+    if (currentId && note.noteId) return currentId === note.noteId;
     const title = clean(note.title, 1000);
     return Boolean(title && clean(root.innerText, 16000).includes(title.slice(0, 24)));
   }
@@ -1837,7 +1860,21 @@
       return { opened: false };
     }
     if (detailRootForNote({})) await closeDetailInPage();
-    const anchor = findNoteAnchor(note.noteId);
+    let anchor = findNoteAnchor(note.noteId) || findNoteAnchorByTitle(note);
+    if (!anchor && note.waitForCard) {
+      const deadline = Date.now() + 12000;
+      let attempts = 0;
+      while (!anchor && Date.now() < deadline) {
+        await waitFor(350);
+        attempts += 1;
+        anchor = findNoteAnchor(note.noteId) || findNoteAnchorByTitle(note);
+        if (!anchor && attempts % 4 === 0) {
+          const scroller = document.scrollingElement || document.documentElement;
+          scroller.scrollTop = Math.min(scroller.scrollHeight, scroller.scrollTop + Math.max(500, window.innerHeight * .7));
+          window.dispatchEvent(new Event("scroll"));
+        }
+      }
+    }
     if (!anchor) throw new Error("当前页面找不到这篇帖子的卡片，请先让它显示在页面上");
     try { anchor.scrollIntoView({ block: "center", inline: "center" }); } catch (_error) {}
     // The result card is often an <a>. Let XHS's own click handler open the
@@ -1897,7 +1934,7 @@
           process: true, noteId: note.noteId, phase: "body", error: errorMessage,
           title: errorMessage, note
         });
-        return { ok: false, error: errorMessage };
+        return { ok: false, error: errorMessage, access: pageAccessEvidence(note) };
       }
 
       if (showProcess) {
@@ -1978,6 +2015,7 @@
       });
       return {
         ok: true,
+        access: { state: "ok", marker: "detail_loaded" },
         note: detail.note,
         comments: commentsWithIds,
         expectedCount,
@@ -1990,7 +2028,11 @@
         process: true, noteId: note.noteId, phase: "body", error: error?.message || "当前页面读取失败",
         title: "当前页面读取失败", note
       });
-      return { ok: false, error: error?.message || "当前页面读取失败" };
+      return {
+        ok: false,
+        error: error?.message || "当前页面读取失败",
+        access: pageAccessEvidence(note)
+      };
     } finally {
       // A user-triggered pull leaves the enlarged note visible so the Process
       // window and the exact source text/comments can be checked side by side.
@@ -2478,8 +2520,7 @@
           excelPath: statusResult.excelPath || note.excelPath || "",
           excelRow: statusResult.excelRow || note.excelRow || 0,
           commentCount: statusResult.commentCount ?? note.commentCount ?? 0,
-          commentRows: Array.isArray(statusResult.commentRows) ? statusResult.commentRows : [],
-          aiStatus: statusResult.aiStatus || note.aiStatus || ""
+          commentRows: Array.isArray(statusResult.commentRows) ? statusResult.commentRows : []
         });
         const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
         const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);

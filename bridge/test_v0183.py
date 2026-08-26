@@ -271,6 +271,168 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(str(folder.resolve()), result["target"])
         startfile.assert_called_once_with(str(folder.resolve()))
 
+    def test_unreachable_status_round_trip_and_bulk_delete(self):
+        from openpyxl import load_workbook
+
+        note_id = "unreachable123456"
+        workbook_path = self.store.export_dir.parent / "unreachable-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        note = {
+            "noteId": note_id,
+            "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+            "title": "无法打开的帖子",
+            "content": "用于访问状态测试",
+            "author": "测试用户",
+            "detailRead": True,
+        }
+        comment = {
+            "commentId": "comment-unreachable-1",
+            "author": "评论用户",
+            "content": "即将随帖子删除",
+            "publishedAt": "08-25",
+        }
+        self.store.confirm(note)
+        self.store.upsert_comments({
+            "noteId": note_id,
+            "comments": [comment],
+            "expectedCount": 1,
+            "status": "likely_complete",
+        })
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+
+        marked = self.store.set_note_access_status({
+            "noteId": note_id,
+            "status": "unreachable",
+            "error": "详情页无法加载",
+        })
+        self.assertEqual("unreachable", marked["accessStatus"])
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        matching_row = next(
+            row for row in range(2, sheet.max_row + 1)
+            if sheet.cell(row, headers["笔记ID"]).value == note_id
+        )
+        self.assertEqual("打不开", sheet.cell(matching_row, headers["访问状态"]).value)
+        workbook.close()
+        self.assertEqual(note_id, self.store.list_unreachable_notes()[0]["note_id"])
+
+        cleared = self.store.set_note_access_status({"noteId": note_id, "status": "ok"})
+        self.assertEqual("ok", cleared["accessStatus"])
+        self.assertEqual([], self.store.list_unreachable_notes())
+        workbook = load_workbook(workbook_path)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        sheet.cell(matching_row, headers["访问状态"]).value = "打不开"
+        workbook.save(workbook_path)
+        workbook.close()
+        self.store.seed_from_xlsx(workbook_path)
+        self.assertEqual([], self.store.list_unreachable_notes())
+        with self.store._session() as db:
+            self.assertEqual("check_failed", db.execute(
+                "SELECT access_status FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()[0])
+        migrated = self.store.reconcile_legacy_access_statuses()
+        self.assertEqual(1, migrated["updated"])
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        self.assertEqual("待复核", sheet.cell(matching_row, headers["访问状态"]).value)
+        workbook.close()
+
+        self.store.set_note_access_status({
+            "noteId": note_id,
+            "status": "unreachable",
+            "error": "两条独立证据确认内容已删除",
+        })
+
+        deleted = self.store.delete_unreachable_notes({})
+        self.assertTrue(deleted["ok"])
+        self.assertEqual(1, deleted["deletedCount"])
+        self.assertEqual(1, deleted["deletedDatabaseComments"])
+        with self.store._session() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone())
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        note_sheet = workbook["sheet1_笔记总表"]
+        comment_sheet = workbook["sheet2_评论总表"]
+        note_headers = {str(cell.value): cell.column for cell in note_sheet[1] if cell.value}
+        comment_headers = {str(cell.value): cell.column for cell in comment_sheet[1] if cell.value}
+        note_ids = {note_sheet.cell(row, note_headers["笔记ID"]).value for row in range(2, note_sheet.max_row + 1)}
+        comment_ids = {comment_sheet.cell(row, comment_headers["笔记评论ID"]).value for row in range(2, comment_sheet.max_row + 1)}
+        workbook.close()
+        self.assertNotIn(note_id, note_ids)
+        self.assertNotIn(comment["commentId"], comment_ids)
+
+    def test_seed_migrates_access_status_column_for_existing_workbook(self):
+        from openpyxl import Workbook, load_workbook
+
+        workbook_path = self.store.export_dir.parent / "legacy-no-access-column.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "sheet1_笔记总表"
+        sheet.append(["笔记url", "笔记标题", "笔记ID"])
+        sheet.append([
+            "https://www.xiaohongshu.com/explore/schema123456",
+            "旧版表格帖子",
+            "schema123456",
+        ])
+        workbook.create_sheet("sheet2_评论总表").append(["笔记评论ID"])
+        workbook.save(workbook_path)
+        workbook.close()
+
+        self.store.seed_from_xlsx(workbook_path)
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        headers = [cell.value for cell in workbook["sheet1_笔记总表"][1]]
+        workbook.close()
+        self.assertIn("访问状态", headers)
+
+    def test_batch_access_status_writes_open_review_and_unreachable(self):
+        from openpyxl import load_workbook
+
+        workbook_path = self.store.export_dir.parent / "access-batch-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        notes = [
+            {"noteId": "accessopen123", "title": "可打开帖子", "content": "正文"},
+            {"noteId": "accessreview123", "title": "待复核帖子", "content": "正文"},
+            {"noteId": "accessgone123", "title": "确认删除帖子", "content": "正文"},
+        ]
+        for note in notes:
+            self.store.confirm(note)
+            self.store._sync_pull_to_xlsx(note, [], {"folder": "", "files": []})
+
+        result = self.store.set_note_access_statuses({"items": [
+            {"noteId": "accessopen123", "status": "ok"},
+            {"noteId": "accessreview123", "status": "check_failed", "error": "token 过期"},
+            {"noteId": "accessgone123", "status": "unreachable", "error": "两条明确删除证据"},
+        ]})
+        self.assertTrue(result["ok"])
+        self.assertEqual({"ok": 1, "check_failed": 1, "unreachable": 1}, result["byStatus"])
+
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        sheet = workbook["sheet1_笔记总表"]
+        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+        excel_states = {
+            sheet.cell(row, headers["笔记ID"]).value: sheet.cell(row, headers["访问状态"]).value
+            for row in range(2, sheet.max_row + 1)
+        }
+        workbook.close()
+        self.assertEqual("可打开", excel_states["accessopen123"])
+        self.assertEqual("待复核", excel_states["accessreview123"])
+        self.assertEqual("打不开", excel_states["accessgone123"])
+        with self.store._session() as db:
+            db_states = {
+                row["note_id"]: row["access_status"]
+                for row in db.execute(
+                    "SELECT note_id,access_status FROM notes WHERE note_id LIKE 'access%'"
+                ).fetchall()
+            }
+        self.assertEqual("ok", db_states["accessopen123"])
+        self.assertEqual("check_failed", db_states["accessreview123"])
+        self.assertEqual("unreachable", db_states["accessgone123"])
+
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()
         settings["api_key_dpapi"] = "test"
@@ -322,6 +484,105 @@ class V0183Tests(unittest.TestCase):
         audit = audit_reply_candidate(reply, "这个多少钱", "brand", [reply])
         self.assertEqual("high", audit["riskLevel"])
         self.assertGreaterEqual(audit["similarityScore"], 0.99)
+
+    def test_operations_center_health_changes_watchlist_and_weekly_report(self):
+        from datetime import datetime
+        from openpyxl import load_workbook
+
+        workbook_path = self.store.export_dir.parent / "operations-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        note = {
+            "noteId": "operations123456", "title": "重点观察测试帖", "author": "测试作者",
+            "content": "有人反馈价格和推销问题", "url": "https://www.xiaohongshu.com/explore/operations123456",
+            "keyword": "origani", "detailRead": True, "likeCount": 1,
+        }
+        self.store.confirm(note)
+        original = {"commentId": "operations-comment-1", "author": "用户甲", "content": "价格多少", "publishedAt": "08-26"}
+        self.store.upsert_comments({
+            "noteId": note["noteId"], "comments": [original], "expectedCount": 1, "status": "likely_complete"
+        })
+        self.store._sync_pull_to_xlsx(note, [original], {"folder": "", "files": []})
+
+        watched = self.store.set_watchlist({
+            "noteId": note["noteId"], "watched": True, "priority": "high", "reason": "价格投诉"
+        })
+        self.assertTrue(watched["watched"])
+        self.assertEqual(1, self.store.list_watchlist()["count"])
+        self.assertTrue(self.store.note_status(note["noteId"])["watched"])
+
+        run = self.store.start_sync_run({"runType": "batch", "totalNotes": 1})
+        added = {"commentId": "operations-comment-2", "author": "用户乙", "content": "被拉着推销", "publishedAt": "08-26"}
+        updated_note = {**note, "likeCount": 2}
+        synced = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": updated_note, "comments": [original, added],
+            "expectedCount": 2, "status": "likely_complete", "runId": run["runId"],
+        })
+        self.assertEqual(1, synced["newCount"])
+        self.assertEqual(2, synced["changeEventCount"])
+        self.store.finish_sync_run({
+            "runId": run["runId"], "status": "completed", "processedNotes": 1,
+            "changedNotes": 1, "newComments": 1,
+        })
+        changes = self.store.list_change_events()
+        self.assertEqual(2, changes["unread"])
+        self.assertEqual({"comment_added", "note_fields_changed"}, {item["event_type"] for item in changes["events"]})
+        self.assertEqual(2, self.store.acknowledge_change_events({"all": True})["updated"])
+        self.assertEqual(0, self.store.list_change_events()["unread"])
+
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET comment_count_collected=99 WHERE note_id=?", (note["noteId"],))
+        health = self.store.data_health()
+        mismatch = next(item for item in health["issues"] if item["id"] == "comment_count_mismatch")
+        self.assertTrue(mismatch["repairable"])
+        repaired = self.store.repair_data_health({})
+        self.assertTrue(repaired["ok"])
+        self.assertFalse(any(item["id"] == "comment_count_mismatch" for item in repaired["health"]["issues"]))
+
+        today = datetime.now().astimezone().date().isoformat()
+        report = self.store.generate_weekly_report({"startDate": today, "endDate": today})
+        self.assertTrue(Path(report["xlsxPath"]).is_file())
+        self.assertTrue(Path(report["htmlPath"]).is_file())
+        self.assertEqual(1, report["summary"]["newComments"])
+        workbook = load_workbook(report["xlsxPath"], read_only=True, data_only=True)
+        self.assertEqual({"周报总览", "新增帖子", "同步变化", "重点观察"}, set(workbook.sheetnames))
+        workbook.close()
+        self.assertTrue(self.store.latest_weekly_report()["found"])
+
+    def test_restart_cancels_legacy_sentiment_queue_and_disables_auto_flags(self):
+        note = {"noteId": "sentiment123456", "title": "旧情绪任务", "content": "正文"}
+        self.store.confirm(note)
+        self.store.upsert_comments({
+            "noteId": note["noteId"],
+            "comments": [{"commentId": "sentiment-comment-1", "author": "用户", "content": "评论"}],
+            "expectedCount": 1,
+            "status": "likely_complete",
+        })
+        self.store.ai_settings.save({"auto_analyze_posts": True, "auto_analyze_comments": True})
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET ai_analysis_status='queued' WHERE note_id=?", (note["noteId"],))
+            db.execute("UPDATE comments SET ai_analysis_status='analyzing' WHERE comment_id='sentiment-comment-1'")
+            db.execute("""INSERT INTO ai_jobs
+                       (target_type,target_id,priority,status,attempts,available_at,created_at,updated_at)
+                       VALUES ('note',?,10,'queued',0,0,'2026-08-25','2026-08-25')""", (note["noteId"],))
+            db.execute("""INSERT INTO ai_jobs
+                       (target_type,target_id,priority,status,attempts,available_at,created_at,updated_at)
+                       VALUES ('comment','sentiment-comment-1',10,'analyzing',0,0,'2026-08-25','2026-08-25')""")
+
+        reopened = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        settings = reopened.ai_settings.get(False)
+        self.assertFalse(settings["auto_analyze_posts"])
+        self.assertFalse(settings["auto_analyze_comments"])
+        with reopened._session() as db:
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM ai_jobs WHERE status IN ('queued','analyzing')"
+            ).fetchone()[0])
+            self.assertEqual("not_analyzed", db.execute(
+                "SELECT ai_analysis_status FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone()[0])
+            self.assertEqual("not_analyzed", db.execute(
+                "SELECT ai_analysis_status FROM comments WHERE comment_id='sentiment-comment-1'"
+            ).fetchone()[0])
 
 
 if __name__ == "__main__":
