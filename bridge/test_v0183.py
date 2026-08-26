@@ -5,7 +5,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from server import MonitorStore, audit_reply_candidate, classify_reply_context
+from server import MonitorStore, audit_reply_candidate, classify_reply_context, replace_with_retry
 
 
 class MediaHandler(BaseHTTPRequestHandler):
@@ -247,6 +247,44 @@ class V0183Tests(unittest.TestCase):
             refreshed = self.store._excel_note_artifacts(note_id)
             self.assertEqual(["image-01.jpg", "image-02.jpg"], refreshed[1])
             self.assertEqual(2, mocked_load.call_count)
+
+    def test_atomic_replace_retries_transient_wps_lock(self):
+        from unittest.mock import patch
+        source = Path(self.tmp.name) / "source.xlsx"
+        target = Path(self.tmp.name) / "target.xlsx"
+        source.write_bytes(b"new")
+        target.write_bytes(b"old")
+        with patch("server.os.replace", side_effect=[PermissionError("busy"), PermissionError("busy"), None]) as replace, \
+             patch("server.time.sleep") as sleep:
+            attempts = replace_with_retry(source, target, attempts=4, initial_delay=0.01)
+        self.assertEqual(3, attempts)
+        self.assertEqual(3, replace.call_count)
+        self.assertEqual(2, sleep.call_count)
+
+    def test_open_excel_prefers_wps_and_locates_note(self):
+        import base64
+        import subprocess
+        from unittest.mock import patch
+
+        note_id = "openexcel123456"
+        workbook_path = self.store.export_dir.parent / "wps-master.xlsx"
+        self.store.seed_xlsx_path = workbook_path
+        self.store._ensure_seed_workbook(workbook_path)
+        pulled = self.store.pull_to_excel({
+            "note": {"noteId": note_id, "title": "WPS 定位测试", "content": "正文", "detailRead": True},
+            "comments": [],
+        })
+        completed = subprocess.CompletedProcess([], 0, stdout="WPS\r\n".encode("utf-16le"), stderr=b"")
+        with patch("server.subprocess.run", return_value=completed) as run:
+            result = self.store.open_local_artifact({
+                "kind": "excel", "noteId": note_id, "excelRow": pulled["excelRow"], "fieldName": "笔记标题"
+            })
+        encoded_script = run.call_args.args[0][-1]
+        script = base64.b64decode(encoded_script).decode("utf-16le")
+        self.assertLess(script.index("ket.Application"), script.index("Excel.Application"))
+        self.assertIn("$app.Goto($cell, $true)", script)
+        self.assertEqual("WPS", result["application"])
+        self.assertEqual(pulled["excelRow"], result["row"])
 
     def test_open_local_artifact_uses_hydrated_media_folder(self):
         from unittest.mock import patch

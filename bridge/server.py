@@ -40,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.0"
+VERSION = "0.23.5"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -56,6 +56,20 @@ RELEVANCE_GROUPS = {
 }
 
 _RESOLVED_RELEVANCE_GROUPS: dict[str, tuple[str, ...]] | None = None
+
+
+def replace_with_retry(source: Path, target: Path, attempts: int = 8, initial_delay: float = 0.12) -> int:
+    """Atomically replace a file, tolerating short WPS/antivirus sharing locks."""
+    total_attempts = max(1, int(attempts))
+    for attempt in range(total_attempts):
+        try:
+            os.replace(source, target)
+            return attempt + 1
+        except PermissionError:
+            if attempt + 1 >= total_attempts:
+                raise
+            time.sleep(min(initial_delay * (2 ** attempt), 1.2))
+    return total_attempts
 
 
 def _relevance_keywords_path() -> Path:
@@ -783,9 +797,9 @@ class MonitorStore:
                 workbook.close()
                 workbook = None
                 try:
-                    os.replace(temporary_path, xlsx_path)
+                    replace_with_retry(temporary_path, xlsx_path)
                 except PermissionError as exc:
-                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试") from exc
+                    raise ValueError("WPS/Excel 持续占用总表，请关闭表格窗口后重试") from exc
                 temporary_path = None
                 return True
             finally:
@@ -1712,9 +1726,9 @@ class MonitorStore:
             workbook.close()
             workbook = None
             try:
-                os.replace(temporary_path, xlsx_path)
+                replace_with_retry(temporary_path, xlsx_path)
             except PermissionError as exc:
-                raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试更新评论") from exc
+                raise ValueError("WPS/Excel 持续占用总表，请关闭表格窗口后重试更新评论") from exc
             temporary_path = None
             return deleted
         finally:
@@ -2033,7 +2047,7 @@ class MonitorStore:
                    "发布时间", "来源词", "笔记ID", "博主ID", "评论数量", "相关性状态", "AI判断来源",
                    "AI置信度", "AI判断理由", "分析时间", "评论内容汇总"]
         temporary_path = xlsx_path.with_name(f".{xlsx_path.stem}.irrelevant-{os.getpid()}.tmp{xlsx_path.suffix}")
-        with self.lock:
+        with self.pull_lock:
             workbook = load_workbook(xlsx_path)
             try:
                 sheet = workbook["sheet3_不相关帖子"] if "sheet3_不相关帖子" in workbook.sheetnames else workbook.create_sheet("sheet3_不相关帖子")
@@ -2069,7 +2083,7 @@ class MonitorStore:
                 workbook.save(temporary_path)
             finally:
                 workbook.close()
-            os.replace(temporary_path, xlsx_path)
+            replace_with_retry(temporary_path, xlsx_path)
         return {"path": str(xlsx_path), "sheet": "sheet3_不相关帖子", "row": target_row}
 
     def analyze_relevance(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4144,10 +4158,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             workbook.close()
             workbook = None
             try:
-                os.replace(temporary_path, xlsx_path)
+                replace_with_retry(temporary_path, xlsx_path)
             except PermissionError as exc:
                 raise ValueError(
-                    "Excel 总表正被占用（可能已在 Excel 中打开），写入被拒绝。"
+                    "WPS/Excel 持续占用总表，写入被拒绝。"
                     "请关闭该文件后重试；数据已在本地保存，不会丢失。"
                 ) from exc
             temporary_path = None
@@ -4285,9 +4299,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 workbook.close()
                 workbook = None
                 try:
-                    os.replace(temporary_path, xlsx_path)
+                    replace_with_retry(temporary_path, xlsx_path)
                 except PermissionError as exc:
-                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试") from exc
+                    raise ValueError("WPS/Excel 持续占用总表，请关闭表格窗口后重试") from exc
                 temporary_path = None
                 with self.lock, self._session() as db:
                     for item in normalized:
@@ -4498,9 +4512,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                         f".{xlsx_path.stem}.delete-backup-{os.getpid()}-{time.time_ns()}.xlsx"
                     )
                     shutil.copy2(xlsx_path, backup_path)
-                    os.replace(temporary_path, xlsx_path)
+                    replace_with_retry(temporary_path, xlsx_path)
                 except PermissionError as exc:
-                    raise ValueError("Excel 总表正被占用，请关闭 Excel 后重试删除") from exc
+                    raise ValueError("WPS/Excel 持续占用总表，请关闭表格窗口后重试删除") from exc
                 temporary_path = None
 
                 with self.lock, self._session() as db:
@@ -4568,7 +4582,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         sheet_name = "sheet1_笔记总表" if target_type == "note" else "sheet2_评论总表"
         id_header = "笔记ID" if target_type == "note" else "笔记评论ID"
         temporary_path: Path | None = None
-        with self.lock:
+        with self.pull_lock:
             workbook = load_workbook(xlsx_path)
             try:
                 if sheet_name not in workbook.sheetnames:
@@ -4599,9 +4613,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 workbook.close()
             if temporary_path and temporary_path.exists():
                 try:
-                    os.replace(temporary_path, xlsx_path)
+                    replace_with_retry(temporary_path, xlsx_path)
                 except PermissionError:
-                    print(f"[bridge] Excel 总表被占用，AI 情绪回写跳过：{xlsx_path}", flush=True)
+                    print(f"[bridge] WPS/Excel 持续占用总表，AI 情绪回写跳过：{xlsx_path}", flush=True)
 
     def pull_to_excel(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Serialize and deduplicate one complete pull transaction."""
@@ -4806,23 +4820,40 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         script = f"""
 $ErrorActionPreference = 'Stop'
 $path = [System.IO.Path]::GetFullPath('{ps_quote(str(xlsx_path))}')
-try {{ $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application') }}
-catch {{ $excel = New-Object -ComObject Excel.Application }}
-$book = $null
-foreach ($candidate in $excel.Workbooks) {{
-  if ([System.String]::Equals([System.IO.Path]::GetFullPath($candidate.FullName), $path, [System.StringComparison]::OrdinalIgnoreCase)) {{ $book = $candidate; break }}
+$sheetName = '{ps_quote(sheet_name)}'
+$rowNumber = {excel_row}
+$columnNumber = {excel_column}
+$openedWith = $null
+$errors = @()
+foreach ($candidateApp in @(
+  @{{ ProgId = 'ket.Application'; Name = 'WPS' }},
+  @{{ ProgId = 'Excel.Application'; Name = 'Excel' }}
+)) {{
+  try {{
+    try {{ $app = [Runtime.InteropServices.Marshal]::GetActiveObject($candidateApp.ProgId) }}
+    catch {{ $app = New-Object -ComObject $candidateApp.ProgId }}
+    $book = $null
+    foreach ($candidate in $app.Workbooks) {{
+      if ([System.String]::Equals([System.IO.Path]::GetFullPath($candidate.FullName), $path, [System.StringComparison]::OrdinalIgnoreCase)) {{ $book = $candidate; break }}
+    }}
+    if ($null -eq $book) {{ $book = $app.Workbooks.Open($path) }}
+    $app.Visible = $true
+    $app.WindowState = -4137
+    $book.Activate()
+    $sheet = $book.Worksheets.Item($sheetName)
+    $sheet.Activate()
+    $cell = $sheet.Cells.Item($rowNumber, $columnNumber)
+    $cell.Select()
+    $app.Goto($cell, $true)
+    $app.UserControl = $true
+    $openedWith = $candidateApp.Name
+    break
+  }} catch {{
+    $errors += ($candidateApp.Name + ': ' + $_.Exception.Message)
+  }}
 }}
-if ($null -eq $book) {{ $book = $excel.Workbooks.Open($path) }}
-$excel.Visible = $true
-$excel.WindowState = -4143
-$book.Activate()
-$sheet = $book.Worksheets.Item('{ps_quote(sheet_name)}')
-$sheet.Activate()
-$cell = $sheet.Cells.Item({excel_row}, {excel_column})
-$cell.Select()
-$excel.Goto($cell, $true)
-$excel.UserControl = $true
-Write-Output 'OK'
+if ($null -eq $openedWith) {{ throw ($errors -join ' | ') }}
+Write-Output $openedWith
 """
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         try:
@@ -4837,18 +4868,21 @@ Write-Output 'OK'
             check=False,
             )
         except subprocess.TimeoutExpired as error:
-            raise ValueError("Excel 启动超时，请关闭残留的 Excel 弹窗后重试") from error
+            raise ValueError("WPS/Excel 启动超时，请关闭残留的表格弹窗后重试") from error
         if completed.returncode != 0:
             raw_error = completed.stderr or completed.stdout or b""
             try:
                 detail = raw_error.decode("utf-16le", errors="ignore").strip()
             except AttributeError:
                 detail = str(raw_error).strip()
-            detail = detail[-500:] if detail else "Excel COM 调用失败"
-            raise ValueError(f"Excel 打开失败：{detail}")
+            detail = detail[-500:] if detail else "WPS/Excel COM 调用失败"
+            raise ValueError(f"WPS/Excel 打开失败：{detail}")
+        output = (completed.stdout or b"").decode("utf-16le", errors="ignore").strip()
+        opened_with = next((line.strip() for line in reversed(output.splitlines()) if line.strip() in {"WPS", "Excel"}), "WPS")
         return {
             "ok": True,
             "kind": "excel",
+            "application": opened_with,
             "target": str(xlsx_path),
             "sheet": sheet_name,
             "row": excel_row,
