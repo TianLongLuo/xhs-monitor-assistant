@@ -6,6 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from data_relationships import repair_relationship_rows
 from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, replace_with_retry
 
 
@@ -268,6 +269,17 @@ class V0183Tests(unittest.TestCase):
             self.assertEqual(["image-01.jpg", "image-02.jpg"], refreshed[1])
             self.assertEqual(2, mocked_read.call_count)
 
+    def test_extension_broadcasts_delete_state_and_reconciles_unchanged_syncs(self):
+        extension = Path(__file__).resolve().parent.parent / "extension"
+        worker = (extension / "service-worker.js").read_text(encoding="utf-8")
+        content = (extension / "content.js").read_text(encoding="utf-8")
+        panel = (extension / "sidepanel.js").read_text(encoding="utf-8")
+        self.assertIn("deletePulledNoteAndBroadcast", worker)
+        self.assertIn('type: "localNoteStateChanged"', worker)
+        self.assertIn("评论无变化，正在校准 CSV、SQLite 与素材快照", worker)
+        self.assertIn('message.type === "localNoteStateChanged"', content)
+        self.assertIn('message.type === "localNoteStateChanged"', panel)
+
     def test_powershell_output_decoder_accepts_utf8_and_utf16(self):
         self.assertEqual("WPS|True\r\n", _decode_powershell_output(b"WPS|True\r\n"))
         self.assertEqual("WPS|True\r\n", _decode_powershell_output("WPS|True\r\n".encode("utf-16le")))
@@ -453,6 +465,143 @@ class V0183Tests(unittest.TestCase):
         comment_ids = {row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
         self.assertNotIn(note_id, note_ids)
         self.assertNotIn(comment["commentId"], comment_ids)
+
+    def test_relationship_repair_rebuilds_fragments_and_marks_orphans(self):
+        known_id = "knownnote123"
+        orphan_id = "orphannote123"
+        notes = [
+            {"笔记ID": known_id, "笔记url": f"https://www.xiaohongshu.com/explore/{known_id}", "笔记标题": "有效帖子"},
+            {"笔记ID": "", "笔记url": f"https://www.xiaohongshu.com/explore/{known_id}", "笔记标题": ""},
+        ]
+        logical = [
+            {"原笔记url": f"https://www.xiaohongshu.com/explore/{known_id}", "用户昵称": "甲",
+             "评论内容": "完整保留一", "评论时间": "08-27", "评论层级": "1级评论", "点赞量": "1",
+             "是否帖主评论": "否", "帖子用户主页url": "https://example.com/a", "文件夹内清单": "a.jpg"},
+            {"原笔记url": f"https://www.xiaohongshu.com/explore/{orphan_id}", "用户昵称": "乙",
+             "评论内容": "完整保留二", "评论时间": "08-27", "评论层级": "2级评论", "点赞量": "0",
+             "是否帖主评论": "否", "帖子用户主页url": "https://example.com/b", "文件夹内清单": "b.jpg"},
+        ]
+        fragmented = []
+        for source in logical:
+            for name in ("原笔记url", "帖子用户主页url", "用户昵称", "评论内容", "评论时间",
+                         "是否帖主评论", "点赞量", "评论层级", "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断"):
+                fragmented.append({name: source.get(name) or ("中立" if name == "AI情绪判断" else "素材" if name == "对应帖子文件夹地址" else "")})
+        result = repair_relationship_rows(notes, fragmented, NOTE_CSV_HEADERS, COMMENT_CSV_HEADERS)
+        self.assertEqual(1, len(result["noteRows"]))
+        self.assertEqual(2, len(result["commentRows"]))
+        self.assertEqual(2, result["summary"]["fragmentedCommentsRebuilt"])
+        self.assertEqual(2, result["summary"]["generatedCommentIds"])
+        self.assertEqual(1, result["summary"]["mappingReviewComments"])
+        self.assertEqual({"完整保留一", "完整保留二"}, {row["评论内容"] for row in result["commentRows"]})
+        self.assertEqual(2, len({row["笔记评论ID"] for row in result["commentRows"]}))
+        orphan = next(row for row in result["commentRows"] if row["笔记ID"] == orphan_id)
+        self.assertEqual("待复核", orphan["映射状态"])
+
+    def test_relationship_repair_unions_csv_sqlite_and_material_comments(self):
+        notes_path, comments_path = self._configure_csv("repair-union")
+        note = {"noteId": "repairunion123", "title": "关系修复", "content": "正文",
+                "url": "https://www.xiaohongshu.com/explore/repairunion123", "detailRead": True}
+        self.store.confirm(note)
+        folder = Path(self.tmp.name) / "posts_materials" / "repairunion123"
+        folder.mkdir(parents=True)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=?,source='existing_xlsx',pull_status='synced' WHERE note_id=?",
+                       (str(folder), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [], {"folder": str(folder), "files": []})
+        self.store.upsert_comments({
+            "noteId": note["noteId"], "status": "partial",
+            "comments": [{"commentId": "db-only-comment", "author": "数据库", "content": "数据库独有"}],
+        })
+        (folder / "comments.json").write_text(json.dumps([
+            {"commentId": "material-only-comment", "noteId": note["noteId"],
+             "author": "素材", "content": "素材独有", "commentLevel": 1}
+        ], ensure_ascii=False), encoding="utf-8")
+        legacy = {"原笔记url": note["url"], "用户昵称": "历史", "评论内容": "CSV 独有",
+                  "评论时间": "08-27", "评论层级": "1级评论"}
+        self.store._replace_csv_table(comments_path, COMMENT_CSV_HEADERS, [legacy], "legacy")
+
+        result = self.store.repair_csv_relationships({})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(3, result["summary"]["commentsAfterUnion"])
+        rows = self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
+        self.assertEqual(3, len(rows))
+        self.assertTrue(all(row["笔记ID"] == note["noteId"] for row in rows))
+        self.assertTrue(all(row["笔记评论ID"] for row in rows))
+        with self.store._session() as db:
+            self.assertEqual(3, db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note["noteId"],)).fetchone()[0])
+        material = json.loads((folder / "comments.json").read_text(encoding="utf-8"))
+        self.assertEqual({row["笔记评论ID"] for row in rows}, {item["commentId"] for item in material})
+        self.assertTrue(result["health"]["summary"]["relationshipsConsistent"])
+
+    def test_relationship_repair_splits_shared_material_directories(self):
+        self._configure_csv("shared-material")
+        shared = Path(self.tmp.name) / "posts_materials" / "共享目录"
+        shared.mkdir(parents=True)
+        (shared / "image-01.jpg").write_bytes(b"shared-image")
+        notes = [
+            {"noteId": "sharednote123", "title": "共享甲", "content": "甲正文",
+             "url": "https://www.xiaohongshu.com/explore/sharednote123", "detailRead": True},
+            {"noteId": "sharednote456", "title": "共享乙", "content": "乙正文",
+             "url": "https://www.xiaohongshu.com/explore/sharednote456", "detailRead": True},
+        ]
+        for index, note in enumerate(notes, 1):
+            comment = {"commentId": f"shared-comment-{index}", "author": f"用户{index}",
+                       "content": f"评论{index}", "commentLevel": 1}
+            self.store.confirm(note)
+            with self.store._session() as db:
+                db.execute("UPDATE notes SET media_dir=?,source='existing_xlsx',pull_status='synced' WHERE note_id=?",
+                           (str(shared), note["noteId"]))
+            self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+            self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(shared), "files": ["image-01.jpg"]})
+
+        result = self.store.repair_csv_relationships({})
+
+        self.assertEqual(2, result["summary"]["sharedMediaRecordsSplit"])
+        with self.store._session() as db:
+            paths = [Path(row[0]) for row in db.execute(
+                "SELECT media_dir FROM notes WHERE note_id IN ('sharednote123','sharednote456') ORDER BY note_id"
+            ).fetchall()]
+        self.assertEqual(2, len({str(path) for path in paths}))
+        self.assertFalse(shared.exists())
+        for index, path in enumerate(paths, 1):
+            self.assertTrue((path / "image-01.jpg").is_file())
+            comments = json.loads((path / "comments.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, len(comments))
+        self.assertTrue(result["health"]["summary"]["relationshipsConsistent"])
+
+    def test_no_change_sync_reconciles_csv_sqlite_and_material_snapshot(self):
+        notes_path, comments_path = self._configure_csv("all-stores")
+        note = {"noteId": "allstores123", "title": "全部本地同步", "content": "正文",
+                "url": "https://www.xiaohongshu.com/explore/allstores123", "detailRead": True}
+        comment = {"commentId": "allstores-comment", "author": "用户", "content": "没有变化",
+                   "publishedAt": "08-27", "commentLevel": 1, "likeCount": 1}
+        self.store.confirm(note)
+        folder = Path(self.tmp.name) / "posts_materials" / "allstores123"
+        folder.mkdir(parents=True)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=?,source='existing_xlsx',pull_status='synced' WHERE note_id=?",
+                       (str(folder), note["noteId"]))
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment],
+                                    "expectedCount": 1, "status": "likely_complete"})
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(folder), "files": []})
+        headers, _rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        self.store._replace_csv_table(comments_path, headers, [], "simulate-drift")
+
+        result = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [comment],
+            "expectedCount": 1, "status": "likely_complete",
+        })
+
+        self.assertTrue(result["consistencyVerified"])
+        self.assertEqual(0, result["newCount"])
+        csv_rows = self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
+        self.assertEqual(["allstores-comment"], [row["笔记评论ID"] for row in csv_rows])
+        self.assertEqual("allstores123", csv_rows[0]["笔记ID"])
+        material = json.loads((folder / "comments.json").read_text(encoding="utf-8"))
+        self.assertEqual(["allstores-comment"], [row["commentId"] for row in material])
+        health = self.store.data_health()
+        self.assertTrue(health["summary"]["relationshipsConsistent"])
 
     def test_wps_gb18030_csv_is_normalized_without_row_loss(self):
         notes_path = Path(self.tmp.name) / "品牌_笔记总表.csv"

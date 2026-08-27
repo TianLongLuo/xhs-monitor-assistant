@@ -2197,6 +2197,16 @@ document.addEventListener("visibilitychange", () => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "localNoteStateChanged") {
+    if (message.noteId && currentDetailNote?.noteId === message.noteId) {
+      currentDetailNote = message.deleted
+        ? { ...currentDetailNote, inExcel: false, pullStatus: "not_started", status: "new" }
+        : { ...currentDetailNote, inExcel: true, pullStatus: message.pullStatus || "synced", status: "known" };
+      if (!ballMode) renderCurrentDetail(currentDetailNote, false);
+    }
+    if (!ballMode) Promise.all([refreshStats(), refreshPending(), loadPageInfo()]).catch(() => {});
+    return false;
+  }
   if (ballMode) {
     if (message.type === "batchCommentSyncProgress") updateCompactFloatingState(message);
     return false;

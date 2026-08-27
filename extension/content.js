@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.24.1";
+  const CONTENT_VERSION = "0.25.0";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -1736,8 +1736,23 @@
       const result = await sendRuntime({ type: "auditCurrentNoteComments", note });
       if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
       const syncChanges = renderCommentChanges(panel, result);
-      if (result.hasChanges && syncChanges) await syncChanges(true);
-      else panel._commentAuditDone = true;
+      if (result.hasChanges && syncChanges) {
+        await syncChanges(true);
+      } else {
+        const response = await sendRuntime({
+          type: "syncCurrentNoteComments",
+          noteId: note.noteId,
+          snapshot: result.snapshot
+        });
+        if (!response?.ok || !response.consistencyVerified) {
+          throw new Error(response?.error || "本地数据一致性校验失败");
+        }
+        setProcessLatest(panel);
+        const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+        if (status) status.textContent = "评论无变化；CSV、SQLite 与素材快照已校准";
+        panel._commentAuditDone = true;
+        panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
+      }
     } catch (error) {
       panel._commentAuditStarted = false;
       panel._commentAuditError = error?.message || "评论对比失败";
@@ -2728,6 +2743,38 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === "localNoteStateChanged") {
+      const noteId = clean(message.noteId, 128);
+      if (!noteId) return false;
+      const note = { ...(processPanel?._processNote || {}), noteId };
+      const freshStatus = message.deleted
+        ? { ...message, noteId, found: false, inExcel: false, status: "new", pullStatus: "not_started" }
+        : { ...message, noteId, found: true, inExcel: true, status: "known",
+            pullStatus: message.pullStatus || "synced" };
+      applyFreshStatusToCard(note, freshStatus);
+      invalidateScanStatusCache(noteId, freshStatus);
+      if (processPanel?.dataset.noteId === noteId) {
+        processPanel._statusFetchedAt = 0;
+        if (message.deleted) {
+          processPanel._commentAuditStarted = false;
+          processPanel._commentAuditDone = false;
+        }
+        const pulled = !message.deleted && Boolean(freshStatus.inExcel);
+        const pullLabel = pulled ? (freshStatus.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
+        const pull = processPanel.querySelector(`.${PROCESS_PANEL_CLASS}__state--pull`);
+        const headPull = processPanel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+        const status = processPanel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+        if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
+        if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = pulled ? "pulled" : "missing"; }
+        if (status) status.textContent = message.deleted
+          ? "本地帖子已删除，可重新拉取"
+          : "CSV、SQLite 与素材快照已同步";
+        refreshProcessPanelStatus(processPanel, note).catch(() => {});
+      }
+      scheduleScan(60);
+      sendResponse({ ok: true, noteId, applied: true });
+      return false;
+    }
     if (message.type === "hydrateProcessPanel") {
       const statusResult = message.status || {};
       const note = { ...(message.note || {}), ...(statusResult.note || {}) };

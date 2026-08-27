@@ -37,11 +37,13 @@ from urllib.request import Request, urlopen
 
 try:
     from .ai_support import AIServiceError, AISettingsStore, DeepSeekClient
+    from .data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
+    from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.24.1"
+VERSION = "0.25.0"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -49,9 +51,9 @@ NOTE_CSV_HEADERS = [
     "文件夹内清单", "AI情绪判断", "帖子好坏", "访问状态",
 ]
 COMMENT_CSV_HEADERS = [
-    "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
+    "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
     "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
-    "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断",
+    "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "映射状态", "映射备注",
 ]
 CSV_ENCODING = "utf-8-sig"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
@@ -345,7 +347,18 @@ def bool_value(value: Any) -> bool:
 
 
 def sentiment_label(value: Any) -> str:
-    return SENTIMENT_LABELS.get(text(value, 40).lower(), "待复核")
+    raw = text(value, 40)
+    if raw in set(SENTIMENT_LABELS.values()):
+        return raw
+    return SENTIMENT_LABELS.get(raw.lower(), "待复核")
+
+
+def sentiment_code(value: Any) -> str:
+    raw = text(value, 40)
+    if not raw:
+        return ""
+    reverse = {label: code for code, label in SENTIMENT_LABELS.items()}
+    return reverse.get(raw, raw.lower() if raw.lower() in SENTIMENTS else "uncertain")
 
 
 def url_score(value: Any) -> int:
@@ -750,6 +763,13 @@ class MonitorStore:
 
             note_headers, note_rows = extract("sheet1_笔记总表", NOTE_CSV_HEADERS)
             comment_headers, comment_rows = extract("sheet2_评论总表", COMMENT_CSV_HEADERS)
+            relationship_repair = repair_relationship_rows(
+                note_rows, comment_rows, note_headers, comment_headers
+            )
+            note_headers = relationship_repair["noteHeaders"]
+            comment_headers = relationship_repair["commentHeaders"]
+            note_rows = relationship_repair["noteRows"]
+            comment_rows = relationship_repair["commentRows"]
             legacy_archive: list[tuple[str, int, str]] = []
             for sheet in workbook.worksheets:
                 if sheet.title in {"sheet1_笔记总表", "sheet2_评论总表"}:
@@ -765,6 +785,7 @@ class MonitorStore:
             workbook.close()
 
         migrated_at = now_iso()
+        migration_repair_id = f"xlsx-migration:{source}:{migrated_at}"
         with self.lock, self._session() as db:
             db.execute("DELETE FROM legacy_sheet_archive WHERE source_path=?", (str(source),))
             db.executemany(
@@ -776,6 +797,13 @@ class MonitorStore:
             archived_count = int(db.execute(
                 "SELECT COUNT(*) FROM legacy_sheet_archive WHERE source_path=?", (str(source),)
             ).fetchone()[0])
+            for archived in relationship_repair.get("archives") or []:
+                db.execute(
+                    """INSERT OR REPLACE INTO data_repair_archive
+                       (repair_id,source_name,row_number,reason,row_json,archived_at) VALUES(?,?,?,?,?,?)""",
+                    (migration_repair_id, archived["source"], int(archived["rowNumber"]),
+                     archived["reason"], json.dumps(archived["row"], ensure_ascii=False), migrated_at),
+                )
         if archived_count != len(legacy_archive):
             raise ValueError("旧版附加 Sheet 归档校验失败，XLSX 已保留")
 
@@ -942,8 +970,8 @@ class MonitorStore:
                     last_ai_analyzed_at TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(note_id) REFERENCES notes(note_id)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_comments_identity_full
-                    ON comments(note_id, author, content, published_at);
+                CREATE INDEX IF NOT EXISTS idx_comments_identity_full
+                    ON comments(note_id, author, content, published_at, parent_comment_id);
                 CREATE INDEX IF NOT EXISTS idx_comments_note ON comments(note_id, first_seen_at);
                 CREATE INDEX IF NOT EXISTS idx_comments_negative ON comments(is_negative, ai_confidence);
 
@@ -1089,8 +1117,24 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_legacy_sheet_archive_sheet
                     ON legacy_sheet_archive(sheet_name, row_number);
+
+                CREATE TABLE IF NOT EXISTS data_repair_archive (
+                    repair_id TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    row_number INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    row_json TEXT NOT NULL,
+                    archived_at TEXT NOT NULL,
+                    PRIMARY KEY(repair_id, source_name, row_number, reason)
+                );
+                CREATE INDEX IF NOT EXISTS idx_data_repair_archive_repair
+                    ON data_repair_archive(repair_id, source_name, row_number);
                 """
             )
+            # Older builds used an identity-only UNIQUE index and could merge
+            # distinct comments that happened to share author/text/time.
+            db.execute("DROP INDEX IF EXISTS idx_comments_identity_full")
+            db.execute("CREATE INDEX idx_comments_identity_full ON comments(note_id,author,content,published_at,parent_comment_id)")
 
             # Backfill identity keys for databases created before content-based
             # matching was introduced.
@@ -1458,6 +1502,7 @@ class MonitorStore:
             if not retired:
                 print(f"[bridge] CSV 迁移已完成；旧 XLSX 尚有未保存内容或仍被占用，暂不强制删除：{source}", flush=True)
             self._seed_from_csv(notes_path)
+            self.repair_csv_relationships({"source": "legacy_xlsx_migration"})
             return inserted
         notes_path, comments_path = self.configure_data_files(source)
         self._ensure_seed_workbook(notes_path)
@@ -1976,15 +2021,17 @@ class MonitorStore:
                     "SELECT comment_id, content_hash FROM comments WHERE comment_id = ?",
                     (comment_id,),
                 ).fetchone()
-                if existing is None:
+                if existing is None and not supplied_id:
                     existing = db.execute(
-                        "SELECT comment_id, content_hash FROM comments WHERE note_id=? AND author=? AND content=? AND published_at=? LIMIT 1",
-                        (note_id, author, content, published_at),
+                        """SELECT comment_id,content_hash FROM comments
+                           WHERE note_id=? AND author=? AND content=? AND published_at=? AND parent_comment_id=? LIMIT 1""",
+                        (note_id, author, content, published_at, parent_comment_id),
                     ).fetchone()
-                if existing is None and not published_at:
+                if existing is None and not supplied_id and not published_at:
                     existing = db.execute(
-                        "SELECT comment_id, content_hash FROM comments WHERE note_id=? AND author=? AND content=? LIMIT 1",
-                        (note_id, author, content),
+                        """SELECT comment_id,content_hash FROM comments
+                           WHERE note_id=? AND author=? AND content=? AND parent_comment_id=? LIMIT 1""",
+                        (note_id, author, content, parent_comment_id),
                     ).fetchone()
                 if existing:
                     stored_id = str(existing["comment_id"])
@@ -2229,7 +2276,7 @@ class MonitorStore:
         kept: list[dict[str, Any]] = []
         deleted = 0
         for row in rows:
-            belongs = note_url_identity(row.get("原笔记url")) == note_id
+            belongs = csv_comment_note_id(row) == note_id
             row_id = text(row.get("笔记评论ID"), 256)
             row_key = (text(row.get("用户昵称"), 500), text(row.get("评论内容"), 8000),
                        text(row.get("评论时间"), 100))
@@ -2251,6 +2298,7 @@ class MonitorStore:
             raise ValueError("comments must be an array")
         with self.pull_lock:
             comparison = self.compare_comments(payload)
+            comments = self._normalize_snapshot_comments(note_id, comments)
             with self.lock, self._session() as db:
                 stored = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
             if stored is None:
@@ -2276,15 +2324,20 @@ class MonitorStore:
                 "status": text(payload.get("status"), 30) or "partial",
                 "collectedAt": now_iso(),
             })
-            xlsx_result = self._sync_pull_to_xlsx(note, comments, media_result)
+            xlsx_result = self._sync_pull_to_xlsx(
+                note, comments, media_result, replace_comments=bool(comparison["canPrune"])
+            )
             removed = comparison["removedComments"] if comparison["canPrune"] else []
-            excel_removed = self._delete_comment_rows_from_xlsx(note_id, removed)
-            removed_ids = [text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)]
+            excel_removed = int(xlsx_result.get("commentRemoved", 0) or 0)
+            current_ids = [text(item.get("commentId"), 256) for item in comments if text(item.get("commentId"), 256)]
             with self.lock, self._session() as db:
-                if removed_ids:
-                    placeholders = ",".join("?" for _ in removed_ids)
-                    db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id IN ({placeholders})",
-                               (note_id, *removed_ids))
+                if comparison["canPrune"]:
+                    if current_ids:
+                        placeholders = ",".join("?" for _ in current_ids)
+                        db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id NOT IN ({placeholders})",
+                                   (note_id, *current_ids))
+                    else:
+                        db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
                 count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
                 checked_at = now_iso()
                 db.execute(
@@ -2304,8 +2357,10 @@ class MonitorStore:
                      text(note.get("url"), 4000), text(note.get("url"), 4000),
                      json.dumps(note, ensure_ascii=False), checked_at, note_id),
                 )
+            all_local_comments = self._comments_as_api(note_id)
             if media_dir:
-                self._write_media_comments(media_result, comments)
+                self._write_media_snapshot(media_result, note, all_local_comments)
+            consistency = self._verify_note_store_consistency(note_id, media_dir)
             change_result = self._record_comment_change_events(
                 note_id,
                 comparison,
@@ -2324,6 +2379,8 @@ class MonitorStore:
                 "changedCount": comparison["changedCount"], "collectedCount": count,
                 "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
                 "excelRemoved": excel_removed, "canPrune": comparison["canPrune"],
+                "storesSynced": ["notes_csv", "comments_csv", "sqlite"] + (["materials"] if media_dir else []),
+                "consistencyVerified": True, "consistency": consistency,
                 "runId": note_change_result.get("runId") or change_result.get("runId", 0),
                 "changeEventCount": int(change_result.get("eventCount", 0)) + int(note_change_result.get("eventCount", 0)),
                 "noteChanged": bool(comparison.get("noteChanged")),
@@ -2352,7 +2409,7 @@ class MonitorStore:
         with self.lock, self._session() as db:
             rows = db.execute(
                 "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT ?",
-                (note_id, max(1, min(int(limit), 2000))),
+                (note_id, max(1, min(int(limit), 10000))),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3664,7 +3721,11 @@ class MonitorStore:
                 row["note_id"] for row in note_rows
                 if row["source"] == "existing_xlsx" or row["pull_status"] in {"synced", "partial"}
             }
-            db_comment_count = int(db.execute("SELECT COUNT(*) FROM comments").fetchone()[0])
+            db_comment_rows = [dict(row) for row in db.execute(
+                "SELECT comment_id,note_id,parent_comment_id,review_status FROM comments"
+            ).fetchall()]
+            db_comment_count = len(db_comment_rows)
+            db_comment_ids = {text(row.get("comment_id"), 256) for row in db_comment_rows}
             actual_comment_counts = {
                 str(row["note_id"]): int(row["count"])
                 for row in db.execute("SELECT note_id,COUNT(*) count FROM comments GROUP BY note_id").fetchall()
@@ -3697,6 +3758,17 @@ class MonitorStore:
             if not exists:
                 (pending_media if row.get("media_status") == "partial" else missing_media).append(row["note_id"])
         review_access = [row["note_id"] for row in note_rows if row.get("access_status") == "check_failed"]
+        media_dir_owners: dict[str, list[str]] = {}
+        for row in note_rows:
+            folder = text(row.get("media_dir"), 4000)
+            if not folder:
+                continue
+            try:
+                key = str(Path(folder).resolve()).casefold()
+            except OSError:
+                key = folder.casefold()
+            media_dir_owners.setdefault(key, []).append(row["note_id"])
+        shared_media_ids = [note_id for owners in media_dir_owners.values() if len(owners) > 1 for note_id in owners]
 
         add_issue("orphan_comments", "critical", "存在孤立评论", "评论在 SQLite 中找不到所属帖子。", orphan_comments, False)
         add_issue("comment_count_mismatch", "warning", "评论计数不一致", "帖子计数与实际 SQLite 评论数量不同。",
@@ -3707,6 +3779,9 @@ class MonitorStore:
                   len(missing_media), True, missing_media)
         add_issue("media_pending_repair", "info", "素材等待补采", "数据体检已标记素材缺失；下次打开帖子时可补采。",
                   len(pending_media), False, pending_media)
+        add_issue("shared_media_directory", "critical", "多个帖子共用同一素材目录",
+                  "comments.json 会互相覆盖，必须拆分为带笔记ID的独立目录。",
+                  len(shared_media_ids), False, shared_media_ids)
         add_issue("access_review", "info", "帖子等待访问复核", "这些帖子上次未完成访问核验，不等于打不开。",
                   len(review_access), False, review_access)
         add_issue("orphan_watchlist", "warning", "观察名单存在失效引用", "观察名单关联的帖子已经不在数据库中。",
@@ -3718,18 +3793,59 @@ class MonitorStore:
             notes_path = comments_path = None
         excel_note_ids: list[str] = []
         excel_comment_rows = 0
+        csv_note_rows: list[dict[str, str]] = []
+        csv_comment_rows: list[dict[str, str]] = []
+        invalid_note_rows: list[str] = []
+        note_url_mismatches: list[str] = []
+        media_path_mismatches: list[str] = []
+        csv_comment_ids: list[str] = []
+        missing_comment_note_ids: list[str] = []
+        abnormal_comment_rows: list[str] = []
+        comment_url_mismatches: list[str] = []
+        mapping_review_ids: list[str] = []
+        unreviewed_orphan_ids: list[str] = []
+        missing_parent_ids: list[str] = []
         if not notes_path or not comments_path or not notes_path.exists() or not comments_path.exists():
             add_issue("csv_missing", "critical", "CSV 总表不存在", "当前配置路径下缺少笔记总表或评论总表。", 1, False)
         else:
             try:
                 note_headers, csv_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
                 comment_headers, csv_comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-                if "笔记ID" not in note_headers or "笔记评论ID" not in comment_headers:
-                    add_issue("csv_schema", "critical", "CSV 表头结构不完整", "缺少帖子或评论 ID 列。", 1, False)
-                else:
-                    excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
-                    excel_note_ids = [value for value in excel_note_ids if value]
-                    excel_comment_rows = len(csv_comment_rows)
+                if "笔记ID" not in note_headers or "笔记ID" not in comment_headers or "笔记评论ID" not in comment_headers:
+                    add_issue("csv_schema", "critical", "CSV 表头结构不完整", "笔记或评论表缺少明确的笔记ID/评论ID列。", 1, False)
+                excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
+                invalid_note_rows = [str(index) for index, note_id in enumerate(excel_note_ids, 2) if not note_id]
+                excel_note_ids = [value for value in excel_note_ids if value]
+                excel_comment_rows = len(csv_comment_rows)
+                db_note_by_id = {row["note_id"]: row for row in note_rows}
+                for index, row in enumerate(csv_note_rows, 2):
+                    note_id = valid_note_id(row.get("笔记ID"))
+                    url_id = note_url_identity(row.get("笔记url"))
+                    if note_id and url_id and note_id != url_id:
+                        note_url_mismatches.append(note_id)
+                    csv_media = text(row.get("对应帖子文件夹地址"), 4000)
+                    db_media = text((db_note_by_id.get(note_id) or {}).get("media_dir"), 4000)
+                    if csv_media and db_media:
+                        try:
+                            media_differs = Path(csv_media).resolve() != Path(db_media).resolve()
+                        except OSError:
+                            media_differs = csv_media.casefold() != db_media.casefold()
+                        if media_differs:
+                            media_path_mismatches.append(note_id)
+                for index, row in enumerate(csv_comment_rows, 2):
+                    explicit_note_id = valid_note_id(row.get("笔记ID"))
+                    url_id = note_url_identity(row.get("原笔记url"))
+                    comment_id = text(row.get("笔记评论ID"), 256)
+                    if comment_id:
+                        csv_comment_ids.append(comment_id)
+                    if not explicit_note_id:
+                        missing_comment_note_ids.append(comment_id or f"row:{index}")
+                    if explicit_note_id and url_id and explicit_note_id != url_id:
+                        comment_url_mismatches.append(comment_id or f"row:{index}")
+                    substantive = bool(text(row.get("用户昵称"), 500) or text(row.get("评论内容"), 8000)
+                                       or text(row.get("评论时间"), 100))
+                    if not explicit_note_id or not comment_id or not substantive:
+                        abnormal_comment_rows.append(comment_id or f"row:{index}")
             except Exception as exc:
                 add_issue("csv_read", "critical", "CSV 总表读取失败", text(exc, 500), 1, False)
 
@@ -3737,8 +3853,58 @@ class MonitorStore:
         duplicate_excel = len(excel_note_ids) - len(excel_note_set)
         missing_excel = sorted(pulled_ids - excel_note_set)
         excel_only = sorted(excel_note_set - db_note_ids)
+        csv_comment_id_set = set(csv_comment_ids)
+        duplicate_comment_ids = len(csv_comment_ids) - len(csv_comment_id_set)
+        if csv_comment_rows:
+            ids_by_note: dict[str, set[str]] = {}
+            for row in csv_comment_rows:
+                note_id = csv_comment_note_id(row)
+                comment_id = text(row.get("笔记评论ID"), 256)
+                if note_id and comment_id:
+                    ids_by_note.setdefault(note_id, set()).add(comment_id)
+            for row in csv_comment_rows:
+                note_id = csv_comment_note_id(row)
+                comment_id = text(row.get("笔记评论ID"), 256)
+                if note_id and note_id not in excel_note_set:
+                    if text(row.get("映射状态"), 40) == "待复核":
+                        mapping_review_ids.append(comment_id or note_id)
+                    else:
+                        unreviewed_orphan_ids.append(comment_id or note_id)
+                parent_id = text(row.get("父评论ID"), 256)
+                if note_id and parent_id and parent_id not in ids_by_note.get(note_id, set()):
+                    missing_parent_ids.append(comment_id or parent_id)
+        csv_missing_db = sorted(csv_comment_id_set - db_comment_ids)
+        db_missing_csv = sorted(db_comment_ids - csv_comment_id_set)
+        add_issue("csv_invalid_note_rows", "critical", "笔记 CSV 存在无有效 ID 的行",
+                  "无法建立稳定外键；重复空 ID 行也会造成界面状态误判。",
+                  len(invalid_note_rows), False, invalid_note_rows)
+        add_issue("csv_note_url_mismatch", "critical", "笔记 ID 与保存 URL 串帖",
+                  "笔记行 URL 中的 ID 与笔记ID不同。", len(note_url_mismatches), False, note_url_mismatches)
+        add_issue("csv_sqlite_media_path_mismatch", "warning", "CSV 与 SQLite 素材路径不一致",
+                  "同一帖子必须指向同一个受管素材目录。", len(media_path_mismatches), False, media_path_mismatches)
         add_issue("csv_duplicate_notes", "critical", "CSV 存在重复帖子行", "同一笔记 ID 在笔记总表重复出现。",
                   duplicate_excel, False)
+        add_issue("csv_comment_missing_note_id", "critical", "评论缺少明确笔记ID",
+                  "评论不能只依赖 URL 推断所属帖子。", len(missing_comment_note_ids), False, missing_comment_note_ids)
+        add_issue("csv_abnormal_comment_rows", "critical", "评论 CSV 存在拆行或异常行",
+                  "评论必须同时具备笔记ID、稳定评论ID及至少一个正文/作者/时间字段。",
+                  len(abnormal_comment_rows), False, abnormal_comment_rows)
+        add_issue("csv_duplicate_comment_ids", "critical", "评论 ID 重复",
+                  "同一个评论ID对应多行，无法保证幂等同步。", duplicate_comment_ids, False)
+        add_issue("csv_comment_url_mismatch", "warning", "评论笔记ID与原笔记 URL 不一致",
+                  "同步时可能写入错误帖子。", len(comment_url_mismatches), False, comment_url_mismatches)
+        add_issue("csv_orphan_comments", "critical", "评论指向笔记总表之外的帖子",
+                  "未标记待复核的评论外键找不到笔记 CSV 行。",
+                  len(unreviewed_orphan_ids), False, unreviewed_orphan_ids)
+        add_issue("comment_mapping_review", "info", "评论映射等待人工复核",
+                  "评论已完整保留，但所属帖子尚未进入笔记总表，不会自动删除。",
+                  len(mapping_review_ids), False, mapping_review_ids)
+        add_issue("csv_sqlite_comment_gap", "critical", "评论 CSV 与 SQLite ID 集合不一致",
+                  f"CSV 独有 {len(csv_missing_db)} 条，SQLite 独有 {len(db_missing_csv)} 条。",
+                  len(csv_missing_db) + len(db_missing_csv), False, [*csv_missing_db, *db_missing_csv])
+        add_issue("comment_parent_missing", "info", "部分二级评论缺少本地主评论",
+                  "父评论可能未在页面加载；保留二级评论并等待后续同步补全。",
+                  len(missing_parent_ids), False, missing_parent_ids)
         add_issue("pulled_missing_csv", "critical", "已拉取帖子未写入 CSV", "SQLite 标记已拉取，但笔记 CSV 找不到对应帖子行。",
                   len(missing_excel), False, missing_excel)
         add_issue("csv_missing_sqlite", "warning", "CSV 帖子未进入 SQLite", "重新载入 CSV 可修复本地索引。",
@@ -3754,7 +3920,16 @@ class MonitorStore:
                 "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
                 "csvNotes": len(excel_note_ids), "csvComments": excel_comment_rows,
                 "excelNotes": len(excel_note_ids), "excelComments": excel_comment_rows,
-                "pulledNotes": len(pulled_ids), "issueCount": len(issues),
+                "pulledNotes": len(pulled_ids),
+                "mappingReviewComments": len(mapping_review_ids),
+                "abnormalCommentRows": len(abnormal_comment_rows),
+                "csvOnlyCommentIds": len(csv_missing_db), "sqliteOnlyCommentIds": len(db_missing_csv),
+                "relationshipsConsistent": not any(item["id"] in {
+                    "csv_invalid_note_rows", "csv_note_url_mismatch", "csv_sqlite_media_path_mismatch", "csv_comment_missing_note_id",
+                    "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_url_mismatch",
+                    "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory"
+                } for item in issues),
+                "issueCount": len(issues),
                 "repairableCount": sum(1 for item in issues if item["repairable"]),
             },
         }
@@ -3805,6 +3980,341 @@ class MonitorStore:
         except Exception as exc:
             warnings.append(f"访问状态 CSV 回写失败：{text(exc, 500)}")
         return {"ok": True, "actions": actions, "warnings": warnings, "health": self.data_health()}
+
+    @staticmethod
+    def _csv_comment_to_api(row: dict[str, Any]) -> dict[str, Any]:
+        level_match = re.search(r"([123])", text(row.get("评论层级"), 30))
+        level = int(level_match.group(1)) if level_match else 1
+        return {
+            "commentId": text(row.get("笔记评论ID"), 256),
+            "noteId": csv_comment_note_id(row),
+            "parentCommentId": text(row.get("父评论ID"), 256),
+            "content": text(row.get("评论内容"), 8000),
+            "author": text(row.get("用户昵称"), 500),
+            "authorUrl": text(row.get("帖子用户主页url"), 2000),
+            "publishedAt": text(row.get("评论时间"), 100),
+            "likeCount": int(float(text(row.get("点赞量"), 30) or 0)) if re.fullmatch(r"\d+(?:\.\d+)?", text(row.get("点赞量"), 30)) else 0,
+            "replyCount": 0,
+            "commentLevel": level,
+            "isAuthor": text(row.get("是否帖主评论"), 20) == "是",
+            "sentiment": text(row.get("AI情绪判断"), 80),
+        }
+
+    @staticmethod
+    def _api_comment_to_csv(
+        item: dict[str, Any], note_id: str, note_row: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        note_row = note_row or {}
+        level = max(1, min(int(item.get("commentLevel") or item.get("comment_level") or 1), 3))
+        return {
+            "笔记ID": note_id,
+            "原笔记url": text(note_row.get("笔记url"), 4000) or f"https://www.xiaohongshu.com/explore/{note_id}",
+            "帖子用户主页url": text(item.get("authorUrl") or item.get("author_url"), 2000),
+            "笔记评论ID": text(item.get("commentId") or item.get("comment_id"), 256),
+            "用户昵称": text(item.get("author"), 500),
+            "评论内容": text(item.get("content"), 8000),
+            "评论时间": text(item.get("publishedAt") or item.get("published_at"), 100),
+            "是否帖主评论": "是" if bool_value(item.get("isAuthor")) else "否",
+            "点赞量": int(item.get("likeCount") or item.get("like_count") or 0),
+            "评论层级": f"{level}级评论",
+            "父评论ID": text(item.get("parentCommentId") or item.get("parent_comment_id"), 256),
+            "对应帖子文件夹地址": text(note_row.get("对应帖子文件夹地址"), 4000),
+            "文件夹内清单": text(note_row.get("文件夹内清单"), 50000),
+            "AI情绪判断": text(item.get("sentiment"), 80),
+            "映射状态": "已映射",
+            "映射备注": "",
+        }
+
+    def repair_csv_relationships(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Repair and reconcile notes/comments across CSV, SQLite and material snapshots."""
+        notes_path, comments_path = self._csv_paths()
+        repair_id = f"csv-relations-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        timestamp = now_iso()
+        warnings: list[str] = []
+        with self.pull_lock:
+            note_headers, raw_notes = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            comment_headers, raw_comments = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            repaired = repair_relationship_rows(
+                raw_notes, raw_comments, note_headers, comment_headers
+            )
+            note_headers = repaired["noteHeaders"]
+            comment_headers = repaired["commentHeaders"]
+            note_rows = repaired["noteRows"]
+            comment_rows = repaired["commentRows"]
+            note_by_id = {valid_note_id(row.get("笔记ID")): row for row in note_rows
+                          if valid_note_id(row.get("笔记ID"))}
+
+            with self.lock, self._session() as db:
+                db_notes = {str(row["note_id"]): dict(row) for row in db.execute("SELECT * FROM notes").fetchall()}
+                db_comments = [dict(row) for row in db.execute("SELECT * FROM comments").fetchall()]
+            for note_id, note_row in note_by_id.items():
+                stored_media = text((db_notes.get(note_id) or {}).get("media_dir"), 4000)
+                if stored_media and Path(stored_media).is_dir():
+                    note_row["对应帖子文件夹地址"] = stored_media
+                    note_row["文件夹内清单"] = "\n".join(
+                        sorted(item.name for item in Path(stored_media).iterdir() if item.is_file())
+                    )
+            material_comments: list[dict[str, Any]] = []
+            media_root = self._media_root()
+            if media_root.is_dir():
+                for material_path in media_root.rglob("comments.json"):
+                    try:
+                        loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
+                        if isinstance(loaded, list):
+                            material_comments.extend(item for item in loaded if isinstance(item, dict))
+                    except (OSError, ValueError) as exc:
+                        warnings.append(f"素材评论读取失败：{material_path.name} ({text(exc, 200)})")
+
+            ordered_ids: list[str] = []
+            by_id: dict[str, dict[str, Any]] = {}
+            for row in comment_rows:
+                comment_id = text(row.get("笔记评论ID"), 256)
+                if comment_id and comment_id not in by_id:
+                    by_id[comment_id] = row
+                    ordered_ids.append(comment_id)
+
+            def note_row_for(note_id: str) -> dict[str, Any]:
+                if note_id in note_by_id:
+                    return note_by_id[note_id]
+                stored = db_notes.get(note_id) or {}
+                return {
+                    "笔记ID": note_id,
+                    "笔记url": text(stored.get("url"), 4000) or f"https://www.xiaohongshu.com/explore/{note_id}",
+                    "对应帖子文件夹地址": text(stored.get("media_dir"), 4000),
+                    "文件夹内清单": "",
+                }
+
+            def merge_source(item: dict[str, Any], source: str) -> None:
+                note_id = valid_note_id(item.get("noteId") or item.get("note_id"))
+                comment_id = text(item.get("commentId") or item.get("comment_id"), 256)
+                if not note_id or not comment_id:
+                    return
+                incoming = self._api_comment_to_csv(item, note_id, note_row_for(note_id))
+                if source == "sqlite":
+                    try:
+                        payload = json.loads(item.get("payload_json") or "{}")
+                        if isinstance(payload, dict):
+                            payload.update({key: val for key, val in item.items() if key != "payload_json"})
+                            incoming = self._api_comment_to_csv(payload, note_id, note_row_for(note_id))
+                            incoming["笔记评论ID"] = comment_id
+                    except (TypeError, ValueError):
+                        pass
+                    if text(item.get("sentiment"), 80):
+                        incoming["AI情绪判断"] = sentiment_label(item.get("sentiment"))
+                existing = by_id.get(comment_id)
+                if existing is None:
+                    by_id[comment_id] = incoming
+                    ordered_ids.append(comment_id)
+                    return
+                for name, incoming_value in incoming.items():
+                    if not text(existing.get(name), 50000) and text(incoming_value, 50000):
+                        existing[name] = incoming_value
+
+            for row in db_comments:
+                merge_source(row, "sqlite")
+            for item in material_comments:
+                merge_source(item, "material")
+
+            merged_rows = [by_id[comment_id] for comment_id in ordered_ids]
+            merged = repair_relationship_rows(
+                note_rows, merged_rows, note_headers, comment_headers
+            )
+            note_headers = merged["noteHeaders"]
+            comment_headers = merged["commentHeaders"]
+            note_rows = merged["noteRows"]
+            comment_rows = merged["commentRows"]
+            note_by_id = {valid_note_id(row.get("笔记ID")): row for row in note_rows
+                          if valid_note_id(row.get("笔记ID"))}
+
+            csv_backups: list[tuple[Path, Path]] = []
+            try:
+                for target in (notes_path, comments_path):
+                    backup = target.with_name(f".{target.stem}.{repair_id}.backup.csv")
+                    shutil.copy2(target, backup)
+                    csv_backups.append((target, backup))
+                self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, repair_id)
+                with self.lock, self._session() as db:
+                    for archived in repaired.get("archives") or []:
+                        db.execute(
+                            """INSERT OR REPLACE INTO data_repair_archive
+                               (repair_id,source_name,row_number,reason,row_json,archived_at)
+                               VALUES(?,?,?,?,?,?)""",
+                            (repair_id, archived["source"], int(archived["rowNumber"]),
+                             archived["reason"], json.dumps(archived["row"], ensure_ascii=False), timestamp),
+                        )
+                    db_note_ids = {str(row[0]) for row in db.execute("SELECT note_id FROM notes").fetchall()}
+                    for note_id in sorted({csv_comment_note_id(row) for row in comment_rows if csv_comment_note_id(row)}):
+                        if note_id in db_note_ids:
+                            continue
+                        source_note = note_by_id.get(note_id) or {}
+                        url = text(source_note.get("笔记url"), 4000) or f"https://www.xiaohongshu.com/explore/{note_id}"
+                        db.execute(
+                            """INSERT INTO notes(note_id,url,title,author,content,keyword,page_url,first_seen_at,last_seen_at,
+                               status,is_relevant,source,payload_json,review_status,review_note)
+                               VALUES(?,?,?,?,?,?,?,?,?,'new',0,'relationship_repair','{}','pending_review',?)""",
+                            (note_id, url, text(source_note.get("笔记标题"), 1000),
+                             text(source_note.get("用户昵称"), 500), text(source_note.get("笔记内容"), 20000),
+                             "", url, timestamp, timestamp, "评论存在但笔记尚未进入笔记总表"),
+                        )
+                        db_note_ids.add(note_id)
+                    final_ids: list[str] = []
+                    for row in comment_rows:
+                        note_id = csv_comment_note_id(row)
+                        comment_id = text(row.get("笔记评论ID"), 256)
+                        if not note_id or not comment_id:
+                            raise ValueError("修复结果仍存在缺少笔记ID或评论ID的行")
+                        final_ids.append(comment_id)
+                        api = self._csv_comment_to_api(row)
+                        mapping_review = text(row.get("映射状态"), 40) == "待复核"
+                        payload_json = json.dumps(api, ensure_ascii=False)
+                        content_value = text(row.get("评论内容"), 8000)
+                        existing = db.execute("SELECT 1 FROM comments WHERE comment_id=?", (comment_id,)).fetchone()
+                        if existing:
+                            db.execute(
+                                """UPDATE comments SET note_id=?,parent_comment_id=?,content=?,author=?,author_url=?,
+                                   published_at=?,like_count=?,comment_level=?,last_seen_at=?,payload_json=?,content_hash=?,
+                                   sentiment=CASE WHEN ?<>'' THEN ? ELSE sentiment END,
+                                   review_status=CASE WHEN ? THEN 'mapping_review'
+                                      WHEN review_status='mapping_review' THEN 'pending_review' ELSE review_status END,
+                                   review_note=CASE WHEN ? THEN ?
+                                      WHEN review_status='mapping_review' THEN '' ELSE review_note END WHERE comment_id=?""",
+                                (note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                                 api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, payload_json,
+                                 self._content_hash(content_value), sentiment_code(row.get("AI情绪判断")),
+                                 sentiment_code(row.get("AI情绪判断")), int(mapping_review), int(mapping_review),
+                                 text(row.get("映射备注"), 1000), comment_id),
+                            )
+                        else:
+                            db.execute(
+                                """INSERT INTO comments(comment_id,note_id,parent_comment_id,content,author,author_url,
+                                   published_at,like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
+                                   payload_json,content_hash,review_status,review_note,sentiment)
+                                   VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?)""",
+                                (comment_id, note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                                 api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, timestamp,
+                                 payload_json, self._content_hash(content_value),
+                                 "mapping_review" if mapping_review else "pending_review",
+                                 text(row.get("映射备注"), 1000), sentiment_code(row.get("AI情绪判断"))),
+                            )
+                    db.execute("CREATE TEMP TABLE IF NOT EXISTS repair_comment_ids(comment_id TEXT PRIMARY KEY)")
+                    db.execute("DELETE FROM repair_comment_ids")
+                    db.executemany("INSERT INTO repair_comment_ids(comment_id) VALUES(?)", ((item,) for item in final_ids))
+                    db.execute("DELETE FROM comments WHERE comment_id NOT IN (SELECT comment_id FROM repair_comment_ids)")
+                    db.execute(
+                        """UPDATE notes SET comment_count_collected=(
+                           SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+                    )
+            except Exception:
+                for target, backup in csv_backups:
+                    if backup.exists():
+                        os.replace(backup, target)
+                raise
+            finally:
+                for _target, backup in csv_backups:
+                    backup.unlink(missing_ok=True)
+
+            # A historical folder name could be shared by several note IDs.
+            # Split it before writing comments.json; otherwise syncing one note
+            # silently overwrites the other note's material snapshot.
+            shared_media_splits = 0
+            shared_sources_to_remove: list[Path] = []
+            with self.lock, self._session() as db:
+                media_rows_for_split = [dict(row) for row in db.execute(
+                    "SELECT note_id,title,content,media_dir FROM notes WHERE media_dir<>''"
+                ).fetchall()]
+            grouped_media: dict[str, list[dict[str, Any]]] = {}
+            for stored in media_rows_for_split:
+                try:
+                    key = str(Path(text(stored.get("media_dir"), 4000)).resolve()).casefold()
+                except OSError:
+                    continue
+                grouped_media.setdefault(key, []).append(stored)
+            for shared_group in grouped_media.values():
+                if len(shared_group) < 2:
+                    continue
+                source_folder = Path(text(shared_group[0].get("media_dir"), 4000))
+                if not source_folder.is_dir():
+                    continue
+                targets: list[tuple[str, Path]] = []
+                for stored in shared_group:
+                    note_id = valid_note_id(stored.get("note_id"))
+                    target = self._media_root() / self._safe_media_folder_name({
+                        "noteId": note_id, "title": stored.get("title"), "content": stored.get("content"),
+                    })
+                    if target.resolve() != source_folder.resolve():
+                        shutil.copytree(source_folder, target, dirs_exist_ok=True)
+                    targets.append((note_id, target.resolve()))
+                for source_file in source_folder.rglob("*"):
+                    if not source_file.is_file():
+                        continue
+                    relative = source_file.relative_to(source_folder)
+                    for _note_id, target in targets:
+                        copied = target / relative
+                        if not copied.is_file() or copied.stat().st_size != source_file.stat().st_size:
+                            raise ValueError(f"共享素材目录拆分校验失败：{source_file.name}")
+                with self.lock, self._session() as db:
+                    for note_id, target in targets:
+                        db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(target), note_id))
+                target_by_id = dict(targets)
+                for row in note_rows:
+                    note_id = valid_note_id(row.get("笔记ID"))
+                    if note_id in target_by_id:
+                        row["对应帖子文件夹地址"] = str(target_by_id[note_id])
+                for row in comment_rows:
+                    note_id = csv_comment_note_id(row)
+                    if note_id in target_by_id:
+                        row["对应帖子文件夹地址"] = str(target_by_id[note_id])
+                shared_media_splits += len(targets)
+                shared_sources_to_remove.append(source_folder.resolve())
+            if shared_media_splits:
+                self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, f"{repair_id}-media-split")
+
+            material_synced = 0
+            with self.lock, self._session() as db:
+                media_rows = [dict(row) for row in db.execute(
+                    "SELECT note_id,title,content,url,payload_json,media_dir FROM notes WHERE media_dir<>''"
+                ).fetchall()]
+            for stored in media_rows:
+                media_dir = text(stored.get("media_dir"), 4000)
+                if not media_dir or not Path(media_dir).is_dir():
+                    continue
+                try:
+                    payload = json.loads(stored.get("payload_json") or "{}")
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except (TypeError, ValueError):
+                    payload = {}
+                note = {**payload, "noteId": stored["note_id"], "title": stored["title"],
+                        "content": stored["content"], "url": stored["url"]}
+                files = sorted(item.name for item in Path(media_dir).iterdir() if item.is_file())
+                self._write_media_snapshot(
+                    {"folder": media_dir, "files": files}, note, self._comments_as_api(stored["note_id"])
+                )
+                self._verify_note_store_consistency(stored["note_id"], media_dir)
+                material_synced += 1
+            for source_folder in shared_sources_to_remove:
+                with self.lock, self._session() as db:
+                    still_referenced = int(db.execute(
+                        "SELECT COUNT(*) FROM notes WHERE lower(media_dir)=lower(?)", (str(source_folder),)
+                    ).fetchone()[0])
+                if not still_referenced and source_folder.is_dir():
+                    shutil.rmtree(source_folder)
+
+            health = self.data_health()
+            result_summary = {
+                **repaired["summary"],
+                "commentsAfterUnion": len(comment_rows),
+                "sqliteCommentsAfter": sum(1 for _item in comment_rows),
+                "materialDirectoriesSynced": material_synced,
+                "sharedMediaRecordsSplit": shared_media_splits,
+                "sourceSqliteComments": len(db_comments),
+                "sourceMaterialComments": len(material_comments),
+            }
+            return {
+                "ok": True, "repairId": repair_id, "summary": result_summary,
+                "warnings": warnings, "health": health,
+                "notesPath": str(notes_path), "commentsPath": str(comments_path),
+            }
 
     @staticmethod
     def _report_period(payload: dict[str, Any]) -> tuple[str, str]:
@@ -4105,8 +4615,71 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             text(item.get("author"), 500),
             text(item.get("content"), 8000),
             text(item.get("publishedAt"), 100),
+            text(item.get("parentCommentId"), 256),
         ))
         return f"dom-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+
+    def _normalize_snapshot_comments(self, note_id: str, comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Give one browser snapshot canonical IDs before writing every local store."""
+        with self.lock, self._session() as db:
+            stored = [dict(row) for row in db.execute(
+                """SELECT comment_id,parent_comment_id,author,content,published_at,payload_json,sentiment
+                   FROM comments WHERE note_id=?""", (note_id,)
+            ).fetchall()]
+        by_id = {text(row.get("comment_id"), 256): row for row in stored}
+        by_exact = {
+            (text(row.get("author"), 500), text(row.get("content"), 8000),
+             text(row.get("published_at"), 100), text(row.get("parent_comment_id"), 256)): row
+            for row in stored
+        }
+        aliases: dict[str, str] = {}
+        normalized: list[dict[str, Any]] = []
+        used: set[str] = set()
+        ordered = sorted(
+            enumerate(comments),
+            key=lambda pair: (max(1, min(int((pair[1] or {}).get("commentLevel") or 1), 3))
+                              if isinstance(pair[1], dict) else 3, pair[0]),
+        )
+        for _index, raw in ordered:
+            if not isinstance(raw, dict) or not text(raw.get("content"), 8000):
+                continue
+            item = dict(raw)
+            supplied_id = text(item.get("commentId"), 256)
+            supplied_parent = text(item.get("parentCommentId"), 256)
+            parent_id = aliases.get(supplied_parent, supplied_parent)
+            if supplied_id:
+                canonical_id = supplied_id
+            else:
+                existing = by_exact.get((
+                    text(item.get("author"), 500), text(item.get("content"), 8000),
+                    text(item.get("publishedAt"), 100), parent_id,
+                ))
+                canonical_id = text(existing.get("comment_id"), 256) if existing else self._excel_comment_id(
+                    note_id, {**item, "parentCommentId": parent_id}
+                )
+            if supplied_id:
+                aliases[supplied_id] = canonical_id
+            if canonical_id in used:
+                continue
+            existing_row = by_id.get(canonical_id) or {}
+            try:
+                existing_payload = json.loads(existing_row.get("payload_json") or "{}")
+                if not isinstance(existing_payload, dict):
+                    existing_payload = {}
+            except (TypeError, ValueError):
+                existing_payload = {}
+            for name in ("authorUrl", "commentUrl", "isAuthor", "replyCount"):
+                if item.get(name) in (None, "") and existing_payload.get(name) not in (None, ""):
+                    item[name] = existing_payload[name]
+            if not text(item.get("sentiment"), 80) and text(existing_row.get("sentiment"), 80):
+                stored_sentiment = text(existing_row.get("sentiment"), 80)
+                item["sentiment"] = stored_sentiment if stored_sentiment in set(SENTIMENT_LABELS.values()) else sentiment_label(stored_sentiment)
+            used.add(canonical_id)
+            item["commentId"] = canonical_id
+            item["parentCommentId"] = parent_id
+            item["noteId"] = note_id
+            normalized.append(item)
+        return normalized
 
     def _resolve_pull_identity(self, note: dict[str, Any]) -> tuple[str, str]:
         """Resolve a pull to one canonical local note before any file is written.
@@ -4152,7 +4725,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         note_id = valid_note_id(note.get("noteId")) or "unknown-note"
         title = canonical_note_title(note.get("title"), note.get("content"), 80)
         title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", title).strip(" .")
-        title = re.sub(r"\s+", " ", title)[:80].strip(" .") or "未命名帖子"
+        # Keep enough headroom for atomic temporary filenames under long
+        # Windows project paths (legacy 80-char names can exceed MAX_PATH).
+        title = re.sub(r"\s+", " ", title)[:40].strip(" .") or "未命名帖子"
         return f"{title}__{note_id}"
 
     def _resolve_media_folder(self, note: dict[str, Any]) -> Path:
@@ -4470,17 +5045,125 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         }
 
     @staticmethod
-    def _write_media_comments(media_result: dict[str, Any], comments: list[dict[str, Any]]) -> None:
+    def _write_json_atomic(path: Path, payload: Any) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}-{time.time_ns()}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _write_media_comments(cls, media_result: dict[str, Any], comments: list[dict[str, Any]]) -> None:
         folder = text(media_result.get("folder"), 4000)
         if not folder:
             return
         path = Path(folder) / "comments.json"
-        path.write_text(json.dumps(comments, ensure_ascii=False, indent=2), encoding="utf-8")
+        cls._write_json_atomic(path, comments)
         files = list(media_result.get("files") or [])
         if path.name not in files:
             files.append(path.name)
         media_result["files"] = files
         media_result["fileCount"] = len(files)
+
+    def _comments_as_api(self, note_id: str) -> list[dict[str, Any]]:
+        rows = self.list_comments(note_id, 10000)
+        output = []
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (TypeError, ValueError):
+                payload = {}
+            output.append({
+                **payload,
+                "commentId": text(row.get("comment_id"), 256),
+                "noteId": note_id,
+                "parentCommentId": text(row.get("parent_comment_id"), 256),
+                "content": text(row.get("content"), 8000),
+                "author": text(row.get("author"), 500),
+                "authorUrl": text(row.get("author_url"), 2000),
+                "publishedAt": text(row.get("published_at"), 100),
+                "likeCount": int(row.get("like_count") or 0),
+                "replyCount": int(row.get("reply_count") or 0),
+                "commentLevel": int(row.get("comment_level") or 1),
+            })
+        return output
+
+    def _write_media_snapshot(
+        self, media_result: dict[str, Any], note: dict[str, Any], comments: list[dict[str, Any]]
+    ) -> None:
+        folder_value = text(media_result.get("folder"), 4000)
+        if not folder_value:
+            return
+        folder = Path(folder_value)
+        if not folder.is_dir():
+            return
+        self._write_media_comments(media_result, comments)
+        metadata_path = folder / "note.json"
+        previous: dict[str, Any] = {}
+        if metadata_path.is_file():
+            try:
+                loaded = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except (OSError, ValueError):
+                previous = {}
+        metadata = {
+            **previous,
+            "noteId": valid_note_id(note.get("noteId")),
+            "url": text(note.get("url"), 2000) or text(previous.get("url"), 2000),
+            "title": canonical_note_title(note.get("title"), note.get("content"), 80),
+            "content": text(note.get("content"), 12000),
+            "tags": note.get("tags") or previous.get("tags") or [],
+            "syncedAt": now_iso(),
+        }
+        self._write_json_atomic(metadata_path, metadata)
+        text_snapshot = "\n".join((
+            metadata["title"], "", metadata["content"], "", f"来源链接：{metadata['url']}",
+        ))
+        text_path = folder / "帖子正文.txt"
+        temporary = text_path.with_name(f".{text_path.name}.{os.getpid()}-{time.time_ns()}.tmp")
+        try:
+            temporary.write_text(text_snapshot, encoding="utf-8")
+            os.replace(temporary, text_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _verify_note_store_consistency(self, note_id: str, media_dir: str = "") -> dict[str, Any]:
+        notes_path, comments_path = self._csv_paths()
+        _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        note_matches = sum(valid_note_id(row.get("笔记ID")) == note_id for row in note_rows)
+        csv_ids = {text(row.get("笔记评论ID"), 256) for row in comment_rows
+                   if csv_comment_note_id(row) == note_id and text(row.get("笔记评论ID"), 256)}
+        with self.lock, self._session() as db:
+            db_ids = {str(row[0]) for row in db.execute(
+                "SELECT comment_id FROM comments WHERE note_id=?", (note_id,)
+            ).fetchall()}
+        if note_matches != 1:
+            raise ValueError(f"本地一致性校验失败：笔记 CSV 中该帖子有 {note_matches} 行")
+        if csv_ids != db_ids:
+            raise ValueError(
+                f"本地一致性校验失败：评论 CSV={len(csv_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
+            )
+        material_ids: set[str] | None = None
+        if media_dir and Path(media_dir).is_dir():
+            material_path = Path(media_dir) / "comments.json"
+            if not material_path.is_file():
+                raise ValueError("本地一致性校验失败：素材目录缺少 comments.json")
+            loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
+            material_ids = {text(item.get("commentId"), 256) for item in loaded
+                            if isinstance(item, dict) and text(item.get("commentId"), 256)}
+            if material_ids != db_ids:
+                raise ValueError(
+                    f"本地一致性校验失败：素材评论={len(material_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
+                )
+        return {
+            "ok": True, "noteId": note_id, "noteRows": note_matches,
+            "commentIds": len(db_ids), "materialIds": len(material_ids) if material_ids is not None else None,
+        }
 
     def _legacy_sync_pull_to_xlsx(
         self,
@@ -4721,6 +5404,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         note: dict[str, Any],
         comments: list[dict[str, Any]],
         media_result: dict[str, Any] | None = None,
+        replace_comments: bool = False,
     ) -> dict[str, Any]:
         """Idempotently update the two UTF-8 CSV master tables."""
         notes_path, comments_path = self._csv_paths()
@@ -4766,6 +5450,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 note_row_data[name] = "" if value is None else value
 
         note_url = preferred_url(note_row_data.get("笔记url"), note.get("url"))
+        stored_url_id = note_url_identity(note_url)
+        if stored_url_id and stored_url_id != note_id:
+            note_url = normalize_xhs_url(f"https://www.xiaohongshu.com/explore/{note_id}")
         note_tags = tag_text(note.get("tags")) or ("无话题" if note.get("detailRead") else "")
         note_fields = {
             "笔记url": note_url, "用户主页url": text(note.get("authorUrl"), 2000),
@@ -4786,6 +5473,18 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         for name, value in note_fields.items():
             set_note_value(name, value)
 
+        removed_comments = 0
+        if replace_comments:
+            retained = [row for row in comment_rows if csv_comment_note_id(row) != note_id]
+            removed_comments = len(comment_rows) - len(retained)
+            comment_rows = retained
+        else:
+            for row in comment_rows:
+                if csv_comment_note_id(row) == note_id:
+                    row["笔记ID"] = note_id
+                    row["映射状态"] = "已映射"
+                    row["映射备注"] = ""
+
         by_id: dict[str, int] = {}
         by_key: dict[tuple[str, str, str, str], int] = {}
         by_loose: dict[tuple[str, str, str], int] = {}
@@ -4793,7 +5492,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             row_id = text(row.get("笔记评论ID"), 256)
             if row_id:
                 by_id[row_id] = index
-            key = (note_url_identity(row.get("原笔记url")), text(row.get("用户昵称"), 500),
+            key = (csv_comment_note_id(row), text(row.get("用户昵称"), 500),
                    text(row.get("评论内容"), 8000), text(row.get("评论时间"), 100))
             if any(key):
                 by_key[key] = index
@@ -4822,7 +5521,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 duplicate_comments += 1
             level = max(1, min(int(item.get("commentLevel") or 1), 3))
             fields = {
-                "原笔记url": note_url, "帖子用户主页url": text(note.get("authorUrl"), 2000),
+                "笔记ID": note_id, "原笔记url": note_url,
+                "帖子用户主页url": text(note.get("authorUrl"), 2000),
                 "笔记评论ID": generated_id, "用户昵称": text(item.get("author"), 500),
                 "评论内容": text(item.get("content"), 8000), "评论时间": text(item.get("publishedAt"), 100),
                 "是否帖主评论": "是" if bool_value(item.get("isAuthor")) else "否",
@@ -4830,6 +5530,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "父评论ID": text(item.get("parentCommentId"), 256),
                 "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
                 "AI情绪判断": text(item.get("sentiment"), 80),
+                "映射状态": "已映射", "映射备注": "",
             }
             for name, value in fields.items():
                 if name not in comment_headers:
@@ -4845,6 +5546,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         return {
             "ok": True, "path": str(notes_path), "commentsPath": str(comments_path),
             "postAdded": int(is_new_note), "commentAdded": inserted_comments,
+            "commentRemoved": removed_comments,
             "commentSkipped": duplicate_comments, "deduplicated": (not is_new_note) or duplicate_comments > 0,
             "matchedBy": matched_by, "noteRow": int(existing_index) + 2,
         }
@@ -5374,14 +6076,14 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             comment_id_set = set(comment_ids)
             kept_comments = [row for row in comment_rows if not (
                 text(row.get("笔记评论ID"), 256) in comment_id_set
-                or note_url_identity(row.get("原笔记url")) == note_id
+                or csv_comment_note_id(row) == note_id
             )]
             deleted_note_rows = len(note_rows) - len(kept_notes)
             deleted_comment_rows = len(comment_rows) - len(kept_comments)
             if any(valid_note_id(row.get("笔记ID")) == note_id for row in kept_notes):
                 raise ValueError("CSV 帖子清理校验失败")
             if any(text(row.get("笔记评论ID"), 256) in comment_id_set
-                   or note_url_identity(row.get("原笔记url")) == note_id for row in kept_comments):
+                   or csv_comment_note_id(row) == note_id for row in kept_comments):
                 raise ValueError("CSV 评论清理校验失败")
 
             media_root = self._media_root().resolve()
@@ -5581,6 +6283,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         }
         try:
             self.confirm(note)
+            comments = self._normalize_snapshot_comments(note_id, comments)
             comment_result = self.upsert_comments({
                 "noteId": note_id,
                 "comments": comments,
@@ -5635,6 +6338,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp, note_id,
                 ),
             )
+        all_local_comments = self._comments_as_api(note_id)
+        if media_result.get("folder"):
+            self._write_media_snapshot(media_result, note, all_local_comments)
+        consistency = self._verify_note_store_consistency(note_id, text(media_result.get("folder"), 4000))
         return {
             "ok": True,
             "noteId": note_id,
@@ -5666,6 +6373,9 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "mediaFiles": media_result.get("files", []) or [],
             "mediaError": media_result.get("error", ""),
             "pullError": final_error,
+            "storesSynced": ["notes_csv", "comments_csv", "sqlite"] + (["materials"] if media_result.get("folder") else []),
+            "consistencyVerified": True,
+            "consistency": consistency,
         }
 
     def open_local_artifact(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -5954,6 +6664,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.delete_unreachable_notes(payload)
             elif self.path == "/api/data-health/repair":
                 result = self.store.repair_data_health(payload)
+            elif self.path == "/api/data-health/repair-relations":
+                result = self.store.repair_csv_relationships(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":

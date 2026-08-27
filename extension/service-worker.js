@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.24.1";
+const CONTENT_SCRIPT_VERSION = "0.25.0";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -691,6 +691,37 @@ async function sendTabMessage(tabId, message) {
   }
 }
 
+async function broadcastLocalNoteState(noteId, state = {}) {
+  const safeNoteId = String(noteId || "").trim();
+  if (!safeNoteId) return;
+  const message = { type: "localNoteStateChanged", noteId: safeNoteId, ...state };
+  chrome.runtime.sendMessage(message).catch(() => {});
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  await Promise.all(tabs
+    .filter((tab) => tab?.id && isXhsPageUrl(tab.url))
+    .map(async (tab) => {
+      const ready = await chrome.tabs.sendMessage(tab.id, { type: "getPageInfo" }).catch(() => null);
+      if (ready?.contentVersion !== CONTENT_SCRIPT_VERSION) {
+        await ensureContentInjected(tab.id).catch(() => null);
+      }
+      return chrome.tabs.sendMessage(tab.id, message).catch(() => null);
+    }));
+}
+
+async function deletePulledNoteAndBroadcast(noteId) {
+  const safeNoteId = String(noteId || "").trim();
+  const result = await bridgeApi("/api/note/delete", {
+    method: "POST", body: JSON.stringify({ noteId: safeNoteId }), timeoutMs: 300000
+  });
+  if (result?.ok) {
+    await broadcastLocalNoteState(safeNoteId, {
+      deleted: true, found: false, inExcel: false, status: "new",
+      pullStatus: "not_started", relevanceStatus: "unknown"
+    });
+  }
+  return result;
+}
+
 async function activeXhsTab(preferredTabId = null) {
   if (preferredTabId) {
     try {
@@ -949,11 +980,16 @@ async function getUnreachableNotes() {
 async function deleteUnreachableNotes() {
   // Import manual changes to the CSV status column before selecting rows.
   await bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
-  return bridgeApi("/api/notes/unreachable/delete", {
-    method: "POST",
-    body: "{}",
-    timeoutMs: 300000
+  const result = await bridgeApi("/api/notes/unreachable/delete", {
+    method: "POST", body: "{}", timeoutMs: 300000
   });
+  for (const item of result?.deleted || []) {
+    await broadcastLocalNoteState(item.noteId, {
+      deleted: true, found: false, inExcel: false, status: "new",
+      pullStatus: "not_started", relevanceStatus: "unknown"
+    });
+  }
+  return result;
 }
 
 async function deleteReviewedFailures(noteIds = []) {
@@ -964,11 +1000,7 @@ async function deleteReviewedFailures(noteIds = []) {
   const failures = [];
   for (const noteId of requested) {
     try {
-      const result = await bridgeApi("/api/note/delete", {
-        method: "POST",
-        body: JSON.stringify({ noteId }),
-        timeoutMs: 300000
-      });
+      const result = await deletePulledNoteAndBroadcast(noteId);
       if (!result?.ok) throw new Error(result?.error || "删除失败");
       deleted.push({ noteId, ...result });
     } catch (error) {
@@ -1038,10 +1070,11 @@ async function auditCurrentNoteComments(note, preferredTabId = null) {
 
 async function syncCurrentNoteComments(payload) {
   const snapshot = payload?.snapshot || {};
-  return bridgeApi("/api/comments/sync", {
+  const noteId = payload?.noteId || snapshot.note?.noteId || "";
+  const result = await bridgeApi("/api/comments/sync", {
     method: "POST",
     body: JSON.stringify({
-      noteId: payload?.noteId || snapshot.note?.noteId || "",
+      noteId,
       note: snapshot.note || payload?.note || {},
       comments: Array.isArray(snapshot.comments) ? snapshot.comments : [],
       expectedCount: Number(snapshot.expectedCount) || 0,
@@ -1050,6 +1083,14 @@ async function syncCurrentNoteComments(payload) {
     }),
     timeoutMs: 120000
   });
+  if (result?.ok) {
+    await broadcastLocalNoteState(noteId, {
+      deleted: false, found: true, inExcel: true, status: "known",
+      pullStatus: "synced", locallyReconciled: true,
+      consistencyVerified: Boolean(result.consistencyVerified)
+    });
+  }
+  return result;
 }
 
 function batchSyncState(overrides = {}) {
@@ -1323,27 +1364,18 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     error.syncStage = "compare";
     throw error;
   }
-  if (!comparison.commentHasChanges) {
-    // Batch change statistics are comment-based. Volatile post counters and
-    // timestamps must not turn every successfully opened post into “changed”.
-    await sendTabMessage(tabId, {
-      type: "batchSyncNoteProgress",
-      noteId: note.noteId,
-      note: snapshot.note,
-      phase: "excel",
-      done: true,
-      title: "核对完成，评论无变化",
-      commentCount: snapshot.comments.length,
-      commentRows: snapshot.comments.slice(0, 12)
-    }).catch(() => {});
-    return { ok: true, changed: false, comparison, collectedCount: snapshot.comments.length };
-  }
+  const hasCommentChanges = Boolean(comparison.commentHasChanges);
+  // Every successful read is written through all local stores even when the
+  // business-facing result remains “无变化”. This repairs drift without
+  // counting volatile post metadata as a comment change.
   await sendTabMessage(tabId, {
     type: "batchSyncNoteProgress",
     noteId: note.noteId,
     note: snapshot.note,
     phase: "excel",
-    title: `发现 ${Number(comparison.newCount || 0) + Number(comparison.removedCount || 0) + Number(comparison.changedCount || 0)} 项变化，正在写入`,
+    title: hasCommentChanges
+      ? `发现 ${Number(comparison.newCount || 0) + Number(comparison.removedCount || 0) + Number(comparison.changedCount || 0)} 项变化，正在同步全部本地数据`
+      : "评论无变化，正在校准 CSV、SQLite 与素材快照",
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
@@ -1354,8 +1386,8 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     error.syncStage = "sync";
     throw error;
   }
-  if (!synced?.ok) {
-    const error = new Error(synced?.error || "评论同步失败");
+  if (!synced?.ok || !synced.consistencyVerified) {
+    const error = new Error(synced?.error || "本地数据一致性校验失败");
     error.syncStage = "sync";
     throw error;
   }
@@ -1365,11 +1397,14 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     note: snapshot.note,
     phase: "excel",
     done: true,
-    title: "评论变化已同步完成",
+    title: hasCommentChanges ? "评论变化及全部本地数据已同步" : "评论无变化，本地数据已全部校准",
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
-  return { ok: true, changed: true, comparison, synced, collectedCount: synced.collectedCount || snapshot.comments.length };
+  return {
+    ok: true, changed: hasCommentChanges, comparison, synced,
+    collectedCount: synced.collectedCount || snapshot.comments.length
+  };
 }
 
 async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
@@ -1698,6 +1733,11 @@ async function pullNote(note, preferredTabId = null) {
         process: showProcess
       };
       broadcastPullProgress({ noteId, phase: "done", done: true, ...finalResult }, progressTabId);
+      await broadcastLocalNoteState(noteId, {
+        deleted: false, found: true, inExcel: true, status: "known",
+        pullStatus: finalResult.pullStatus || "synced", relevanceStatus: "relevant",
+        consistencyVerified: Boolean(finalResult.consistencyVerified)
+      });
       return finalResult;
     } catch (error) {
       const result = { ok: false, noteId, process: showProcess, phase: "excel", error: error.message || "拉取失败" };
@@ -1985,11 +2025,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "confirmNote") return confirmNote(message.note || {});
     if (message.type === "pullNote") return pullNote(message.note || {}, sender.tab?.id || null);
     if (message.type === "deletePulledNote") {
-      return bridgeApi("/api/note/delete", {
-        method: "POST",
-        body: JSON.stringify({ noteId: message.noteId || message.note?.noteId || "" }),
-        timeoutMs: 60000
-      });
+      return deletePulledNoteAndBroadcast(message.noteId || message.note?.noteId || "");
     }
     if (message.type === "getNoteStatus") return getNoteStatus(message.noteId || message.note?.noteId || "");
     if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);

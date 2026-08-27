@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 UTF-8 CSV / SQLite，并可调用 AI 进行分析。
 
-当前版本：`0.24.1`
+当前版本：`0.25.0`
 
 当前状态与完整需求见 [小红书舆情监控助手_PRD.md](小红书舆情监控助手_PRD.md)。
 
@@ -103,6 +103,7 @@ POST /api/comments/upsert
 POST /api/ai/test
 POST /api/ai/analyze
 POST /api/review
+POST /api/data-health/repair-relations  # 明确确认后的关系修复
 ```
 
 ## 安全与隐私
@@ -206,4 +207,13 @@ powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 
 - Bridge 可识别 WPS 另存产生的 GB18030、无 BOM UTF-8 和 UTF-16 CSV，避免总表因编码变化而无法读取。
 - Bridge 启动或重载时逐行读取并原子规范化为 UTF-8 BOM；若文件仍被 WPS 编辑则保留可读状态，等待下次写入或重启重试。
-- 实际评论总表发现 GB18030 后已无损恢复为 UTF-8 BOM，4,335 条评论校验通过。
+- 实际评论总表发现 GB18030 后已恢复为 UTF-8 BOM；v0.25.0 进一步完成逻辑评论重组与跨存储校验。
+
+## v0.25.0：笔记—评论外键与全存储同步
+
+- 评论 CSV 新增明确的 `笔记ID`、`映射状态` 和 `映射备注`；修复历史拆行、空评论 ID、空笔记 ID 重复行及 URL 串帖。
+- 198 条历史评论从 2,325 个碎片行重组；176 条无 ID 评论生成稳定 ID；合并 CSV、SQLite 与素材快照后保留 2,200 条唯一评论。
+- 17 条指向候选帖的评论标记为“待复核”，不自动删除；原始异常行归档到 SQLite `data_repair_archive`。
+- 单帖和批量同步无论评论是否变化，都会校准笔记 CSV、评论 CSV、SQLite、`note.json`、`comments.json` 和正文快照，并执行 ID 集合校验。
+- 本地删除成功后立即广播到所有小红书标签页和侧边栏，外部帖子卡片即时从“CSV 已有”更新为“未拉取”。
+- 数据体检新增双向外键、异常行、孤立评论、CSV/SQLite 评论集合、URL 串帖及共享素材目录检查。
