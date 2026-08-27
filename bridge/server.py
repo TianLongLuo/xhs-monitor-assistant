@@ -41,7 +41,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.24.0"
+VERSION = "0.24.1"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -588,11 +588,33 @@ class MonitorStore:
         return notes_path, comments_path
 
     @staticmethod
-    def _read_csv_table(path: Path, default_headers: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+    def _csv_source_encoding(path: Path) -> str:
+        """Accept WPS CSV encodings while keeping UTF-8 BOM as the canonical format."""
+        path = Path(path)
+        with path.open("rb") as stream:
+            prefix = stream.read(3)
+        if prefix.startswith(b"\xef\xbb\xbf"):
+            return CSV_ENCODING
+        if prefix.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return "utf-16"
+        raw = path.read_bytes()
+        try:
+            raw.decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError as utf8_error:
+            try:
+                raw.decode("gb18030")
+                return "gb18030"
+            except UnicodeDecodeError:
+                raise utf8_error
+
+    @classmethod
+    def _read_csv_table(cls, path: Path, default_headers: list[str]) -> tuple[list[str], list[dict[str, str]]]:
         path = Path(path)
         if not path.is_file():
             return list(default_headers), []
-        with path.open("r", encoding=CSV_ENCODING, newline="") as stream:
+        encoding = cls._csv_source_encoding(path)
+        with path.open("r", encoding=encoding, newline="") as stream:
             reader = csv.DictReader(stream)
             headers = [str(item).strip() for item in (reader.fieldnames or []) if item is not None and str(item).strip()]
             if not headers:
@@ -677,12 +699,22 @@ class MonitorStore:
                 backup.unlink(missing_ok=True)
 
     def _ensure_seed_workbook(self, _path: Path | None = None) -> None:
-        """Create the two UTF-8 BOM CSV tables required by a fresh installation."""
+        """Create both CSVs and normalize WPS/Excel legacy encodings to UTF-8 BOM."""
         notes_path, comments_path = self._csv_paths()
-        if not notes_path.exists():
-            self._replace_csv_table(notes_path, NOTE_CSV_HEADERS, [], "initialize")
-        if not comments_path.exists():
-            self._replace_csv_table(comments_path, COMMENT_CSV_HEADERS, [], "initialize")
+        for path, defaults in ((notes_path, NOTE_CSV_HEADERS), (comments_path, COMMENT_CSV_HEADERS)):
+            if not path.exists():
+                self._replace_csv_table(path, defaults, [], "initialize")
+                continue
+            encoding = self._csv_source_encoding(path)
+            if encoding == CSV_ENCODING:
+                continue
+            headers, rows = self._read_csv_table(path, defaults)
+            try:
+                self._replace_csv_table(path, headers, rows, "normalize-encoding")
+            except ValueError as exc:
+                # Keep the Bridge usable when WPS is still editing the file;
+                # reads continue with the detected encoding and the next write/restart retries.
+                print(f"[bridge] CSV 编码等待规范化：{path} ({exc})", flush=True)
 
     def migrate_legacy_workbook(self, xlsx_path: Path) -> dict[str, Any]:
         """Losslessly split the legacy workbook into notes/comments UTF-8 CSV files."""

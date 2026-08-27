@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 UTF-8 CSV / SQLite，并可调用 AI 进行分析。
 
-当前版本：`0.24.0`
+当前版本：`0.24.1`
 
 当前状态与完整需求见 [小红书舆情监控助手_PRD.md](小红书舆情监控助手_PRD.md)。
 
@@ -201,3 +201,9 @@ powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 - 新安装直接创建两个 CSV；拉取、评论同步、访问状态、AI 回写、数据体检、彻底删除及 WPS 行列定位均已切换到 CSV。
 - 批量同步仅以评论新增、删除或实质修改统计“有变化”；仅帖子互动量、时间等元数据刷新仍计为“无变化”。
 - 未完成帖子支持单条忽略和表头一键忽略；忽略项不再参与批量同步，并在运营页折叠展示、支持恢复。
+
+## v0.24.1：WPS CSV 编码自愈
+
+- Bridge 可识别 WPS 另存产生的 GB18030、无 BOM UTF-8 和 UTF-16 CSV，避免总表因编码变化而无法读取。
+- Bridge 启动或重载时逐行读取并原子规范化为 UTF-8 BOM；若文件仍被 WPS 编辑则保留可读状态，等待下次写入或重启重试。
+- 实际评论总表发现 GB18030 后已无损恢复为 UTF-8 BOM，4,335 条评论校验通过。

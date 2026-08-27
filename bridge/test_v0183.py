@@ -454,6 +454,23 @@ class V0183Tests(unittest.TestCase):
         self.assertNotIn(note_id, note_ids)
         self.assertNotIn(comment["commentId"], comment_ids)
 
+    def test_wps_gb18030_csv_is_normalized_without_row_loss(self):
+        notes_path = Path(self.tmp.name) / "品牌_笔记总表.csv"
+        self.store.configure_data_files(notes_path)
+        self.store._replace_csv_table(notes_path, NOTE_CSV_HEADERS, [], "test")
+        comments_path = Path(self.tmp.name) / "品牌_评论总表.csv"
+        with comments_path.open("w", encoding="gb18030", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=COMMENT_CSV_HEADERS, lineterminator="\r\n")
+            writer.writeheader()
+            writer.writerow({"笔记评论ID": "gb18030-comment", "用户昵称": "测试用户", "评论内容": "中文评论保持完整"})
+
+        self.store.seed_from_xlsx(notes_path)
+
+        self.assertEqual(b"\xef\xbb\xbf", comments_path.read_bytes()[:3])
+        _headers, rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        self.assertEqual("中文评论保持完整", rows[0]["评论内容"])
+        self.assertEqual("测试用户", rows[0]["用户昵称"])
+
     def test_seed_migrates_existing_workbook_to_two_utf8_csv_files(self):
         from openpyxl import Workbook
 

@@ -17,7 +17,7 @@
 | 项目 | 当前状态 |
 |---|---|
 | Bridge 健康检查 | 正常，`ok=true` |
-| Bridge 版本 | `0.24.0` |
+| Bridge 版本 | `0.24.1` |
 | 本地服务 | `http://127.0.0.1:17881` |
 | Native Host | `com.xhsmonitor.bridge` |
 | Native Host 程序 | `舆论监控插件联动\bridge\dist\xhs_monitor_native_host.exe` |
