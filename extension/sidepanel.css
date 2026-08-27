@@ -776,7 +776,7 @@ body.is-floating .icon-button--float {
   overflow: auto;
   padding: 0 2px 0 0;
 }
-.batch-sync-failure a {
+.batch-sync-failure {
   align-items: center;
   background: #fff8f5;
   border: 1px solid #ead1ca;
@@ -786,9 +786,8 @@ body.is-floating .icon-button--float {
   grid-template-columns: 25px minmax(0, 1fr) auto;
   min-height: 46px;
   padding: 7px 8px;
-  text-decoration: none;
 }
-.batch-sync-failure a:hover { background: #fbe9e4; border-color: #d8998d; }
+.batch-sync-failure:hover { background: #fbe9e4; border-color: #d8998d; }
 .batch-sync-failure__number {
   color: #b94b3f;
   font: 800 8px/1 ui-monospace, "Cascadia Mono", monospace;
@@ -821,7 +820,25 @@ body.is-floating .icon-button--float {
 .batch-sync-failure__copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-sync-failure__copy strong { font-size: 9px; }
 .batch-sync-failure__copy small { color: var(--muted); font-size: 8px; }
-.batch-sync-failure__action { color: #9d3e34; font-size: 8px; font-weight: 800; white-space: nowrap; }
+.batch-sync-failure__actions { align-items: flex-end; display: grid; gap: 4px; justify-items: end; }
+.batch-sync-failure__action,
+.batch-sync-failure__excel {
+  background: transparent;
+  border: 0;
+  color: #9d3e34;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1.2;
+  padding: 2px 0;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.batch-sync-failure__excel { color: #0068c9; }
+.batch-sync-failure__action:hover,
+.batch-sync-failure__excel:hover { text-decoration: underline; }
+.batch-sync-failure__excel:disabled { cursor: wait; opacity: .55; text-decoration: none; }
 .batch-sync-progress__cancel {
   background: transparent;
   border: 1px solid #d6b8ad;

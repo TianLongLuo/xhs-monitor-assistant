@@ -377,13 +377,7 @@ function renderBatchFailures(failures = []) {
   items.forEach((failure, index) => {
     const item = document.createElement("li");
     item.className = "batch-sync-failure";
-    const link = document.createElement("a");
     const url = failureNoteUrl(failure);
-    link.href = url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.title = "在新标签页打开失败帖子";
-
     const number = document.createElement("span");
     number.className = "batch-sync-failure__number";
     number.textContent = String(index + 1).padStart(2, "0");
@@ -400,11 +394,46 @@ function renderBatchFailures(failures = []) {
     reason.textContent = [diagnosis.summary, diagnosis.localSummary, failure.error].filter(Boolean).join(" · ") || "等待重新核验";
     reason.title = reason.textContent;
     copy.append(badge, title, reason);
-    const action = document.createElement("span");
-    action.className = "batch-sync-failure__action";
-    action.textContent = failure.markedUnreachable ? "待清理" : "打开 ↗";
-    link.append(number, copy, action);
-    item.append(link);
+    const actions = document.createElement("span");
+    actions.className = "batch-sync-failure__actions";
+    const open = document.createElement("a");
+    open.className = "batch-sync-failure__action";
+    open.href = url;
+    open.target = "_blank";
+    open.rel = "noopener noreferrer";
+    open.title = "在新标签页打开原帖";
+    open.textContent = failure.markedUnreachable ? "原帖 ↗" : "打开 ↗";
+    const excel = document.createElement("button");
+    excel.type = "button";
+    excel.className = "batch-sync-failure__excel";
+    excel.textContent = "Excel";
+    excel.title = "使用 WPS 打开总表并定位到该帖子行";
+    excel.disabled = !failure.noteId;
+    excel.addEventListener("click", async () => {
+      const originalText = excel.textContent;
+      excel.disabled = true;
+      excel.textContent = "定位中";
+      try {
+        const result = await sendRuntime({
+          type: "openLocalArtifact",
+          payload: { kind: "excel", noteId: failure.noteId, fieldName: "笔记标题" }
+        });
+        if (!result?.ok) throw new Error(result?.error || "Excel 定位失败");
+        excel.textContent = "已定位";
+        showToast(`已在 Excel 定位“${failure.title || "该帖子"}”`);
+      } catch (error) {
+        excel.textContent = "重试";
+        setStatus(error.message || "Excel 定位失败", "error");
+      } finally {
+        setTimeout(() => {
+          if (!excel.isConnected) return;
+          excel.disabled = !failure.noteId;
+          excel.textContent = originalText;
+        }, 1800);
+      }
+    });
+    actions.append(open, excel);
+    item.append(number, copy, actions);
     fragment.append(item);
   });
   elements.batchSyncFailureList.replaceChildren(fragment);
