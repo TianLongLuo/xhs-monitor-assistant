@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.10";
+const CONTENT_SCRIPT_VERSION = "0.23.11";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -954,6 +954,37 @@ async function deleteUnreachableNotes() {
     body: "{}",
     timeoutMs: 300000
   });
+}
+
+async function deleteReviewedFailures(noteIds = []) {
+  const requested = [...new Set((Array.isArray(noteIds) ? noteIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!requested.length) return { ok: false, error: "没有可删除的待复核帖子" };
+  await getBatchCommentSyncState();
+  const deleted = [];
+  const failures = [];
+  for (const noteId of requested) {
+    try {
+      const result = await bridgeApi("/api/note/delete", {
+        method: "POST",
+        body: JSON.stringify({ noteId }),
+        timeoutMs: 300000
+      });
+      if (!result?.ok) throw new Error(result?.error || "删除失败");
+      deleted.push({ noteId, ...result });
+    } catch (error) {
+      failures.push({ noteId, error: error?.message || "删除失败" });
+    }
+  }
+  const deletedIds = new Set(deleted.map((item) => item.noteId));
+  const remaining = (batchCommentSyncState.failures || []).filter((item) => !deletedIds.has(String(item?.noteId || "")));
+  const state = await publishBatchCommentSync({
+    failures: remaining,
+    failedPosts: remaining.length,
+    reviewPosts: remaining.filter((item) => !item?.markedUnreachable).length,
+    unreachablePosts: remaining.filter((item) => item?.markedUnreachable).length
+  });
+  return { ok: failures.length === 0, deleted, failures, deletedCount: deleted.length, state,
+    error: failures.length ? `${failures.length} 篇删除失败` : "" };
 }
 
 async function auditCurrentNoteComments(note, preferredTabId = null) {
@@ -1942,6 +1973,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getBatchCommentSyncState") return getBatchCommentSyncState();
     if (message.type === "getUnreachableNotes") return getUnreachableNotes();
     if (message.type === "deleteUnreachableNotes") return deleteUnreachableNotes();
+    if (message.type === "deleteReviewedFailures") return deleteReviewedFailures(message.noteIds || []);
     if (message.type === "suggestCommentReply") return suggestCommentReply(message, sender.tab?.id || null);
     if (message.type === "applyCommentReply") return applyCommentReply(message, sender.tab?.id || null);
     if (message.type === "getNoteSummary") {

@@ -544,18 +544,18 @@ function renderUnreachableNotes(result = {}) {
   if (elements.deleteUnreachableLabel) {
     elements.deleteUnreachableLabel.textContent = count
       ? `清理已确认失效帖子（${count}）`
-      : reviewCount ? `重新诊断待复核帖子（${reviewCount}）` : "暂无已确认失效帖子";
+      : reviewCount ? `人工确认并删除无效帖子（${reviewCount}）` : "暂无已确认失效帖子";
   }
   if (elements.unreachableHint) {
     elements.unreachableHint.textContent = count
       ? "同步删除 Excel、评论、SQLite、分析记录与素材，并执行一致性校验"
-      : reviewCount ? "先查链接、扫码限制和本地素材；确认失效后才允许删除" : "仅删除经双重证据确认已删除或下架的帖子";
+      : reviewCount ? "自动证据不足时，可由你人工确认后彻底删除；操作前会再次提示" : "仅删除经双重证据确认已删除或下架的帖子";
   }
   if (elements.deleteUnreachable) {
     elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || (count === 0 && reviewCount === 0);
     elements.deleteUnreachable.title = count
       ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n")
-      : reviewCount ? "点击重新核验待复核帖子，不会直接删除" : "当前没有经双重证据确认的失效帖子";
+      : reviewCount ? "点击后确认删除这些无效帖子，并同步清理 Excel、数据库和素材" : "当前没有经双重证据确认的失效帖子";
   }
 }
 
@@ -569,9 +569,31 @@ async function refreshUnreachableNotes() {
 async function deleteAllUnreachableNotes() {
   if (unreachableDeleteRunning || batchSyncViewState.running) return;
   if (!unreachableNotes.length) {
-    const reviewCount = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable).length;
-    if (reviewCount) return retryFailedPulledSync();
-    return;
+    const reviewFailures = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable && item?.noteId);
+    if (!reviewFailures.length) return;
+    const preview = reviewFailures.slice(0, 8).map((item) => `• ${item.title || item.noteId}（${item.diagnosis?.label || "待复核"}）`).join("\n");
+    const accepted = confirm(
+      `自动核验尚未达到“确认失效”标准。\n\n你是否人工确认以下 ${reviewFailures.length} 篇属于无效帖子并彻底删除？\n\n${preview}` +
+      `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
+      "将同步删除 Excel 帖子及评论、SQLite 分析记录和素材目录。此操作不可撤销。"
+    );
+    if (!accepted) return;
+    unreachableDeleteRunning = true;
+    if (elements.deleteUnreachable) elements.deleteUnreachable.disabled = true;
+    if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在删除 ${reviewFailures.length} 篇…`;
+    setStatus(`正在按人工确认清理 ${reviewFailures.length} 篇无效帖子…`, "warning");
+    try {
+      const result = await sendRuntime({ type: "deleteReviewedFailures", noteIds: reviewFailures.map((item) => item.noteId) });
+      if (result?.state) renderBatchSync(result.state);
+      if (!result?.ok) throw new Error(result?.error || "部分帖子删除失败");
+      setStatus(`已彻底删除 ${result.deletedCount || reviewFailures.length} 篇人工确认的无效帖子`, "success");
+      showToast("无效帖子已从 Excel、数据库和素材目录清理");
+      await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
+      return result;
+    } finally {
+      unreachableDeleteRunning = false;
+      renderUnreachableNotes({ notes: unreachableNotes, count: unreachableNotes.length });
+    }
   }
   const count = unreachableNotes.length;
   const accepted = confirm(
