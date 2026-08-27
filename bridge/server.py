@@ -40,7 +40,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.9"
+VERSION = "0.23.10"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -3357,6 +3357,11 @@ class MonitorStore:
             return value
         return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
 
+    def weekly_report_dir(self) -> Path:
+        """Keep business-facing reports beside the master workbook, not among Bridge internals."""
+        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        return (xlsx_path.parent / "weekly_reports") if xlsx_path else (self.export_dir / "weekly_reports")
+
     def generate_weekly_report(self, payload: dict[str, Any]) -> dict[str, Any]:
         period_start, period_end = self._report_period(payload)
         with self.lock, self._session() as db:
@@ -3404,7 +3409,7 @@ class MonitorStore:
             "watchlistCount": len(watch_items),
             "issueCategories": dict(issue_counts.most_common()),
         }
-        report_dir = self.export_dir / "weekly_reports"
+        report_dir = self.weekly_report_dir()
         report_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"ORIGANI舆情周报_{period_start.replace('-', '')}_{period_end.replace('-', '')}"
         xlsx_path = report_dir / f"{base_name}.xlsx"
@@ -3534,7 +3539,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             raise ValueError("尚未生成周报")
         report = latest["report"]
         target_type = text(payload.get("target"), 20) or "html"
-        report_root = (self.export_dir / "weekly_reports").resolve()
+        report_root = self.weekly_report_dir().resolve()
         if target_type == "folder":
             target = report_root
         elif target_type == "excel":
