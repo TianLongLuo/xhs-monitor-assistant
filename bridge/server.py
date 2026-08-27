@@ -5076,7 +5076,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         with self.lock, self._session() as db:
             rows = db.execute(
                 """SELECT note_id,title,url,access_error,last_access_checked_at
-                   FROM notes WHERE access_status='unreachable'
+                   FROM notes WHERE access_status='unreachable' AND status<>'ignored'
                    ORDER BY last_access_checked_at DESC, first_seen_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]

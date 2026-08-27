@@ -194,13 +194,15 @@ class V0183Tests(unittest.TestCase):
     def test_ignored_pulled_note_restores_to_known(self):
         note, _old, _kept = self._seed_pulled_note_with_comments()
         with self.store._session() as db:
-            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced' WHERE note_id=?", (note["noteId"],))
+            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced',access_status='unreachable' WHERE note_id=?", (note["noteId"],))
         self.store.ignore({"noteId": note["noteId"]})
+        self.assertEqual([], self.store.list_unreachable_notes())
         restored = self.store.restore({"noteId": note["noteId"]})
         self.assertTrue(restored["ok"])
         with self.store._session() as db:
             status = db.execute("SELECT status FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0]
         self.assertEqual("known", status)
+        self.assertEqual(note["noteId"], self.store.list_unreachable_notes()[0]["note_id"])
 
     def test_comment_sync_updates_sqlite_and_csv_without_blank_rows(self):
         note, old, kept = self._seed_pulled_note_with_comments()
