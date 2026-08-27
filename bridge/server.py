@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
 import html
 import json
@@ -40,7 +41,19 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
 
 
-VERSION = "0.23.12"
+VERSION = "0.24.0"
+NOTE_CSV_HEADERS = [
+    "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
+    "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
+    "图片数量", "发布日期", "来源词", "笔记ID", "博主ID", "对应帖子文件夹地址",
+    "文件夹内清单", "AI情绪判断", "帖子好坏", "访问状态",
+]
+COMMENT_CSV_HEADERS = [
+    "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
+    "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
+    "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断",
+]
+CSV_ENCODING = "utf-8-sig"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
 WHITESPACE_RE = re.compile(r"\s+")
@@ -56,6 +69,15 @@ RELEVANCE_GROUPS = {
 }
 
 _RESOLVED_RELEVANCE_GROUPS: dict[str, tuple[str, ...]] | None = None
+
+
+def _decode_powershell_output(raw: bytes | None) -> str:
+    value = raw or b""
+    if not value:
+        return ""
+    if value.startswith((b"\xff\xfe", b"\xfe\xff")) or value.count(b"\x00") > max(2, len(value) // 8):
+        return value.decode("utf-16le", errors="ignore").lstrip("\ufeff")
+    return value.decode("utf-8", errors="replace").lstrip("\ufeff")
 
 
 def _reopen_saved_office_workbook_read_only(target: Path) -> bool:
@@ -104,8 +126,42 @@ Write-Output $result
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    output = (completed.stdout or b"").decode("utf-16le", errors="ignore")
+    output = _decode_powershell_output(completed.stdout)
     return completed.returncode == 0 and "REOPENED_READ_ONLY" in output
+
+
+def _close_saved_office_workbook(target: Path) -> bool:
+    """Close a saved workbook/CSV so a completed migration can retire it safely."""
+    if os.name != "nt":
+        return False
+    escaped_path = str(Path(target).resolve()).replace("'", "''")
+    script = f"""
+$path = [System.IO.Path]::GetFullPath('{escaped_path}')
+$result = 'NOT_OPEN'
+foreach ($progId in @('ket.Application', 'Excel.Application')) {{
+  try {{ $app = [Runtime.InteropServices.Marshal]::GetActiveObject($progId) }} catch {{ continue }}
+  foreach ($book in @($app.Workbooks)) {{
+    if (-not [System.String]::Equals([System.IO.Path]::GetFullPath($book.FullName), $path, [System.StringComparison]::OrdinalIgnoreCase)) {{ continue }}
+    if (-not $book.Saved) {{ $result = 'UNSAVED'; break }}
+    $book.Close($false)
+    $result = 'CLOSED'
+    break
+  }}
+  if ($result -ne 'NOT_OPEN') {{ break }}
+}}
+Write-Output $result
+"""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=8, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = _decode_powershell_output(completed.stdout)
+    return completed.returncode == 0 and "CLOSED" in output
 
 
 def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_delay: float = 0.15) -> int:
@@ -488,7 +544,10 @@ class MonitorStore:
         self._excel_artifact_cache_lock = threading.Lock()
         self._excel_artifact_cache_key: tuple[str, int, int] | None = None
         self._excel_artifact_cache: dict[str, tuple[str, list[str], int]] = {}
+        # Kept as a compatibility attribute for older extension/API fields.
+        # Since v0.24 it always points to the UTF-8 notes CSV after startup.
         self.seed_xlsx_path: Path | None = None
+        self.comments_csv_path: Path | None = None
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
         self.ai_client = ai_client or DeepSeekClient()
         self.ai_wakeup = threading.Event()
@@ -496,6 +555,220 @@ class MonitorStore:
         self._init_db()
         self._recover_jobs()
         self.ai_workers: list[threading.Thread] = []
+
+    @staticmethod
+    def _derived_csv_paths(master_path: Path) -> tuple[Path, Path]:
+        path = Path(master_path).expanduser().resolve()
+        stem = path.stem
+        if "笔记评论总表" in stem:
+            prefix = stem.split("笔记评论总表", 1)[0].rstrip("_- ") or "小红书"
+            return path.parent / f"{prefix}_笔记总表.csv", path.parent / f"{prefix}_评论总表.csv"
+        if "笔记总表" in stem:
+            return path.with_suffix(".csv"), path.with_name(stem.replace("笔记总表", "评论总表") + ".csv")
+        if path.suffix.lower() == ".csv":
+            return path, path.with_name(f"{stem}_评论总表.csv")
+        return path.parent / f"{stem}_笔记总表.csv", path.parent / f"{stem}_评论总表.csv"
+
+    def configure_data_files(self, master_path: Path) -> tuple[Path, Path]:
+        notes_path, comments_path = self._derived_csv_paths(Path(master_path))
+        self.seed_xlsx_path = notes_path
+        self.comments_csv_path = comments_path
+        return notes_path, comments_path
+
+    def _csv_paths(self) -> tuple[Path, Path]:
+        if not self.seed_xlsx_path:
+            raise ValueError("尚未配置 CSV 总表")
+        notes_path = Path(self.seed_xlsx_path).expanduser().resolve()
+        if notes_path.suffix.lower() != ".csv":
+            notes_path, derived_comments = self._derived_csv_paths(notes_path)
+        else:
+            _notes, derived_comments = self._derived_csv_paths(notes_path)
+        comments_path = Path(self.comments_csv_path).expanduser().resolve() if self.comments_csv_path else derived_comments
+        self.seed_xlsx_path, self.comments_csv_path = notes_path, comments_path
+        return notes_path, comments_path
+
+    @staticmethod
+    def _read_csv_table(path: Path, default_headers: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+        path = Path(path)
+        if not path.is_file():
+            return list(default_headers), []
+        with path.open("r", encoding=CSV_ENCODING, newline="") as stream:
+            reader = csv.DictReader(stream)
+            headers = [str(item).strip() for item in (reader.fieldnames or []) if item is not None and str(item).strip()]
+            if not headers:
+                headers = list(default_headers)
+            for name in default_headers:
+                if name not in headers:
+                    headers.append(name)
+            rows = [
+                {name: "" if row.get(name) is None else str(row.get(name)) for name in headers}
+                for row in reader
+                if row and any(value is not None and str(value) != "" for value in row.values())
+            ]
+        return headers, rows
+
+    @staticmethod
+    def _write_csv_temporary(path: Path, headers: list[str], rows: list[dict[str, Any]], purpose: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.stem}.{purpose}-{os.getpid()}-{time.time_ns()}.tmp.csv")
+        with temporary.open("w", encoding=CSV_ENCODING, newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore", lineterminator="\r\n")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({name: "" if row.get(name) is None else row.get(name) for name in headers})
+            stream.flush()
+            os.fsync(stream.fileno())
+        return temporary
+
+    def _replace_csv_table(self, path: Path, headers: list[str], rows: list[dict[str, Any]], purpose: str) -> None:
+        temporary = self._write_csv_temporary(path, headers, rows, purpose)
+        try:
+            replace_with_retry(temporary, path)
+        except PermissionError as exc:
+            raise ValueError(f"WPS/Excel 持续占用 CSV：{path.name}，请关闭该文件后重试") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _replace_csv_pair(
+        self,
+        note_headers: list[str],
+        note_rows: list[dict[str, Any]],
+        comment_headers: list[str],
+        comment_rows: list[dict[str, Any]],
+        purpose: str,
+    ) -> None:
+        notes_path, comments_path = self._csv_paths()
+        note_temp = self._write_csv_temporary(notes_path, note_headers, note_rows, purpose)
+        comment_temp = self._write_csv_temporary(comments_path, comment_headers, comment_rows, purpose)
+        backups: list[tuple[Path, Path]] = []
+        replaced: list[Path] = []
+        try:
+            for target in (notes_path, comments_path):
+                if target.exists():
+                    backup = target.with_name(f".{target.stem}.{purpose}-backup-{os.getpid()}-{time.time_ns()}.csv")
+                    shutil.copy2(target, backup)
+                    backups.append((target, backup))
+            replace_with_retry(note_temp, notes_path)
+            replaced.append(notes_path)
+            replace_with_retry(comment_temp, comments_path)
+            replaced.append(comments_path)
+        except PermissionError as exc:
+            backed_up = {target for target, _backup in backups}
+            for target, backup in backups:
+                if backup.exists():
+                    os.replace(backup, target)
+            for target in replaced:
+                if target not in backed_up:
+                    target.unlink(missing_ok=True)
+            raise ValueError("WPS/Excel 持续占用 CSV 总表，请关闭笔记表和评论表后重试") from exc
+        except Exception:
+            backed_up = {target for target, _backup in backups}
+            for target, backup in backups:
+                if backup.exists():
+                    os.replace(backup, target)
+            for target in replaced:
+                if target not in backed_up:
+                    target.unlink(missing_ok=True)
+            raise
+        finally:
+            note_temp.unlink(missing_ok=True)
+            comment_temp.unlink(missing_ok=True)
+            for _target, backup in backups:
+                backup.unlink(missing_ok=True)
+
+    def _ensure_seed_workbook(self, _path: Path | None = None) -> None:
+        """Create the two UTF-8 BOM CSV tables required by a fresh installation."""
+        notes_path, comments_path = self._csv_paths()
+        if not notes_path.exists():
+            self._replace_csv_table(notes_path, NOTE_CSV_HEADERS, [], "initialize")
+        if not comments_path.exists():
+            self._replace_csv_table(comments_path, COMMENT_CSV_HEADERS, [], "initialize")
+
+    def migrate_legacy_workbook(self, xlsx_path: Path) -> dict[str, Any]:
+        """Losslessly split the legacy workbook into notes/comments UTF-8 CSV files."""
+        from openpyxl import load_workbook
+
+        source = Path(xlsx_path).expanduser().resolve()
+        if source.suffix.lower() not in {".xlsx", ".xlsm"} or not source.is_file():
+            raise ValueError("旧版 XLSX 总表不存在")
+        notes_path, comments_path = self._derived_csv_paths(source)
+        workbook = load_workbook(source, read_only=True, data_only=False)
+        try:
+            if "sheet1_笔记总表" not in workbook.sheetnames or "sheet2_评论总表" not in workbook.sheetnames:
+                raise ValueError("旧版 XLSX 缺少笔记总表或评论总表")
+
+            def extract(sheet_name: str, required: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+                sheet = workbook[sheet_name]
+                values = list(sheet.iter_rows(values_only=True))
+                raw_headers = [text(value, 200) for value in (values[0] if values else ())]
+                while raw_headers and not raw_headers[-1]:
+                    raw_headers.pop()
+                headers = [name or f"未命名列{index + 1}" for index, name in enumerate(raw_headers)]
+                for name in required:
+                    if name not in headers:
+                        headers.append(name)
+                rows: list[dict[str, Any]] = []
+                for values_row in values[1:]:
+                    row = {headers[index]: values_row[index] if index < len(values_row) else "" for index in range(len(raw_headers))}
+                    for name in required:
+                        row.setdefault(name, "")
+                    if any(value not in (None, "") for value in row.values()):
+                        rows.append(row)
+                return headers, rows
+
+            note_headers, note_rows = extract("sheet1_笔记总表", NOTE_CSV_HEADERS)
+            comment_headers, comment_rows = extract("sheet2_评论总表", COMMENT_CSV_HEADERS)
+            legacy_archive: list[tuple[str, int, str]] = []
+            for sheet in workbook.worksheets:
+                if sheet.title in {"sheet1_笔记总表", "sheet2_评论总表"}:
+                    continue
+                for row_number, values_row in enumerate(sheet.iter_rows(values_only=True), 1):
+                    values = list(values_row)
+                    while values and values[-1] in (None, ""):
+                        values.pop()
+                    if not values:
+                        continue
+                    legacy_archive.append((sheet.title, row_number, json.dumps(values, ensure_ascii=False, default=str)))
+        finally:
+            workbook.close()
+
+        migrated_at = now_iso()
+        with self.lock, self._session() as db:
+            db.execute("DELETE FROM legacy_sheet_archive WHERE source_path=?", (str(source),))
+            db.executemany(
+                """INSERT INTO legacy_sheet_archive(source_path,sheet_name,row_number,row_json,migrated_at)
+                   VALUES(?,?,?,?,?)""",
+                [(str(source), sheet_name, row_number, row_json, migrated_at)
+                 for sheet_name, row_number, row_json in legacy_archive],
+            )
+            archived_count = int(db.execute(
+                "SELECT COUNT(*) FROM legacy_sheet_archive WHERE source_path=?", (str(source),)
+            ).fetchone()[0])
+        if archived_count != len(legacy_archive):
+            raise ValueError("旧版附加 Sheet 归档校验失败，XLSX 已保留")
+
+        self.seed_xlsx_path, self.comments_csv_path = notes_path, comments_path
+        self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "migrate")
+        verify_note_headers, verified_notes = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        verify_comment_headers, verified_comments = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        source_note_ids = [valid_note_id(row.get("笔记ID")) for row in note_rows if valid_note_id(row.get("笔记ID"))]
+        csv_note_ids = [valid_note_id(row.get("笔记ID")) for row in verified_notes if valid_note_id(row.get("笔记ID"))]
+        source_comment_ids = [text(row.get("笔记评论ID"), 256) for row in comment_rows]
+        csv_comment_ids = [text(row.get("笔记评论ID"), 256) for row in verified_comments]
+        def logical_rows(headers: list[str], rows: list[dict[str, Any]]) -> list[list[str]]:
+            return [["" if row.get(name) is None else str(row.get(name)) for name in headers] for row in rows]
+        note_content_matches = logical_rows(note_headers, note_rows) == logical_rows(note_headers, verified_notes)
+        comment_content_matches = logical_rows(comment_headers, comment_rows) == logical_rows(comment_headers, verified_comments)
+        if (len(note_rows) != len(verified_notes) or len(comment_rows) != len(verified_comments)
+                or source_note_ids != csv_note_ids or source_comment_ids != csv_comment_ids
+                or not note_content_matches or not comment_content_matches):
+            raise ValueError("CSV 迁移校验失败，旧版 XLSX 已保留")
+        return {
+            "ok": True, "notesPath": str(notes_path), "commentsPath": str(comments_path),
+            "noteRows": len(verified_notes), "commentRows": len(verified_comments),
+            "noteColumns": len(verify_note_headers), "commentColumns": len(verify_comment_headers),
+            "archivedSheetRows": archived_count,
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=10)
@@ -773,6 +1046,17 @@ class MonitorStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_weekly_reports_generated
                     ON weekly_reports(generated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS legacy_sheet_archive (
+                    source_path TEXT NOT NULL,
+                    sheet_name TEXT NOT NULL,
+                    row_number INTEGER NOT NULL,
+                    row_json TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL,
+                    PRIMARY KEY(source_path, sheet_name, row_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_legacy_sheet_archive_sheet
+                    ON legacy_sheet_archive(sheet_name, row_number);
                 """
             )
 
@@ -829,7 +1113,7 @@ class MonitorStore:
                         ),
                     )
 
-    def _ensure_access_status_column(self, xlsx_path: Path) -> bool:
+    def _legacy_ensure_access_status_column(self, xlsx_path: Path) -> bool:
         """Migrate an existing workbook so the access status is visible immediately."""
         from openpyxl import load_workbook
 
@@ -866,11 +1150,11 @@ class MonitorStore:
                     except OSError:
                         pass
 
-    def seed_from_xlsx(self, xlsx_path: Path) -> int:
-        """Synchronize the Excel post index into the local comparison database."""
+    def _seed_from_legacy_xlsx(self, xlsx_path: Path) -> int:
+        """Import notes and legacy irrelevant-sheet records before XLSX retirement."""
         from openpyxl import load_workbook
 
-        self._ensure_access_status_column(Path(xlsx_path))
+        self._legacy_ensure_access_status_column(Path(xlsx_path))
         workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
         if "sheet1_笔记总表" not in workbook.sheetnames:
             raise ValueError("seed workbook is missing sheet1_笔记总表")
@@ -931,7 +1215,8 @@ class MonitorStore:
                             tags=CASE WHEN ? <> '' THEN ? ELSE tags END,
                             keyword=CASE WHEN ? <> '' THEN ? ELSE keyword END,
                             page_url=CASE WHEN ? <> '' THEN ? ELSE page_url END,
-                            status='known', source='existing_xlsx', is_relevant=1, relevance_status='relevant', relevance_source='excel',
+                            status=CASE WHEN status='ignored' THEN status ELSE 'known' END,
+                            source='existing_xlsx', is_relevant=1, relevance_status='relevant', relevance_source='excel',
                             post_sentiment=CASE WHEN ? <> '' THEN ? ELSE post_sentiment END,
                             title_key=CASE WHEN ? <> '' THEN ? ELSE title_key END,
                             content_key=CASE WHEN ? <> '' THEN ? ELSE content_key END,
@@ -1040,6 +1325,112 @@ class MonitorStore:
             )
         workbook.close()
         return inserted
+
+    def _seed_from_csv(self, notes_path: Path) -> int:
+        """Synchronize the UTF-8 notes CSV index into SQLite."""
+        headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        if "笔记ID" not in headers:
+            raise ValueError("笔记 CSV 缺少笔记ID列")
+        inserted = 0
+        timestamp = now_iso()
+        with self.lock, self._session() as db:
+            for row in rows:
+                note_id = valid_note_id(row.get("笔记ID"))
+                if not note_id:
+                    continue
+                row_title = text(row.get("笔记标题"), 1000)
+                row_content = text(row.get("笔记内容"), 20000)
+                row_tags = text(row.get("笔记话题"), 6000)
+                row_access_label = text(row.get("访问状态"), 100).strip()
+                row_title_key, row_content_key, row_combined_key = identity_keys(row_title, row_content)
+                row_files = [line.strip() for line in text(row.get("文件夹内清单"), 50000).splitlines() if line.strip()]
+                row_media_dir = self._resolve_legacy_media_dir(row.get("对应帖子文件夹地址"), row_files, note_id)
+                existing = db.execute(
+                    "SELECT note_id,url,page_url,access_status,access_check_result FROM notes WHERE note_id=?", (note_id,)
+                ).fetchone()
+                confirmed_unreachable = bool(existing and existing["access_check_result"] == "confirmed_v2")
+                if row_access_label == "可打开":
+                    access_status, access_error, access_result = "ok", "", "opened"
+                elif row_access_label == "打不开" and confirmed_unreachable:
+                    access_status, access_error, access_result = "unreachable", "", "confirmed_v2"
+                elif row_access_label in {"打不开", "待复核", "检查失败"}:
+                    access_status, access_error, access_result = "check_failed", "CSV 中的旧状态等待重新同步核验", "legacy_excel_unverified"
+                else:
+                    access_status, access_error, access_result = "", "", ""
+                row_url = text(row.get("笔记url"), 4000)
+                if existing:
+                    preferred = preferred_url(existing["url"], row_url)
+                    preferred_page = preferred_url(existing["page_url"], row_url)
+                    db.execute(
+                        """UPDATE notes SET url=CASE WHEN ?<>'' THEN ? ELSE url END,
+                           title=CASE WHEN ?<>'' THEN ? ELSE title END,
+                           author=CASE WHEN ?<>'' THEN ? ELSE author END,
+                           content=CASE WHEN ?<>'' THEN ? ELSE content END,
+                           tags=CASE WHEN ?<>'' THEN ? ELSE tags END,
+                           keyword=CASE WHEN ?<>'' THEN ? ELSE keyword END,
+                           page_url=CASE WHEN ?<>'' THEN ? ELSE page_url END,
+                           status=CASE WHEN status='ignored' THEN status ELSE 'known' END,
+                           source='existing_xlsx',is_relevant=1,relevance_status='relevant',relevance_source='csv',
+                           post_sentiment=CASE WHEN ?<>'' THEN ? ELSE post_sentiment END,
+                           title_key=CASE WHEN ?<>'' THEN ? ELSE title_key END,
+                           content_key=CASE WHEN ?<>'' THEN ? ELSE content_key END,
+                           title_content_key=CASE WHEN ?<>'' THEN ? ELSE title_content_key END,
+                           last_seen_at=?,access_status=?,access_error=?,access_check_result=?,
+                           pull_status='synced',pull_error='',excel_synced_at=?,excel_sync_path=? WHERE note_id=?""",
+                        (preferred, preferred, row_title, row_title, text(row.get("用户昵称"), 500), text(row.get("用户昵称"), 500),
+                         row_content, row_content, row_tags, row_tags, text(row.get("来源词"), 200), text(row.get("来源词"), 200),
+                         preferred_page, preferred_page, text(row.get("帖子好坏"), 80), text(row.get("帖子好坏"), 80),
+                         row_title_key, row_title_key, row_content_key, row_content_key, row_combined_key, row_combined_key,
+                         timestamp, access_status, access_error, access_result, timestamp, str(notes_path), note_id),
+                    )
+                else:
+                    db.execute(
+                        """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
+                           status,is_relevant,source,post_sentiment,title_key,content_key,title_content_key,payload_json,
+                           access_status,access_error,access_check_result,pull_status,excel_synced_at,excel_sync_path,relevance_status,relevance_source)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,'known',1,'existing_xlsx',?,?,?,?,?, ?,?,?,'synced',?,?, 'relevant','csv')""",
+                        (note_id, row_url, row_title, text(row.get("用户昵称"), 500), row_content, row_tags,
+                         text(row.get("来源词"), 200), row_url, timestamp, timestamp, text(row.get("帖子好坏"), 80),
+                         row_title_key, row_content_key, row_combined_key,
+                         json.dumps({"seed": "csv", "tags": row_tags}, ensure_ascii=False), access_status, access_error,
+                         access_result, timestamp, str(notes_path)),
+                    )
+                    inserted += 1
+                if row_media_dir:
+                    db.execute(
+                        "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
+                        (row_media_dir, len(row_files), note_id),
+                    )
+        return inserted
+
+    def seed_from_xlsx(self, master_path: Path) -> int:
+        """Compatibility entry point: migrate XLSX once, then use two CSV files."""
+        source = Path(master_path).expanduser().resolve()
+        if source.suffix.lower() in {".xlsx", ".xlsm"} and source.is_file():
+            inserted = self._seed_from_legacy_xlsx(source)
+            migration = self.migrate_legacy_workbook(source)
+            notes_path = Path(migration["notesPath"])
+            self.seed_xlsx_path = notes_path
+            self.comments_csv_path = Path(migration["commentsPath"])
+            # Only retire the workbook after CSV content verification and SQLite import both succeed.
+            retired = False
+            for attempt in range(8):
+                try:
+                    source.unlink(missing_ok=True)
+                    retired = not source.exists()
+                    break
+                except PermissionError:
+                    if attempt == 0:
+                        _close_saved_office_workbook(source)
+                    time.sleep(0.2 * (attempt + 1))
+            if not retired:
+                print(f"[bridge] CSV 迁移已完成；旧 XLSX 尚有未保存内容或仍被占用，暂不强制删除：{source}", flush=True)
+            self._seed_from_csv(notes_path)
+            return inserted
+        notes_path, comments_path = self.configure_data_files(source)
+        self._ensure_seed_workbook(notes_path)
+        self.comments_csv_path = comments_path
+        return self._seed_from_csv(notes_path)
 
     def _find_match(
         self,
@@ -1483,7 +1874,9 @@ class MonitorStore:
             raise ValueError("noteId is required")
         with self.lock, self._session() as db:
             updated = db.execute(
-                "UPDATE notes SET status = 'new', last_seen_at = ? WHERE note_id = ? AND status = 'ignored'",
+                """UPDATE notes SET status=CASE
+                   WHEN source='existing_xlsx' OR pull_status IN ('synced','partial') THEN 'known'
+                   ELSE 'new' END, last_seen_at=? WHERE note_id=? AND status='ignored'""",
                 (now_iso(), note_id),
             ).rowcount
         if not updated:
@@ -1727,12 +2120,13 @@ class MonitorStore:
             "canPrune": can_prune, "newCount": len(new_comments), "removedCount": len(removed),
             "changedCount": len(changed_comments), "pendingRemovedCount": len(pending_removed),
             "hasChanges": bool(new_comments or removed or changed_comments or note_changes),
+            "commentHasChanges": bool(new_comments or removed or changed_comments),
             "noteChanged": bool(note_changes), "noteChanges": note_changes,
             "newComments": new_comments, "removedComments": removed,
             "changedComments": changed_comments, "pendingRemovedComments": pending_removed,
         }
 
-    def _delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
+    def _legacy_delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
         if not removed:
             return 0
         xlsx_path = Path(getattr(self, "seed_xlsx_path", "") or "")
@@ -1791,6 +2185,29 @@ class MonitorStore:
                 workbook.close()
             if temporary_path and temporary_path.exists():
                 temporary_path.unlink(missing_ok=True)
+
+    def _delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
+        if not removed:
+            return 0
+        _notes_path, comments_path = self._csv_paths()
+        headers, rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        removed_ids = {text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)}
+        removed_exact = {(text(item.get("author"), 500), text(item.get("content"), 8000),
+                          text(item.get("publishedAt"), 100)) for item in removed}
+        kept: list[dict[str, Any]] = []
+        deleted = 0
+        for row in rows:
+            belongs = note_url_identity(row.get("原笔记url")) == note_id
+            row_id = text(row.get("笔记评论ID"), 256)
+            row_key = (text(row.get("用户昵称"), 500), text(row.get("评论内容"), 8000),
+                       text(row.get("评论时间"), 100))
+            if belongs and (row_id in removed_ids or row_key in removed_exact):
+                deleted += 1
+            else:
+                kept.append(row)
+        if deleted:
+            self._replace_csv_table(comments_path, headers, kept, "comment-prune")
+        return deleted
 
     def sync_comment_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Apply a reviewed comment delta to SQLite, Excel and comments.json."""
@@ -1908,7 +2325,7 @@ class MonitorStore:
         return [dict(row) for row in rows]
 
 
-    def _excel_note_artifacts(self, note_id: str) -> tuple[str, list[str], int]:
+    def _legacy_excel_note_artifacts(self, note_id: str) -> tuple[str, list[str], int]:
         """Return workbook artifacts from a revision-aware, process-local index."""
         xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
         if not xlsx_path or not xlsx_path.exists():
@@ -1988,6 +2405,33 @@ class MonitorStore:
             return ""
         scored.sort(key=lambda item: item[0], reverse=True)
         return str(scored[0][1])
+
+    def _excel_note_artifacts(self, note_id: str) -> tuple[str, list[str], int]:
+        if not self.seed_xlsx_path:
+            return "", [], 0
+        notes_path, _comments_path = self._csv_paths()
+        if not notes_path.is_file():
+            return "", [], 0
+        try:
+            stat = notes_path.stat()
+            cache_key = (str(notes_path).casefold(), int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            return "", [], 0
+        with self._excel_artifact_cache_lock:
+            if self._excel_artifact_cache_key != cache_key:
+                _headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                artifact_index: dict[str, tuple[str, list[str], int]] = {}
+                for row_number, row in enumerate(rows, 2):
+                    row_id = valid_note_id(row.get("笔记ID"))
+                    if not row_id:
+                        continue
+                    folder = text(row.get("对应帖子文件夹地址"), 4000)
+                    files = [line.strip() for line in text(row.get("文件夹内清单"), 50000).splitlines() if line.strip()]
+                    artifact_index[row_id] = (folder, files, row_number)
+                self._excel_artifact_cache = artifact_index
+                self._excel_artifact_cache_key = cache_key
+            raw_folder, files, row_number = self._excel_artifact_cache.get(note_id, ("", [], 0))
+        return raw_folder, list(files), row_number
 
     def note_status(self, note_id: str) -> dict[str, Any]:
         note_id = valid_note_id(note_id)
@@ -2093,7 +2537,7 @@ class MonitorStore:
             "watchReason": watch_row["reason"] if watch_row else "",
         }
 
-    def _sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
+    def _legacy_sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
         xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
         if not xlsx_path or not xlsx_path.exists():
             raise ValueError("未配置 Excel 总表路径")
@@ -2140,6 +2584,11 @@ class MonitorStore:
                 workbook.close()
             replace_with_retry(temporary_path, xlsx_path)
         return {"path": str(xlsx_path), "sheet": "sheet3_不相关帖子", "row": target_row}
+
+    def _sync_irrelevant_to_xlsx(self, note: dict[str, Any], comments: list[dict[str, Any]], decision: dict[str, Any]) -> dict[str, Any]:
+        # CSV mode deliberately has exactly two business tables. Irrelevant
+        # candidates remain fully queryable in SQLite instead of creating a third file.
+        return {"path": "", "sheet": "sqlite:irrelevant", "row": 0, "storedIn": "sqlite"}
 
     def analyze_relevance(self, payload: dict[str, Any]) -> dict[str, Any]:
         note = payload.get("note") or {}
@@ -3231,46 +3680,36 @@ class MonitorStore:
         add_issue("orphan_watchlist", "warning", "观察名单存在失效引用", "观察名单关联的帖子已经不在数据库中。",
                   orphan_watch, True)
 
-        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        try:
+            notes_path, comments_path = self._csv_paths()
+        except ValueError:
+            notes_path = comments_path = None
         excel_note_ids: list[str] = []
         excel_comment_rows = 0
-        if not xlsx_path or not xlsx_path.exists():
-            add_issue("excel_missing", "critical", "Excel 总表不存在", "当前配置路径下没有找到 Excel 总表。", 1, False)
+        if not notes_path or not comments_path or not notes_path.exists() or not comments_path.exists():
+            add_issue("csv_missing", "critical", "CSV 总表不存在", "当前配置路径下缺少笔记总表或评论总表。", 1, False)
         else:
             try:
-                from openpyxl import load_workbook
-                workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
-                try:
-                    if "sheet1_笔记总表" not in workbook.sheetnames or "sheet2_评论总表" not in workbook.sheetnames:
-                        add_issue("excel_schema", "critical", "Excel 工作表结构不完整", "缺少帖子总表或评论总表。", 1, False)
-                    else:
-                        note_sheet = workbook["sheet1_笔记总表"]
-                        note_headers = self._excel_headers(note_sheet)
-                        note_col = note_headers.get("笔记ID")
-                        if not note_col:
-                            add_issue("excel_note_id_column", "critical", "Excel 缺少笔记ID列", "无法可靠对齐帖子。", 1, False)
-                        else:
-                            excel_note_ids = [
-                                valid_note_id(note_sheet.cell(row, note_col).value)
-                                for row in range(2, note_sheet.max_row + 1)
-                            ]
-                            excel_note_ids = [value for value in excel_note_ids if value]
-                        comment_sheet = workbook["sheet2_评论总表"]
-                        excel_comment_rows = max(0, comment_sheet.max_row - 1)
-                finally:
-                    workbook.close()
+                note_headers, csv_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                comment_headers, csv_comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+                if "笔记ID" not in note_headers or "笔记评论ID" not in comment_headers:
+                    add_issue("csv_schema", "critical", "CSV 表头结构不完整", "缺少帖子或评论 ID 列。", 1, False)
+                else:
+                    excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
+                    excel_note_ids = [value for value in excel_note_ids if value]
+                    excel_comment_rows = len(csv_comment_rows)
             except Exception as exc:
-                add_issue("excel_read", "critical", "Excel 总表读取失败", text(exc, 500), 1, False)
+                add_issue("csv_read", "critical", "CSV 总表读取失败", text(exc, 500), 1, False)
 
         excel_note_set = set(excel_note_ids)
         duplicate_excel = len(excel_note_ids) - len(excel_note_set)
         missing_excel = sorted(pulled_ids - excel_note_set)
         excel_only = sorted(excel_note_set - db_note_ids)
-        add_issue("excel_duplicate_notes", "critical", "Excel 存在重复帖子行", "同一笔记 ID 在帖子总表重复出现。",
+        add_issue("csv_duplicate_notes", "critical", "CSV 存在重复帖子行", "同一笔记 ID 在笔记总表重复出现。",
                   duplicate_excel, False)
-        add_issue("pulled_missing_excel", "critical", "已拉取帖子未写入 Excel", "SQLite 标记已拉取，但 Excel 找不到对应帖子行。",
+        add_issue("pulled_missing_csv", "critical", "已拉取帖子未写入 CSV", "SQLite 标记已拉取，但笔记 CSV 找不到对应帖子行。",
                   len(missing_excel), False, missing_excel)
-        add_issue("excel_missing_sqlite", "warning", "Excel 帖子未进入 SQLite", "重新载入 Excel 可修复本地索引。",
+        add_issue("csv_missing_sqlite", "warning", "CSV 帖子未进入 SQLite", "重新载入 CSV 可修复本地索引。",
                   len(excel_only), True, excel_only)
 
         weights = {"critical": 24, "warning": 7, "info": 1}
@@ -3281,6 +3720,7 @@ class MonitorStore:
             "ok": True, "status": status, "score": score, "checkedAt": now_iso(), "issues": issues,
             "summary": {
                 "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
+                "csvNotes": len(excel_note_ids), "csvComments": excel_comment_rows,
                 "excelNotes": len(excel_note_ids), "excelComments": excel_comment_rows,
                 "pulledNotes": len(pulled_ids), "issueCount": len(issues),
                 "repairableCount": sum(1 for item in issues if item["repairable"]),
@@ -3290,13 +3730,13 @@ class MonitorStore:
     def repair_data_health(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         actions: list[str] = []
         warnings: list[str] = []
-        xlsx_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
-        if xlsx_path and xlsx_path.exists():
+        notes_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
+        if notes_path and notes_path.exists():
             try:
-                inserted = self.seed_from_xlsx(xlsx_path)
-                actions.append(f"重新载入 Excel，补充 {inserted} 条本地索引")
+                inserted = self.seed_from_xlsx(notes_path)
+                actions.append(f"重新载入 CSV，补充 {inserted} 条本地索引")
             except Exception as exc:
-                warnings.append(f"Excel 重载失败：{text(exc, 500)}")
+                warnings.append(f"CSV 重载失败：{text(exc, 500)}")
         with self.lock, self._session() as db:
             db.execute(
                 """UPDATE notes SET comment_count_collected=(
@@ -3331,7 +3771,7 @@ class MonitorStore:
             if migrated.get("updated"):
                 actions.append(f"迁移 {migrated['updated']} 条旧访问状态")
         except Exception as exc:
-            warnings.append(f"访问状态 Excel 回写失败：{text(exc, 500)}")
+            warnings.append(f"访问状态 CSV 回写失败：{text(exc, 500)}")
         return {"ok": True, "actions": actions, "warnings": warnings, "health": self.data_health()}
 
     @staticmethod
@@ -4010,7 +4450,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         media_result["files"] = files
         media_result["fileCount"] = len(files)
 
-    def _sync_pull_to_xlsx(
+    def _legacy_sync_pull_to_xlsx(
         self,
         note: dict[str, Any],
         comments: list[dict[str, Any]],
@@ -4244,8 +4684,141 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 except OSError:
                     pass
 
-    def _ensure_seed_workbook(self, xlsx_path: Path) -> None:
-        """Excel 总表不存在时，自动初始化含两张标准工作表的空表（新用户开箱即用）。"""
+    def _sync_pull_to_xlsx(
+        self,
+        note: dict[str, Any],
+        comments: list[dict[str, Any]],
+        media_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently update the two UTF-8 CSV master tables."""
+        notes_path, comments_path = self._csv_paths()
+        self._ensure_seed_workbook(notes_path)
+        media_result = media_result or {}
+        media_folder = text(media_result.get("folder"), 4000)
+        media_files = "\n".join(text(item, 300) for item in (media_result.get("files") or []) if text(item, 300))
+        note_id = valid_note_id(note.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+
+        existing_index = next((index for index, row in enumerate(note_rows)
+                               if valid_note_id(row.get("笔记ID")) == note_id), None)
+        matched_by = "note_id" if existing_index is not None else "new"
+        if existing_index is None:
+            _title, _content, incoming_combined = identity_keys(note.get("title"), note.get("content"))
+            if incoming_combined:
+                for index, row in enumerate(note_rows):
+                    _rt, _rc, row_combined = identity_keys(row.get("笔记标题"), row.get("笔记内容"))
+                    if row_combined == incoming_combined:
+                        existing_index = index
+                        matched_by = "title_content"
+                        stored_id = valid_note_id(row.get("笔记ID"))
+                        if stored_id:
+                            note_id = stored_id
+                        break
+        is_new_note = existing_index is None
+        if is_new_note:
+            note_row_data: dict[str, Any] = {name: "" for name in note_headers}
+            note_rows.append(note_row_data)
+            existing_index = len(note_rows) - 1
+        else:
+            note_row_data = note_rows[existing_index]
+
+        def set_note_value(name: str, value: Any) -> None:
+            if name not in note_headers:
+                note_headers.append(name)
+                for row in note_rows:
+                    row.setdefault(name, "")
+            if value not in (None, "") or is_new_note:
+                note_row_data[name] = "" if value is None else value
+
+        note_url = preferred_url(note_row_data.get("笔记url"), note.get("url"))
+        note_tags = tag_text(note.get("tags")) or ("无话题" if note.get("detailRead") else "")
+        note_fields = {
+            "笔记url": note_url, "用户主页url": text(note.get("authorUrl"), 2000),
+            "用户昵称": text(note.get("author"), 500),
+            "笔记标题": canonical_note_title(note.get("title"), note.get("content"), 80),
+            "笔记内容": text(note.get("content"), 12000), "笔记话题": note_tags,
+            "点赞量": note.get("likeCount", ""), "收藏量": note.get("collectCount", ""),
+            "评论量": note.get("commentCount", ""), "分享量": note.get("shareCount", ""),
+            "发布时间": text(note.get("publishedAt"), 100), "更新时间": text(note.get("updatedAt"), 100),
+            "IP地址": text(note.get("ipLocation"), 100),
+            "图片数量": note.get("imageCount", len(note.get("imageUrls") or [])),
+            "发布日期": text(note.get("publishedAt"), 100)[:10], "来源词": text(note.get("keyword"), 200),
+            "笔记ID": note_id, "博主ID": text(note.get("authorId"), 256),
+            "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
+            "AI情绪判断": text(note.get("postSentiment"), 80), "帖子好坏": text(note.get("postSentiment"), 80),
+            "访问状态": "可打开",
+        }
+        for name, value in note_fields.items():
+            set_note_value(name, value)
+
+        by_id: dict[str, int] = {}
+        by_key: dict[tuple[str, str, str, str], int] = {}
+        by_loose: dict[tuple[str, str, str], int] = {}
+        for index, row in enumerate(comment_rows):
+            row_id = text(row.get("笔记评论ID"), 256)
+            if row_id:
+                by_id[row_id] = index
+            key = (note_url_identity(row.get("原笔记url")), text(row.get("用户昵称"), 500),
+                   text(row.get("评论内容"), 8000), text(row.get("评论时间"), 100))
+            if any(key):
+                by_key[key] = index
+                by_loose[key[:3]] = index
+        inserted_comments = 0
+        duplicate_comments = 0
+        for item in comments:
+            if not isinstance(item, dict) or not text(item.get("content"), 8000):
+                continue
+            generated_id = self._excel_comment_id(note_id, item)
+            key = (note_url_identity(note_url) or note_id, text(item.get("author"), 500),
+                   text(item.get("content"), 8000), text(item.get("publishedAt"), 100))
+            row_index = by_id.get(generated_id)
+            if row_index is None:
+                row_index = by_key.get(key)
+            if row_index is None:
+                row_index = by_loose.get(key[:3])
+            is_new_comment = row_index is None
+            if is_new_comment:
+                comment_row: dict[str, Any] = {name: "" for name in comment_headers}
+                comment_rows.append(comment_row)
+                row_index = len(comment_rows) - 1
+                inserted_comments += 1
+            else:
+                comment_row = comment_rows[row_index]
+                duplicate_comments += 1
+            level = max(1, min(int(item.get("commentLevel") or 1), 3))
+            fields = {
+                "原笔记url": note_url, "帖子用户主页url": text(note.get("authorUrl"), 2000),
+                "笔记评论ID": generated_id, "用户昵称": text(item.get("author"), 500),
+                "评论内容": text(item.get("content"), 8000), "评论时间": text(item.get("publishedAt"), 100),
+                "是否帖主评论": "是" if bool_value(item.get("isAuthor")) else "否",
+                "点赞量": item.get("likeCount", 0), "评论层级": f"{level}级评论",
+                "父评论ID": text(item.get("parentCommentId"), 256),
+                "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
+                "AI情绪判断": text(item.get("sentiment"), 80),
+            }
+            for name, value in fields.items():
+                if name not in comment_headers:
+                    comment_headers.append(name)
+                    for row in comment_rows:
+                        row.setdefault(name, "")
+                comment_row[name] = "" if value is None else value
+            by_id[generated_id] = row_index
+            by_key[key] = row_index
+            by_loose[key[:3]] = row_index
+
+        self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "sync")
+        return {
+            "ok": True, "path": str(notes_path), "commentsPath": str(comments_path),
+            "postAdded": int(is_new_note), "commentAdded": inserted_comments,
+            "commentSkipped": duplicate_comments, "deduplicated": (not is_new_note) or duplicate_comments > 0,
+            "matchedBy": matched_by, "noteRow": int(existing_index) + 2,
+        }
+
+    def _legacy_create_seed_workbook(self, xlsx_path: Path) -> None:
+        """Retained only for tests/tools that explicitly request a legacy workbook."""
         if xlsx_path.exists():
             return
         from openpyxl import Workbook
@@ -4277,8 +4850,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         workbook.close()
         print(f"[bridge] 已自动创建 Excel 总表：{xlsx_path}")
 
-    def set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Persist one sync run's reachability results in one Excel transaction."""
+    def _legacy_set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Legacy XLSX implementation retained for migration reference only."""
         raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
         deduplicated: dict[str, dict[str, Any]] = {}
         for raw in raw_items:
@@ -4403,6 +4976,79 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         return {"ok": True, "updated": len(normalized), "excelRows": total_rows,
                 "byStatus": by_status, "items": normalized}
 
+    def set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist one sync run's reachability results in one CSV transaction."""
+        raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        labels = {"ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""}
+        deduplicated: dict[str, dict[str, Any]] = {}
+        for raw in raw_items:
+            if isinstance(raw, dict):
+                note_id = valid_note_id(raw.get("noteId"))
+                if note_id:
+                    deduplicated[note_id] = raw
+        if not deduplicated:
+            raise ValueError("items must contain at least one noteId")
+        normalized: list[dict[str, Any]] = []
+        for note_id, raw in deduplicated.items():
+            requested = text(raw.get("status"), 40).strip().lower()
+            if requested == "suspected":
+                requested = "check_failed"
+            if requested not in labels:
+                raise ValueError("status must be ok, check_failed, unreachable or empty")
+            normalized.append({
+                "noteId": note_id, "status": requested, "excelStatus": labels[requested],
+                "error": "" if requested == "ok" else text(raw.get("error"), 1000),
+                "result": text(raw.get("result"), 80) or {"ok": "opened", "check_failed": "inconclusive",
+                           "unreachable": "confirmed_v2", "": ""}[requested],
+                "checkedAt": text(raw.get("checkedAt"), 80) or now_iso(),
+            })
+        notes_path, _comments_path = self._csv_paths()
+        headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        if "访问状态" not in headers:
+            headers.append("访问状态")
+            for row in rows:
+                row["访问状态"] = ""
+        rows_by_id: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            row_id = valid_note_id(row.get("笔记ID"))
+            if row_id:
+                rows_by_id.setdefault(row_id, []).append(row)
+        with self.pull_lock:
+            with self.lock, self._session() as db:
+                for item in normalized:
+                    stored = db.execute("SELECT title,access_status FROM notes WHERE note_id=?", (item["noteId"],)).fetchone()
+                    if not stored:
+                        raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
+                    item["previousStatus"] = text(stored["access_status"], 40)
+                    item["title"] = text(stored["title"], 1000)
+                    matched = rows_by_id.get(item["noteId"], [])
+                    for row in matched:
+                        row["访问状态"] = item["excelStatus"]
+                    item["excelRows"] = len(matched)
+            self._replace_csv_table(notes_path, headers, rows, "access")
+            with self.lock, self._session() as db:
+                for item in normalized:
+                    db.execute(
+                        """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?
+                           WHERE note_id=?""",
+                        (item["status"], item["error"], item["checkedAt"], item["result"], item["noteId"]),
+                    )
+                    previous, current = item.get("previousStatus") or "", item["status"]
+                    if previous != current and bool(previous or current in {"check_failed", "unreachable"}):
+                        human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
+                        db.execute(
+                            """INSERT INTO change_events
+                               (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
+                               VALUES (?,?,?,?,?,?,?,?)""",
+                            (max(0, int(payload.get("runId") or 0)), item["noteId"], "access_status_changed",
+                             item.get("title") or "", f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}",
+                             json.dumps({"status": previous}, ensure_ascii=False),
+                             json.dumps({"status": current, "error": item["error"]}, ensure_ascii=False), item["checkedAt"]),
+                        )
+        by_status = dict(Counter(item["status"] for item in normalized))
+        return {"ok": True, "updated": len(normalized), "excelRows": sum(item["excelRows"] for item in normalized),
+                "byStatus": by_status, "items": normalized, "path": str(notes_path)}
+
     def set_note_access_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         result = self.set_note_access_statuses({"items": [payload], "runId": payload.get("runId")})
         item = result["items"][0]
@@ -4465,8 +5111,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "error": "；".join(item["error"] for item in failures[:3]),
         }
 
-    def delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Physically remove one pulled note from Excel, SQLite and its media folder."""
+    def _legacy_delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Legacy XLSX deletion implementation retained for reference."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
@@ -4675,8 +5321,120 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 if backup_path and backup_path.exists():
                     backup_path.unlink(missing_ok=True)
 
-    def _sync_ai_result_to_xlsx(self, target_type: str, target_id: str, result: dict[str, Any]) -> None:
-        """Write completed AI sentiment back to the matching Excel row."""
+    def delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Atomically remove one note from both CSV files, SQLite and managed media."""
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        notes_path, comments_path = self._csv_paths()
+        self._ensure_seed_workbook(notes_path)
+        with self.pull_lock:
+            with self.lock, self._session() as db:
+                note_row = db.execute("SELECT note_id,media_dir FROM notes WHERE note_id=?", (note_id,)).fetchone()
+                comment_ids = [str(row[0]) for row in db.execute(
+                    "SELECT comment_id FROM comments WHERE note_id=?", (note_id,)
+                ).fetchall()]
+            if note_row is None:
+                raise ValueError("本地数据库中未找到该帖子")
+            note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            kept_notes = [row for row in note_rows if valid_note_id(row.get("笔记ID")) != note_id]
+            comment_id_set = set(comment_ids)
+            kept_comments = [row for row in comment_rows if not (
+                text(row.get("笔记评论ID"), 256) in comment_id_set
+                or note_url_identity(row.get("原笔记url")) == note_id
+            )]
+            deleted_note_rows = len(note_rows) - len(kept_notes)
+            deleted_comment_rows = len(comment_rows) - len(kept_comments)
+            if any(valid_note_id(row.get("笔记ID")) == note_id for row in kept_notes):
+                raise ValueError("CSV 帖子清理校验失败")
+            if any(text(row.get("笔记评论ID"), 256) in comment_id_set
+                   or note_url_identity(row.get("原笔记url")) == note_id for row in kept_comments):
+                raise ValueError("CSV 评论清理校验失败")
+
+            media_root = self._media_root().resolve()
+            media_value = text(note_row["media_dir"], 4000)
+            managed_media_dirs: list[Path] = []
+            if media_value:
+                candidate = Path(media_value).expanduser()
+                if candidate.exists():
+                    candidate = candidate.resolve()
+                    if candidate.parent != media_root:
+                        raise ValueError("素材目录不在受管 posts_materials 目录内，已停止删除")
+                    managed_media_dirs.append(candidate)
+            if media_root.exists():
+                suffix = f"__{note_id}"
+                for candidate in media_root.iterdir():
+                    if candidate.is_dir() and candidate.name.endswith(suffix) and candidate.resolve() not in managed_media_dirs:
+                        managed_media_dirs.append(candidate.resolve())
+            tombstones: list[tuple[Path, Path]] = []
+            csv_backups: list[tuple[Path, Path]] = []
+            logical_committed = False
+            try:
+                for index, folder in enumerate(managed_media_dirs, 1):
+                    tombstone = folder.with_name(f".{folder.name}.deleting-{os.getpid()}-{time.time_ns()}-{index}")
+                    folder.rename(tombstone)
+                    tombstones.append((folder, tombstone))
+                for target in (notes_path, comments_path):
+                    backup = target.with_name(f".{target.stem}.delete-backup-{os.getpid()}-{time.time_ns()}.csv")
+                    shutil.copy2(target, backup)
+                    csv_backups.append((target, backup))
+                self._replace_csv_pair(note_headers, kept_notes, comment_headers, kept_comments, "delete")
+
+                linked_database_records = 0
+                with self.lock, self._session() as db:
+                    if comment_ids:
+                        placeholders = ",".join("?" for _ in comment_ids)
+                        linked_database_records += db.execute(
+                            f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids
+                        ).rowcount
+                        linked_database_records += db.execute(
+                            f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({placeholders})", comment_ids
+                        ).rowcount
+                    linked_database_records += db.execute(
+                        "DELETE FROM ai_jobs WHERE target_type IN ('note','relevance') AND target_id=?", (note_id,)
+                    ).rowcount
+                    linked_database_records += db.execute(
+                        "DELETE FROM ai_analysis_records WHERE target_type IN ('note','relevance') AND target_id=?", (note_id,)
+                    ).rowcount
+                    for table in ("note_summaries", "reply_generation_history", "comment_collection_jobs", "change_events", "watchlist"):
+                        linked_database_records += db.execute(f"DELETE FROM {table} WHERE note_id=?", (note_id,)).rowcount
+                    deleted_database_comments = db.execute("DELETE FROM comments WHERE note_id=?", (note_id,)).rowcount
+                    deleted_database_notes = db.execute("DELETE FROM notes WHERE note_id=?", (note_id,)).rowcount
+                    if deleted_database_notes != 1:
+                        raise ValueError("SQLite 帖子清理校验失败")
+                logical_committed = True
+                cleanup_errors = []
+                for _original, tombstone in tombstones:
+                    try:
+                        if tombstone.exists():
+                            shutil.rmtree(tombstone)
+                    except OSError as exc:
+                        cleanup_errors.append(f"{tombstone.name}: {text(exc, 220)}")
+                return {
+                    "ok": True, "noteId": note_id, "excelPath": str(notes_path),
+                    "commentsPath": str(comments_path), "deletedNoteRows": deleted_note_rows,
+                    "deletedCommentRows": deleted_comment_rows, "deletedDatabaseComments": deleted_database_comments,
+                    "deletedLinkedDatabaseRecords": linked_database_records, "excelVerified": True,
+                    "csvVerified": True, "databaseVerified": True,
+                    "mediaDeleted": bool(tombstones) and not cleanup_errors,
+                    "mediaCleanupWarning": ("素材目录已移出但清理失败：" + "；".join(cleanup_errors)) if cleanup_errors else "",
+                }
+            except Exception:
+                if not logical_committed:
+                    for target, backup in csv_backups:
+                        if backup.exists():
+                            os.replace(backup, target)
+                    for original, tombstone in reversed(tombstones):
+                        if tombstone.exists() and not original.exists():
+                            tombstone.rename(original)
+                raise
+            finally:
+                for _target, backup in csv_backups:
+                    backup.unlink(missing_ok=True)
+
+    def _legacy_sync_ai_result_to_xlsx(self, target_type: str, target_id: str, result: dict[str, Any]) -> None:
+        """Legacy XLSX AI write-back retained for reference."""
         xlsx_path = getattr(self, "seed_xlsx_path", None)
         if not xlsx_path or not Path(xlsx_path).is_file():
             return
@@ -4720,6 +5478,42 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     replace_with_retry(temporary_path, xlsx_path)
                 except PermissionError:
                     print(f"[bridge] WPS/Excel 持续占用总表，AI 情绪回写跳过：{xlsx_path}", flush=True)
+
+    def _sync_ai_result_to_xlsx(self, target_type: str, target_id: str, result: dict[str, Any]) -> None:
+        try:
+            notes_path, comments_path = self._csv_paths()
+        except ValueError:
+            return
+        path = notes_path if target_type == "note" else comments_path
+        defaults = NOTE_CSV_HEADERS if target_type == "note" else COMMENT_CSV_HEADERS
+        id_header = "笔记ID" if target_type == "note" else "笔记评论ID"
+        if not path.is_file():
+            return
+        with self.pull_lock:
+            headers, rows = self._read_csv_table(path, defaults)
+            if "AI情绪判断" not in headers:
+                headers.append("AI情绪判断")
+                for row in rows:
+                    row["AI情绪判断"] = ""
+            if target_type == "note" and "帖子好坏" not in headers:
+                headers.append("帖子好坏")
+                for row in rows:
+                    row["帖子好坏"] = ""
+            matched = False
+            label = sentiment_label(result.get("sentiment"))
+            for row in rows:
+                if text(row.get(id_header), 256) != target_id:
+                    continue
+                row["AI情绪判断"] = label
+                if target_type == "note":
+                    row["帖子好坏"] = label
+                matched = True
+                break
+            if matched:
+                try:
+                    self._replace_csv_table(path, headers, rows, "ai")
+                except ValueError:
+                    print(f"[bridge] CSV 被占用，AI 情绪回写跳过：{path}", flush=True)
 
     def pull_to_excel(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Serialize and deduplicate one complete pull transaction."""
@@ -4877,12 +5671,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
 
         if kind != "excel":
             raise ValueError("不支持的打开类型")
-        xlsx_path = getattr(self, "seed_xlsx_path", None)
-        if not xlsx_path:
-            raise ValueError("尚未配置 Excel 总表")
-        xlsx_path = Path(xlsx_path).resolve()
-        if not xlsx_path.is_file():
-            self._ensure_seed_workbook(xlsx_path)
+        notes_path, _comments_path = self._csv_paths()
+        if not notes_path.is_file():
+            self._ensure_seed_workbook(notes_path)
+        xlsx_path = notes_path.resolve()
 
         with self.lock, self._session() as db:
             analysis = db.execute(
@@ -4892,31 +5684,22 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         if analysis and analysis["ai_analysis_status"] == "completed" and analysis["post_sentiment"]:
             self._sync_ai_result_to_xlsx("note", note_id, {"sentiment": analysis["post_sentiment"]})
 
-        from openpyxl import load_workbook
-
-        workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
-        try:
-            sheet_name = "sheet1_笔记总表" if "sheet1_笔记总表" in workbook.sheetnames else workbook.sheetnames[0]
-            worksheet = workbook[sheet_name]
-            headers = self._excel_headers(worksheet)
-            note_column = headers.get("笔记ID")
-            if not note_column:
-                raise ValueError("Excel 帖子总表缺少笔记ID列")
-            excel_row = 0
-            requested_row = max(0, int(payload.get("excelRow") or 0))
-            if requested_row >= 2 and text(worksheet.cell(requested_row, note_column).value, 128) == note_id:
-                excel_row = requested_row
-            if not excel_row:
-                for row_number in range(2, worksheet.max_row + 1):
-                    if text(worksheet.cell(row_number, note_column).value, 128) == note_id:
-                        excel_row = row_number
-                        break
-            if not excel_row:
-                raise ValueError("Excel 中尚未找到该帖子")
-            field_name = text(payload.get("fieldName"), 100)
-            excel_column = headers.get(field_name, note_column)
-        finally:
-            workbook.close()
+        headers, rows = self._read_csv_table(xlsx_path, NOTE_CSV_HEADERS)
+        if "笔记ID" not in headers:
+            raise ValueError("笔记 CSV 缺少笔记ID列")
+        note_column = headers.index("笔记ID") + 1
+        excel_row = 0
+        requested_row = max(0, int(payload.get("excelRow") or 0))
+        if requested_row >= 2 and requested_row - 2 < len(rows) and valid_note_id(rows[requested_row - 2].get("笔记ID")) == note_id:
+            excel_row = requested_row
+        if not excel_row:
+            excel_row = next((index + 2 for index, row in enumerate(rows)
+                              if valid_note_id(row.get("笔记ID")) == note_id), 0)
+        if not excel_row:
+            raise ValueError("笔记 CSV 中尚未找到该帖子")
+        field_name = text(payload.get("fieldName"), 100)
+        excel_column = headers.index(field_name) + 1 if field_name in headers else note_column
+        sheet_name = "笔记总表"
 
         def ps_quote(value: str) -> str:
             return value.replace("'", "''")
@@ -4948,7 +5731,7 @@ foreach ($candidateApp in @(
     $app.Visible = $true
     $app.WindowState = -4137
     $book.Activate()
-    $sheet = $book.Worksheets.Item($sheetName)
+    $sheet = $book.Worksheets.Item(1)
     $sheet.Activate()
     $cell = $sheet.Cells.Item($rowNumber, $columnNumber)
     $cell.Select()
@@ -4980,17 +5763,17 @@ Write-Output $openedWith
         if completed.returncode != 0:
             raw_error = completed.stderr or completed.stdout or b""
             try:
-                detail = raw_error.decode("utf-16le", errors="ignore").strip()
-            except AttributeError:
+                detail = _decode_powershell_output(raw_error).strip()
+            except (AttributeError, TypeError):
                 detail = str(raw_error).strip()
             detail = detail[-500:] if detail else "WPS/Excel COM 调用失败"
             raise ValueError(f"WPS/Excel 打开失败：{detail}")
-        output = (completed.stdout or b"").decode("utf-16le", errors="ignore").strip()
+        output = _decode_powershell_output(completed.stdout).strip()
         open_state = next((line.strip() for line in reversed(output.splitlines()) if line.strip().startswith(("WPS|", "Excel|"))), "WPS|True")
         opened_with, _, read_only_text = open_state.partition("|")
         return {
             "ok": True,
-            "kind": "excel",
+            "kind": "csv",
             "application": opened_with,
             "readOnly": read_only_text.casefold() == "true",
             "target": str(xlsx_path),
@@ -5174,7 +5957,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/excel/reload":
                 seed_path = getattr(self.store, "seed_xlsx_path", None)
                 if not seed_path:
-                    raise ValueError("未配置 Excel 总表路径")
+                    raise ValueError("未配置 CSV 总表路径")
                 inserted = self.store.seed_from_xlsx(Path(seed_path))
                 access_migration: dict[str, Any] = {"updated": 0}
                 migration_error = ""
@@ -5222,7 +6005,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=17881)
     parser.add_argument("--db", type=Path, default=Path(__file__).parent / "data" / "xhs_monitor.db")
     parser.add_argument("--export-dir", type=Path, default=Path(__file__).parent / "exports")
-    parser.add_argument("--seed-xlsx", type=Path, default=None)
+    parser.add_argument("--seed-xlsx", "--seed-csv", dest="seed_xlsx", type=Path, default=None)
     parser.add_argument("--seed-only", action="store_true", help="只初始化数据库，不启动 HTTP 服务")
     return parser.parse_args()
 
@@ -5237,10 +6020,7 @@ def _project_data_dir() -> Path:
 
 
 def default_seed_xlsx() -> Path:
-    """解析 Excel 总表路径：优先安装配置；未配置时用项目 data 目录默认值。
-
-    新用户场景下文件允许不存在——首次拉取写入时会自动创建标准空表。
-    """
+    """Resolve the notes CSV path, accepting the legacy XLSX config for one-time migration."""
     candidates: list[Path] = []
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
@@ -5251,24 +6031,28 @@ def default_seed_xlsx() -> Path:
         try:
             if not path.is_file():
                 continue
-            value = text(json.loads(path.read_text(encoding="utf-8")).get("seed_xlsx"), 500)
+            config = json.loads(path.read_text(encoding="utf-8"))
+            value = text(config.get("seed_csv") or config.get("seed_xlsx"), 500)
             if value:
-                return Path(value).expanduser()
+                candidate = Path(value).expanduser()
+                if candidate.suffix.lower() in {".xlsx", ".xlsm"} and not candidate.exists():
+                    notes_csv, _comments_csv = MonitorStore._derived_csv_paths(candidate)
+                    if notes_csv.exists():
+                        return notes_csv
+                return candidate
         except Exception:
             continue
-    return _project_data_dir() / "小红书笔记评论总表.xlsx"
+    return _project_data_dir() / "小红书_笔记总表.csv"
 
 
 def create_server(host: str, port: int, db_path: Path, export_dir: Path, seed_xlsx: Path | None = None):
     store = MonitorStore(db_path, export_dir)
-    store.seed_xlsx_path = seed_xlsx  # type: ignore[attr-defined]
-    inserted = 0
-    if seed_xlsx and Path(seed_xlsx).is_file():
-        inserted = store.seed_from_xlsx(seed_xlsx)
-        try:
-            store.reconcile_legacy_access_statuses()
-        except Exception as exc:
-            print(f"[bridge] 旧版访问状态已在数据库降级；Excel 标签稍后重试：{exc}")
+    configured = Path(seed_xlsx) if seed_xlsx else default_seed_xlsx()
+    inserted = store.seed_from_xlsx(configured)
+    try:
+        store.reconcile_legacy_access_statuses()
+    except Exception as exc:
+        print(f"[bridge] 旧版访问状态已在数据库降级；CSV 标签稍后重试：{exc}")
     server = ThreadingHTTPServer((host, port), BridgeHandler)
     server.store = store  # type: ignore[attr-defined]
     return server, store, inserted
@@ -5295,13 +6079,12 @@ def main() -> None:
     args = parse_args()
     if args.seed_only:
         if not args.seed_xlsx:
-            raise SystemExit("--seed-only requires --seed-xlsx")
+            raise SystemExit("--seed-only requires --seed-csv or --seed-xlsx")
         store = MonitorStore(args.db, args.export_dir)
-        store.seed_xlsx_path = args.seed_xlsx  # type: ignore[attr-defined]
         inserted = store.seed_from_xlsx(args.seed_xlsx)
         migration = store.reconcile_legacy_access_statuses()
         print(
-            f"[bridge] seeded {inserted} existing note IDs from {args.seed_xlsx}; "
+            f"[bridge] seeded {inserted} existing note IDs from {store.seed_xlsx_path}; "
             f"downgraded {migration.get('updated', 0)} legacy access statuses"
         )
         return
@@ -5312,10 +6095,7 @@ def main() -> None:
         )
     seed_xlsx = Path(args.seed_xlsx) if args.seed_xlsx else default_seed_xlsx()
     server, store, inserted = create_server(args.host, args.port, args.db, args.export_dir, seed_xlsx)
-    if Path(seed_xlsx).is_file():
-        print(f"[bridge] seeded {inserted} existing note IDs from {seed_xlsx}")
-    else:
-        print(f"[bridge] Excel 总表暂不存在，首次拉取时将自动创建：{seed_xlsx}")
+    print(f"[bridge] seeded {inserted} existing note IDs from CSV: {store.seed_xlsx_path}")
     print(f"[bridge] listening on http://{args.host}:{args.port}")
     print(f"[bridge] database: {store.db_path}")
     try:

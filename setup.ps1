@@ -2,7 +2,8 @@
 # This file is intentionally ASCII-only for Windows PowerShell 5.1 compatibility.
 param(
   [string]$ExtensionId = '',
-  [string]$SeedXlsx = '',
+  [Alias('SeedXlsx')]
+  [string]$SeedCsv = '',
   [switch]$SkipBuild
 )
 
@@ -91,7 +92,7 @@ if (-not $SkipBuild -or -not (Test-Path -LiteralPath $hostExe)) {
 }
 
 $installArgs = @{ ExtensionId = $ExtensionId }
-if ($SeedXlsx) { $installArgs.SeedXlsx = $SeedXlsx }
+if ($SeedCsv) { $installArgs.SeedCsv = $SeedCsv }
 & (Join-Path $bridgeDir 'install_native_host.ps1') @installArgs
 
 Start-Process -FilePath $hostExe -ArgumentList '--bridge' -WindowStyle Hidden

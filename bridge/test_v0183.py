@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import threading
@@ -5,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from server import MonitorStore, audit_reply_candidate, classify_reply_context, replace_with_retry
+from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, replace_with_retry
 
 
 class MediaHandler(BaseHTTPRequestHandler):
@@ -62,6 +63,14 @@ class V0183Tests(unittest.TestCase):
 
     def tearDown(self):
         self.server.shutdown(); self.server.server_close(); self.tmp.cleanup()
+
+    def _configure_csv(self, name: str = "master"):
+        notes_path, comments_path = self.store.configure_data_files(Path(self.tmp.name) / f"{name}_笔记总表.csv")
+        self.store._ensure_seed_workbook(notes_path)
+        return notes_path, comments_path
+
+    def _csv_rows(self, path: Path, headers: list[str]):
+        return self.store._read_csv_table(path, headers)[1]
 
     def test_media_is_idempotent_and_only_repairs_missing_video(self):
         note = {"noteId": "abcdef123456", "title": "视频帖子", "content": "正文",
@@ -167,12 +176,35 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(1, result["pendingRemovedCount"])
         self.assertFalse(result["hasChanges"])
 
-    def test_comment_sync_updates_sqlite_and_excel_without_blank_rows(self):
-        from openpyxl import load_workbook
+    def test_post_metadata_change_does_not_mark_comments_changed(self):
         note, old, kept = self._seed_pulled_note_with_comments()
-        workbook_path = self.store.export_dir.parent / "comments-master.xlsx"
-        self.store.seed_xlsx_path = workbook_path
-        self.store._ensure_seed_workbook(workbook_path)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET payload_json=? WHERE note_id=?", (
+                json.dumps({**note, "likeCount": 1}, ensure_ascii=False), note["noteId"]
+            ))
+        result = self.store.compare_comments({
+            "noteId": note["noteId"], "note": {**note, "likeCount": 2},
+            "comments": [old, kept], "expectedCount": 2, "status": "likely_complete"
+        })
+        self.assertTrue(result["noteChanged"])
+        self.assertTrue(result["hasChanges"])
+        self.assertFalse(result["commentHasChanges"])
+        self.assertEqual((0, 0, 0), (result["newCount"], result["removedCount"], result["changedCount"]))
+
+    def test_ignored_pulled_note_restores_to_known(self):
+        note, _old, _kept = self._seed_pulled_note_with_comments()
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced' WHERE note_id=?", (note["noteId"],))
+        self.store.ignore({"noteId": note["noteId"]})
+        restored = self.store.restore({"noteId": note["noteId"]})
+        self.assertTrue(restored["ok"])
+        with self.store._session() as db:
+            status = db.execute("SELECT status FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0]
+        self.assertEqual("known", status)
+
+    def test_comment_sync_updates_sqlite_and_csv_without_blank_rows(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        _notes_path, comments_path = self._configure_csv("comments")
         self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
         fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
         result = self.store.sync_comment_snapshot({
@@ -183,70 +215,60 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual((1, 1), (result["newCount"], result["removedCount"]))
         ids = {row["comment_id"] for row in self.store.list_comments(note["noteId"])}
         self.assertEqual({"comment-kept", "comment-new"}, ids)
-        workbook = load_workbook(workbook_path, read_only=True)
-        sheet = workbook["sheet2_评论总表"]
-        excel_ids = {sheet.cell(row, 3).value for row in range(2, sheet.max_row + 1)}
-        workbook.close()
-        self.assertEqual({"comment-kept", "comment-new"}, excel_ids)
+        csv_ids = {row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual({"comment-kept", "comment-new"}, csv_ids)
 
-    def test_note_status_repairs_legacy_excel_media_path(self):
-        from openpyxl import load_workbook
+    def test_note_status_repairs_legacy_csv_media_path(self):
         note_id = "legacy123456"
-        workbook_path = self.store.export_dir.parent / "legacy-master.xlsx"
-        self.store.seed_xlsx_path = workbook_path
-        self.store._ensure_seed_workbook(workbook_path)
-        actual_folder = workbook_path.parent / "posts_materials" / "旧标题"
+        notes_path, _comments_path = self._configure_csv("legacy")
+        actual_folder = notes_path.parent / "posts_materials" / "旧标题"
         actual_folder.mkdir(parents=True)
         (actual_folder / "旧标题-图1.jpg").write_bytes(b"image")
-        workbook = load_workbook(workbook_path)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        row = sheet.max_row + 1
-        sheet.cell(row, headers["笔记ID"]).value = note_id
-        sheet.cell(row, headers["笔记标题"]).value = "旧标题"
-        sheet.cell(row, headers["笔记url"]).value = f"https://www.xiaohongshu.com/explore/{note_id}"
-        sheet.cell(row, headers["对应帖子文件夹地址"]).value = "C:/removed-root/posts_materials/旧标题"
-        sheet.cell(row, headers["文件夹内清单"]).value = "旧标题-图1.jpg"
-        workbook.save(workbook_path)
-        workbook.close()
-        self.store.seed_from_xlsx(workbook_path)
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        row = {name: "" for name in headers}
+        row.update({"笔记ID": note_id, "笔记标题": "旧标题",
+                    "笔记url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                    "对应帖子文件夹地址": "C:/removed-root/posts_materials/旧标题",
+                    "文件夹内清单": "旧标题-图1.jpg"})
+        rows.append(row)
+        self.store._replace_csv_table(notes_path, headers, rows, "test")
+        self.store.seed_from_xlsx(notes_path)
         result = self.store.note_status(note_id)
         self.assertTrue(result["inExcel"])
         self.assertEqual(str(actual_folder.resolve()), result["mediaDir"])
         self.assertEqual(["旧标题-图1.jpg"], result["mediaFiles"])
         self.assertGreater(result["excelRow"], 1)
 
-    def test_excel_artifact_index_is_reused_until_workbook_changes(self):
-        from openpyxl import load_workbook
+    def test_csv_artifact_index_is_reused_until_file_changes(self):
         from unittest.mock import patch
         note_id = "cache123456"
-        workbook_path = self.store.export_dir.parent / "cache-master.xlsx"
-        self.store.seed_xlsx_path = workbook_path
-        self.store._ensure_seed_workbook(workbook_path)
-        workbook = load_workbook(workbook_path)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        row = sheet.max_row + 1
-        sheet.cell(row, headers["笔记ID"]).value = note_id
-        sheet.cell(row, headers["对应帖子文件夹地址"]).value = "C:/materials/cache123456"
-        sheet.cell(row, headers["文件夹内清单"]).value = "image-01.jpg"
-        workbook.save(workbook_path)
-        workbook.close()
+        notes_path, _comments_path = self._configure_csv("cache")
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        row = {name: "" for name in headers}
+        row.update({"笔记ID": note_id, "对应帖子文件夹地址": "C:/materials/cache123456",
+                    "文件夹内清单": "image-01.jpg"})
+        rows.append(row)
+        self.store._replace_csv_table(notes_path, headers, rows, "test")
 
-        with patch("openpyxl.load_workbook", wraps=load_workbook) as mocked_load:
+        with patch.object(self.store, "_read_csv_table", wraps=self.store._read_csv_table) as mocked_read:
             first = self.store._excel_note_artifacts(note_id)
             second = self.store._excel_note_artifacts(note_id)
             self.assertEqual(first, second)
-            self.assertEqual(1, mocked_load.call_count)
+            self.assertEqual(1, mocked_read.call_count)
 
-            workbook = load_workbook(workbook_path)
-            sheet = workbook["sheet1_笔记总表"]
-            sheet.cell(row, headers["文件夹内清单"]).value = "image-01.jpg\nimage-02.jpg"
-            workbook.save(workbook_path)
-            workbook.close()
+            with notes_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                raw_rows = list(csv.DictReader(stream))
+            raw_rows[0]["文件夹内清单"] = "image-01.jpg\nimage-02.jpg"
+            with notes_path.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=headers, lineterminator="\r\n")
+                writer.writeheader(); writer.writerows(raw_rows)
             refreshed = self.store._excel_note_artifacts(note_id)
             self.assertEqual(["image-01.jpg", "image-02.jpg"], refreshed[1])
-            self.assertEqual(2, mocked_load.call_count)
+            self.assertEqual(2, mocked_read.call_count)
+
+    def test_powershell_output_decoder_accepts_utf8_and_utf16(self):
+        self.assertEqual("WPS|True\r\n", _decode_powershell_output(b"WPS|True\r\n"))
+        self.assertEqual("WPS|True\r\n", _decode_powershell_output("WPS|True\r\n".encode("utf-16le")))
 
     def test_atomic_replace_retries_transient_wps_lock(self):
         from unittest.mock import patch
@@ -301,6 +323,9 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("$app.Workbooks.Open($path, 0, $true)", script)
         self.assertIn("$app.Goto($cell, $true)", script)
         self.assertEqual("WPS", result["application"])
+        self.assertEqual("csv", result["kind"])
+        self.assertTrue(result["target"].endswith(".csv"))
+        self.assertIn("$book.Worksheets.Item(1)", script)
         self.assertTrue(result["readOnly"])
         self.assertEqual(pulled["excelRow"], result["row"])
 
@@ -328,12 +353,8 @@ class V0183Tests(unittest.TestCase):
         startfile.assert_called_once_with(str(folder.resolve()))
 
     def test_unreachable_status_round_trip_and_bulk_delete(self):
-        from openpyxl import load_workbook
-
         note_id = "unreachable123456"
-        workbook_path = self.store.export_dir.parent / "unreachable-master.xlsx"
-        self.store.seed_xlsx_path = workbook_path
-        self.store._ensure_seed_workbook(workbook_path)
+        notes_path, comments_path = self._configure_csv("unreachable")
         note = {
             "noteId": note_id,
             "url": f"https://www.xiaohongshu.com/explore/{note_id}",
@@ -363,27 +384,18 @@ class V0183Tests(unittest.TestCase):
             "error": "详情页无法加载",
         })
         self.assertEqual("unreachable", marked["accessStatus"])
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        matching_row = next(
-            row for row in range(2, sheet.max_row + 1)
-            if sheet.cell(row, headers["笔记ID"]).value == note_id
-        )
-        self.assertEqual("打不开", sheet.cell(matching_row, headers["访问状态"]).value)
-        workbook.close()
+        note_rows = self._csv_rows(notes_path, NOTE_CSV_HEADERS)
+        matching_row = next(row for row in note_rows if row["笔记ID"] == note_id)
+        self.assertEqual("打不开", matching_row["访问状态"])
         self.assertEqual(note_id, self.store.list_unreachable_notes()[0]["note_id"])
 
         cleared = self.store.set_note_access_status({"noteId": note_id, "status": "ok"})
         self.assertEqual("ok", cleared["accessStatus"])
         self.assertEqual([], self.store.list_unreachable_notes())
-        workbook = load_workbook(workbook_path)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        sheet.cell(matching_row, headers["访问状态"]).value = "打不开"
-        workbook.save(workbook_path)
-        workbook.close()
-        self.store.seed_from_xlsx(workbook_path)
+        headers, note_rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        next(row for row in note_rows if row["笔记ID"] == note_id)["访问状态"] = "打不开"
+        self.store._replace_csv_table(notes_path, headers, note_rows, "manual")
+        self.store.seed_from_xlsx(notes_path)
         self.assertEqual([], self.store.list_unreachable_notes())
         with self.store._session() as db:
             self.assertEqual("check_failed", db.execute(
@@ -391,11 +403,8 @@ class V0183Tests(unittest.TestCase):
             ).fetchone()[0])
         migrated = self.store.reconcile_legacy_access_statuses()
         self.assertEqual(1, migrated["updated"])
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        self.assertEqual("待复核", sheet.cell(matching_row, headers["访问状态"]).value)
-        workbook.close()
+        note_rows = self._csv_rows(notes_path, NOTE_CSV_HEADERS)
+        self.assertEqual("待复核", next(row for row in note_rows if row["笔记ID"] == note_id)["访问状态"])
 
         self.store.set_note_access_status({
             "noteId": note_id,
@@ -438,19 +447,13 @@ class V0183Tests(unittest.TestCase):
             self.assertEqual(0, db.execute(
                 "SELECT COUNT(*) FROM ai_analysis_records WHERE target_id=?", (note_id,)
             ).fetchone()[0])
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-        note_sheet = workbook["sheet1_笔记总表"]
-        comment_sheet = workbook["sheet2_评论总表"]
-        note_headers = {str(cell.value): cell.column for cell in note_sheet[1] if cell.value}
-        comment_headers = {str(cell.value): cell.column for cell in comment_sheet[1] if cell.value}
-        note_ids = {note_sheet.cell(row, note_headers["笔记ID"]).value for row in range(2, note_sheet.max_row + 1)}
-        comment_ids = {comment_sheet.cell(row, comment_headers["笔记评论ID"]).value for row in range(2, comment_sheet.max_row + 1)}
-        workbook.close()
+        note_ids = {row["笔记ID"] for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)}
+        comment_ids = {row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
         self.assertNotIn(note_id, note_ids)
         self.assertNotIn(comment["commentId"], comment_ids)
 
-    def test_seed_migrates_access_status_column_for_existing_workbook(self):
-        from openpyxl import Workbook, load_workbook
+    def test_seed_migrates_existing_workbook_to_two_utf8_csv_files(self):
+        from openpyxl import Workbook
 
         workbook_path = self.store.export_dir.parent / "legacy-no-access-column.xlsx"
         workbook = Workbook()
@@ -463,21 +466,26 @@ class V0183Tests(unittest.TestCase):
             "schema123456",
         ])
         workbook.create_sheet("sheet2_评论总表").append(["笔记评论ID"])
+        audit = workbook.create_sheet("旧版审核记录")
+        audit.append(["笔记ID", "处理结果"])
+        audit.append(["schema123456", "保留"])
         workbook.save(workbook_path)
         workbook.close()
 
         self.store.seed_from_xlsx(workbook_path)
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-        headers = [cell.value for cell in workbook["sheet1_笔记总表"][1]]
-        workbook.close()
+        notes_path, comments_path = self.store._csv_paths()
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        self.assertFalse(workbook_path.exists())
+        self.assertTrue(comments_path.exists())
         self.assertIn("访问状态", headers)
+        self.assertEqual("schema123456", rows[0]["笔记ID"])
+        self.assertEqual(b"\xef\xbb\xbf", notes_path.read_bytes()[:3])
+        with self.store._session() as db:
+            archived = db.execute("SELECT COUNT(*) FROM legacy_sheet_archive WHERE sheet_name='旧版审核记录'").fetchone()[0]
+        self.assertEqual(2, archived)
 
     def test_batch_access_status_writes_open_review_and_unreachable(self):
-        from openpyxl import load_workbook
-
-        workbook_path = self.store.export_dir.parent / "access-batch-master.xlsx"
-        self.store.seed_xlsx_path = workbook_path
-        self.store._ensure_seed_workbook(workbook_path)
+        notes_path, _comments_path = self._configure_csv("access-batch")
         notes = [
             {"noteId": "accessopen123", "title": "可打开帖子", "content": "正文"},
             {"noteId": "accessreview123", "title": "待复核帖子", "content": "正文"},
@@ -495,14 +503,8 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual({"ok": 1, "check_failed": 1, "unreachable": 1}, result["byStatus"])
 
-        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-        sheet = workbook["sheet1_笔记总表"]
-        headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
-        excel_states = {
-            sheet.cell(row, headers["笔记ID"]).value: sheet.cell(row, headers["访问状态"]).value
-            for row in range(2, sheet.max_row + 1)
-        }
-        workbook.close()
+        excel_states = {row["笔记ID"]: row["访问状态"]
+                        for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)}
         self.assertEqual("可打开", excel_states["accessopen123"])
         self.assertEqual("待复核", excel_states["accessreview123"])
         self.assertEqual("打不开", excel_states["accessgone123"])

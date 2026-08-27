@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.23.12";
+const CONTENT_SCRIPT_VERSION = "0.24.0";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -947,7 +947,7 @@ async function getUnreachableNotes() {
 }
 
 async function deleteUnreachableNotes() {
-  // Import manual changes to the Excel status column before selecting rows.
+  // Import manual changes to the CSV status column before selecting rows.
   await bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
   return bridgeApi("/api/notes/unreachable/delete", {
     method: "POST",
@@ -985,6 +985,34 @@ async function deleteReviewedFailures(noteIds = []) {
   });
   return { ok: failures.length === 0, deleted, failures, deletedCount: deleted.length, state,
     error: failures.length ? `${failures.length} 篇删除失败` : "" };
+}
+
+async function ignoreBatchFailures(noteIds = []) {
+  const requested = [...new Set((Array.isArray(noteIds) ? noteIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!requested.length) return { ok: false, error: "没有可忽略的未完成帖子" };
+  await getBatchCommentSyncState();
+  const ignored = [];
+  const failures = [];
+  for (const noteId of requested) {
+    try {
+      const result = await bridgeApi("/api/ignore", {
+        method: "POST", body: JSON.stringify({ noteId }), timeoutMs: 30000
+      });
+      if (!result?.ok) throw new Error(result?.error || "忽略失败");
+      ignored.push(noteId);
+    } catch (error) {
+      failures.push({ noteId, error: error?.message || "忽略失败" });
+    }
+  }
+  const ignoredIds = new Set(ignored);
+  const remaining = (batchCommentSyncState.failures || []).filter((item) => !ignoredIds.has(String(item?.noteId || "")));
+  const state = await publishBatchCommentSync({
+    failures: remaining, failedPosts: remaining.length,
+    reviewPosts: remaining.filter((item) => !item?.markedUnreachable).length,
+    unreachablePosts: remaining.filter((item) => item?.markedUnreachable).length
+  });
+  return { ok: failures.length === 0, ignoredCount: ignored.length, ignored, failures, state,
+    error: failures.length ? `${failures.length} 篇忽略失败` : "" };
 }
 
 async function auditCurrentNoteComments(note, preferredTabId = null) {
@@ -1295,14 +1323,16 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     error.syncStage = "compare";
     throw error;
   }
-  if (!comparison.hasChanges) {
+  if (!comparison.commentHasChanges) {
+    // Batch change statistics are comment-based. Volatile post counters and
+    // timestamps must not turn every successfully opened post into “changed”.
     await sendTabMessage(tabId, {
       type: "batchSyncNoteProgress",
       noteId: note.noteId,
       note: snapshot.note,
       phase: "excel",
       done: true,
-      title: "核对完成，本地评论已是最新",
+      title: "核对完成，评论无变化",
       commentCount: snapshot.comments.length,
       commentRows: snapshot.comments.slice(0, 12)
     }).catch(() => {});
@@ -1351,7 +1381,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const seen = new Set();
   const notes = (source.notes || []).filter((note) => {
     const pulled = note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
-    return pulled && note.noteId && (!selection || selection.has(note.noteId))
+    return pulled && note.status !== "ignored" && note.noteId && (!selection || selection.has(note.noteId))
       && !seen.has(note.noteId) && seen.add(note.noteId);
   });
   const startedAt = new Date().toISOString();
@@ -1462,7 +1492,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
       if (!accessResult?.ok) {
         await publishBatchCommentSync({
           statusSyncFailures: accessUpdates.length,
-          error: `评论已核对，但访问状态写入失败：${accessResult?.error || "请关闭 Excel 后重试"}`
+          error: `评论已核对，但访问状态写入失败：${accessResult?.error || "请关闭 CSV 表格后重试"}`
         });
       }
     }
@@ -1635,7 +1665,7 @@ async function pullNote(note, preferredTabId = null) {
       });
       broadcastPullProgress({
         noteId, phase: "excel", process: showProcess,
-        title: "素材与 Excel / SQLite 已写入，正在核对结果",
+        title: "素材与 CSV / SQLite 已写入，正在核对结果",
         note: showProcess ? {
           ...detail.note,
           mediaDir: result.mediaDir || "",
@@ -1974,6 +2004,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getUnreachableNotes") return getUnreachableNotes();
     if (message.type === "deleteUnreachableNotes") return deleteUnreachableNotes();
     if (message.type === "deleteReviewedFailures") return deleteReviewedFailures(message.noteIds || []);
+    if (message.type === "ignoreBatchFailures") return ignoreBatchFailures(message.noteIds || []);
     if (message.type === "suggestCommentReply") return suggestCommentReply(message, sender.tab?.id || null);
     if (message.type === "applyCommentReply") return applyCommentReply(message, sender.tab?.id || null);
     if (message.type === "getNoteSummary") {

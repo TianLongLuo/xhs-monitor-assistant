@@ -52,6 +52,7 @@ const elements = {
   batchSyncFailures: document.getElementById("batchSyncFailures"),
   batchSyncFailureCount: document.getElementById("batchSyncFailureCount"),
   batchSyncFailureList: document.getElementById("batchSyncFailureList"),
+  ignoreAllBatchFailures: document.getElementById("ignoreAllBatchFailures"),
   cancelBatchSync: document.getElementById("cancelBatchSync"),
   retryBatchFailures: document.getElementById("retryBatchFailures"),
   deleteUnreachable: document.getElementById("deleteUnreachable"),
@@ -95,6 +96,9 @@ const elements = {
   pendingList: document.getElementById("pendingList"),
   pendingEmpty: document.getElementById("pendingEmpty"),
   operationsCenter: document.getElementById("operationsCenter"),
+  ignoredOperations: document.getElementById("ignoredOperations"),
+  ignoredOperationsCount: document.getElementById("ignoredOperationsCount"),
+  ignoredOperationsList: document.getElementById("ignoredOperationsList"),
   refreshOperations: document.getElementById("refreshOperations"),
   healthScore: document.getElementById("healthScore"),
   healthSummary: document.getElementById("healthSummary"),
@@ -201,10 +205,10 @@ if (floatingMode) {
 }
 
 const STATUS_VIEWS = {
-  new: { title: "新相关未拉取", kicker: "NEW & RELEVANT", hint: "与 XHS-Monitor 品牌相关，但本地 Excel 中还没有" },
-  known: { title: "Excel 已有", kicker: "IN LOCAL EXCEL", hint: "这些帖子已经存在于本地 Excel" },
-  confirmed: { title: "待加入 Excel", kicker: "MARKED", hint: "已人工标记，但当前仍未写入 Excel" },
-  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "不再显示在 Excel 未找到列表中，可随时恢复" }
+  new: { title: "新相关未拉取", kicker: "NEW & RELEVANT", hint: "与 XHS-Monitor 品牌相关，但本地笔记 CSV 中还没有" },
+  known: { title: "CSV 已有", kicker: "IN LOCAL CSV", hint: "这些帖子已经存在于本地笔记 CSV" },
+  confirmed: { title: "待加入 CSV", kicker: "MARKED", hint: "已人工标记，但当前仍未写入 CSV" },
+  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "不再参与批量同步，可随时恢复" }
 };
 
 const PANEL_VIEWS = new Set(["overview", "posts", "tools"]);
@@ -368,11 +372,28 @@ function failureNoteUrl(failure = {}) {
   return noteId ? `https://www.xiaohongshu.com/explore/${encodeURIComponent(noteId)}` : "";
 }
 
+async function ignoreBatchFailureItems(items = [], confirmMany = false) {
+  const targets = (Array.isArray(items) ? items : []).filter((item) => item?.noteId);
+  if (!targets.length) return null;
+  if (confirmMany && !confirm(`确定一键忽略 ${targets.length} 篇未完成帖子吗？\n\n忽略后不再参与“同步全部”，可在运营页面展开并恢复。`)) return null;
+  const result = await sendRuntime({ type: "ignoreBatchFailures", noteIds: targets.map((item) => item.noteId) });
+  if (result?.state) renderBatchSync(result.state);
+  if (!result?.ok) throw new Error(result?.error || "忽略失败");
+  setStatus(`已忽略 ${result.ignoredCount || targets.length} 篇帖子，可在运营页面恢复`, "success");
+  showToast("帖子已移入运营页的“已忽略帖子”");
+  await Promise.all([refreshStats(), refreshIgnoredOperations(), refreshUnreachableNotes()]);
+  return result;
+}
+
 function renderBatchFailures(failures = []) {
   if (!elements.batchSyncFailures || !elements.batchSyncFailureList) return;
   const items = Array.isArray(failures) ? failures.filter((item) => item?.noteId || item?.url) : [];
   elements.batchSyncFailures.hidden = items.length === 0;
   if (elements.batchSyncFailureCount) elements.batchSyncFailureCount.textContent = `${items.length} 篇`;
+  if (elements.ignoreAllBatchFailures) {
+    elements.ignoreAllBatchFailures.hidden = items.length === 0;
+    elements.ignoreAllBatchFailures.disabled = batchSyncViewState.running || !items.some((item) => item?.noteId);
+  }
   const fragment = document.createDocumentFragment();
   items.forEach((failure, index) => {
     const item = document.createElement("li");
@@ -406,8 +427,8 @@ function renderBatchFailures(failures = []) {
     const excel = document.createElement("button");
     excel.type = "button";
     excel.className = "batch-sync-failure__excel";
-    excel.textContent = "Excel";
-    excel.title = "使用 WPS 打开总表并定位到该帖子行";
+    excel.textContent = "CSV";
+    excel.title = "使用 WPS 打开笔记 CSV 并定位到该帖子行";
     excel.disabled = !failure.noteId;
     excel.addEventListener("click", async () => {
       const originalText = excel.textContent;
@@ -418,12 +439,12 @@ function renderBatchFailures(failures = []) {
           type: "openLocalArtifact",
           payload: { kind: "excel", noteId: failure.noteId, fieldName: "笔记标题" }
         });
-        if (!result?.ok) throw new Error(result?.error || "Excel 定位失败");
+        if (!result?.ok) throw new Error(result?.error || "CSV 定位失败");
         excel.textContent = "已定位";
-        showToast(`已在 Excel 定位“${failure.title || "该帖子"}”`);
+        showToast(`已在 CSV 定位“${failure.title || "该帖子"}”`);
       } catch (error) {
         excel.textContent = "重试";
-        setStatus(error.message || "Excel 定位失败", "error");
+        setStatus(error.message || "CSV 定位失败", "error");
       } finally {
         setTimeout(() => {
           if (!excel.isConnected) return;
@@ -432,7 +453,24 @@ function renderBatchFailures(failures = []) {
         }, 1800);
       }
     });
-    actions.append(open, excel);
+    const ignore = document.createElement("button");
+    ignore.type = "button";
+    ignore.className = "batch-sync-failure__ignore";
+    ignore.textContent = "忽略";
+    ignore.title = "忽略后不再参与批量同步，可在运营页面恢复";
+    ignore.disabled = !failure.noteId;
+    ignore.addEventListener("click", async () => {
+      ignore.disabled = true;
+      ignore.textContent = "忽略中";
+      try {
+        await ignoreBatchFailureItems([failure]);
+      } catch (error) {
+        ignore.disabled = false;
+        ignore.textContent = "重试";
+        setStatus(error.message || "忽略失败", "error");
+      }
+    });
+    actions.append(open, excel, ignore);
     item.append(number, copy, actions);
     fragment.append(item);
   });
@@ -577,14 +615,14 @@ function renderUnreachableNotes(result = {}) {
   }
   if (elements.unreachableHint) {
     elements.unreachableHint.textContent = count
-      ? "同步删除 Excel、评论、SQLite、分析记录与素材，并执行一致性校验"
+      ? "同步删除笔记/评论 CSV、SQLite、分析记录与素材，并执行一致性校验"
       : reviewCount ? "自动证据不足时，可由你人工确认后彻底删除；操作前会再次提示" : "仅删除经双重证据确认已删除或下架的帖子";
   }
   if (elements.deleteUnreachable) {
     elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || (count === 0 && reviewCount === 0);
     elements.deleteUnreachable.title = count
       ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n")
-      : reviewCount ? "点击后确认删除这些无效帖子，并同步清理 Excel、数据库和素材" : "当前没有经双重证据确认的失效帖子";
+      : reviewCount ? "点击后确认删除这些无效帖子，并同步清理 CSV、数据库和素材" : "当前没有经双重证据确认的失效帖子";
   }
 }
 
@@ -604,7 +642,7 @@ async function deleteAllUnreachableNotes() {
     const accepted = confirm(
       `自动核验尚未达到“确认失效”标准。\n\n你是否人工确认以下 ${reviewFailures.length} 篇属于无效帖子并彻底删除？\n\n${preview}` +
       `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
-      "将同步删除 Excel 帖子及评论、SQLite 分析记录和素材目录。此操作不可撤销。"
+      "将同步删除笔记/评论 CSV、SQLite 分析记录和素材目录。此操作不可撤销。"
     );
     if (!accepted) return;
     unreachableDeleteRunning = true;
@@ -616,7 +654,7 @@ async function deleteAllUnreachableNotes() {
       if (result?.state) renderBatchSync(result.state);
       if (!result?.ok) throw new Error(result?.error || "部分帖子删除失败");
       setStatus(`已彻底删除 ${result.deletedCount || reviewFailures.length} 篇人工确认的无效帖子`, "success");
-      showToast("无效帖子已从 Excel、数据库和素材目录清理");
+      showToast("无效帖子已从 CSV、数据库和素材目录清理");
       await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
       return result;
     } finally {
@@ -627,7 +665,7 @@ async function deleteAllUnreachableNotes() {
   const count = unreachableNotes.length;
   const accepted = confirm(
     `确定删除 ${count} 篇标记为“打不开”的帖子吗？\n\n` +
-    "将同时删除 Excel 中的帖子整行、对应评论行、SQLite 记录和受管素材目录。"
+    "将同时删除笔记 CSV 中的帖子行、评论 CSV 对应行、SQLite 记录和受管素材目录。"
   );
   if (!accepted) return;
   unreachableDeleteRunning = true;
@@ -641,7 +679,7 @@ async function deleteAllUnreachableNotes() {
     if (!result?.ok && !deleted) throw new Error(result?.error || "批量删除失败");
     const verified = Boolean(result?.excelVerified && result?.databaseVerified);
     const linked = Number(result?.deletedLinkedDatabaseRecords) || 0;
-    const message = `已清理 ${deleted} 篇失效帖子、${Number(result?.deletedCommentRows) || 0} 条 Excel 评论及 ${linked} 条关联记录${verified ? "；Excel 与数据库校验通过" : ""}${failed ? `；${failed} 篇失败` : ""}`;
+    const message = `已清理 ${deleted} 篇失效帖子、${Number(result?.deletedCommentRows) || 0} 条 CSV 评论及 ${linked} 条关联记录${verified ? "；CSV 与数据库校验通过" : ""}${failed ? `；${failed} 篇失败` : ""}`;
     setStatus(message, failed ? "warning" : "success");
     showToast(message, failed ? "error" : "success");
     await Promise.all([refreshAll({ quiet: true }), refreshUnreachableNotes()]);
@@ -676,7 +714,7 @@ function renderCurrentDetail(note = null, loading = false) {
   const state = active
     ? { label: "处理中", value: "processing" }
     : currentDetailNote.inExcel
-      ? { label: "Excel 已有", value: "synced" }
+      ? { label: "CSV 已有", value: "synced" }
       : loading || !contentLength
         ? { label: "正文加载中", value: "loading" }
         : { label: "可拉取", value: "ready" };
@@ -687,11 +725,11 @@ function renderCurrentDetail(note = null, loading = false) {
     currentDetailNote.noteId ? `ID ${currentDetailNote.noteId}` : ""
   ].filter(Boolean).join(" · ");
   const hint = active
-    ? "Process 正在详情右侧运行：正文、素材图片、评论及 ID、Excel / SQLite。"
+    ? "Process 正在详情右侧运行：正文、素材图片、评论及 ID、CSV / SQLite。"
     : currentDetailNote.inExcel
-      ? "本次已写入本地 Excel 与 SQLite；再次点击可补采正文、图片或评论。"
+      ? "本次已写入本地 CSV 与 SQLite；再次点击可补采正文、图片或评论。"
       : contentLength
-        ? `已读正文 ${contentLength} 字 · ${imageCount} 张图片；点击“拉取到 Excel”开始完整采集。`
+        ? `已读正文 ${contentLength} 字 · ${imageCount} 张图片；点击“拉取到 CSV”开始完整采集。`
         : "详情已打开，点击后会等待正文加载，再读取正文、素材图片、评论及 ID。";
 
   const imageUrl = Array.isArray(currentDetailNote.imageUrls)
@@ -729,7 +767,7 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailPull.disabled = active || !noteId;
   elements.currentDetailPull.textContent = active
     ? "处理中…"
-    : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 Excel";
+    : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 CSV";
   elements.currentDetailRefresh.disabled = active;
   elements.currentDetailSummary.disabled = active || !contentLength;
   elements.currentDetailComments.disabled = active || !contentLength;
@@ -786,7 +824,7 @@ function renderDataHealth(result) {
   elements.healthSummary.textContent = `${statusLabel} · ${formatLocalTime(result.checkedAt)}`;
   renderOperationsMetrics(elements.healthMetrics, [
     ["SQLite 帖子", summary.databaseNotes || 0],
-    ["Excel 帖子", summary.excelNotes || 0],
+    ["CSV 帖子", summary.csvNotes ?? summary.excelNotes ?? 0],
     ["问题项目", summary.issueCount || 0]
   ]);
   elements.healthIssues.replaceChildren();
@@ -802,7 +840,7 @@ function renderDataHealth(result) {
     badge.textContent = issue.repairable ? "可修复" : ({ critical: "关键", warning: "提醒", info: "信息" }[issue.severity] || "检查");
     row.append(copy, badge); elements.healthIssues.appendChild(row);
   }
-  if (!issues.length) operationsEmpty(elements.healthIssues, "✓ Excel、SQLite、评论计数与素材目录均未发现异常");
+  if (!issues.length) operationsEmpty(elements.healthIssues, "✓ CSV、SQLite、评论计数与素材目录均未发现异常");
   elements.repairHealth.disabled = !(summary.repairableCount > 0);
 }
 
@@ -883,6 +921,40 @@ function renderWatchlist(result) {
   if (!items.length) operationsEmpty(elements.watchList, "还没有重点观察帖子");
 }
 
+function renderIgnoredOperations(result) {
+  const items = Array.isArray(result?.notes) ? result.notes : [];
+  if (elements.ignoredOperationsCount) elements.ignoredOperationsCount.textContent = String(items.length);
+  if (!elements.ignoredOperationsList) return;
+  elements.ignoredOperationsList.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement("div"); row.className = "operations-row";
+    const copy = document.createElement("div"); copy.className = "operations-row__copy";
+    const title = document.createElement("strong"); title.textContent = item.title || "未命名帖子";
+    const detail = document.createElement("p");
+    detail.textContent = [item.author || "未知作者", item.accessStatus === "unreachable" ? "已确认失效" : "人工忽略"].join(" · ");
+    const meta = document.createElement("small"); meta.textContent = formatLocalTime(item.lastSeenAt || item.firstSeenAt);
+    copy.append(title, detail, meta);
+    const actions = document.createElement("div"); actions.className = "operations-row__actions";
+    const open = document.createElement("button"); open.type = "button"; open.textContent = "打开";
+    open.addEventListener("click", () => openOperationsNote(item));
+    const restore = document.createElement("button"); restore.type = "button"; restore.textContent = "恢复";
+    restore.addEventListener("click", async () => {
+      restore.disabled = true; restore.textContent = "恢复中";
+      try {
+        const restored = await sendRuntime({ type: "restoreNote", note: { noteId: item.noteId } });
+        if (!restored?.ok) throw new Error(restored?.error || "恢复失败");
+        await Promise.all([refreshIgnoredOperations(), refreshStats()]);
+        showToast("帖子已恢复，将重新参与批量同步");
+      } catch (error) {
+        restore.disabled = false; restore.textContent = "重试";
+        setStatus(error.message || "恢复失败", "error");
+      }
+    });
+    actions.append(open, restore); row.append(copy, actions); elements.ignoredOperationsList.appendChild(row);
+  }
+  if (!items.length) operationsEmpty(elements.ignoredOperationsList, "当前没有已忽略帖子");
+}
+
 function renderWeeklyReport(result) {
   operationsState.report = result?.found ? result.report : null;
   const report = operationsState.report;
@@ -915,6 +987,13 @@ async function refreshWatchlist() {
   renderWatchlist(result); return result;
 }
 
+async function refreshIgnoredOperations() {
+  const result = await sendRuntime({ type: "getNotes", status: "ignored", limit: 1000 })
+    .catch((error) => ({ ok: false, error: error.message, notes: [] }));
+  renderIgnoredOperations(result);
+  return result;
+}
+
 async function refreshWeeklyReport() {
   const result = await sendRuntime({ type: "getLatestWeeklyReport" }).catch((error) => ({ ok: false, error: error.message, found: false }));
   renderWeeklyReport(result); return result;
@@ -925,7 +1004,7 @@ async function refreshOperations() {
   operationsLoading = true;
   elements.refreshOperations.disabled = true;
   try {
-    await Promise.all([refreshHealth(), refreshChanges(), refreshWatchlist(), refreshWeeklyReport()]);
+    await Promise.all([refreshHealth(), refreshChanges(), refreshWatchlist(), refreshIgnoredOperations(), refreshWeeklyReport()]);
     return operationsState;
   } finally {
     operationsLoading = false;
@@ -1153,13 +1232,13 @@ async function deleteLocalNote(note, button = null) {
   const noteId = note?.noteId || note?.note_id;
   if (!noteId) throw new Error("缺少帖子 ID，无法删除");
   const title = note.title || "该帖子";
-  if (!confirm(`确定彻底删除“${title}”吗？\n\n将同时删除：\n• Excel 帖子整行及其全部评论行\n• SQLite 帖子、评论和分析记录\n• 对应素材目录\n\n此操作不可撤销。`)) return null;
+  if (!confirm(`确定彻底删除“${title}”吗？\n\n将同时删除：\n• 笔记 CSV 帖子行及评论 CSV 对应行\n• SQLite 帖子、评论和分析记录\n• 对应素材目录\n\n此操作不可撤销。`)) return null;
   const originalButtonText = button?.textContent || "删除本地帖子";
   if (button) {
     button.disabled = true;
     button.textContent = "删除中…";
   }
-  setStatus(`正在删除“${title}”的 Excel 行、数据库记录和素材目录…`, "warning");
+  setStatus(`正在删除“${title}”的 CSV 行、数据库记录和素材目录…`, "warning");
   try {
     const result = await sendRuntime({ type: "deletePulledNote", noteId });
     if (!result?.ok) throw new Error(result?.error || "删除失败");
@@ -1168,7 +1247,7 @@ async function deleteLocalNote(note, button = null) {
       renderCurrentDetail(currentDetailNote, false);
     }
     setStatus(
-      `删除完成：Excel 删除 ${result.deletedNoteRows || 0} 条帖子、${result.deletedCommentRows || 0} 条评论${result.mediaDeleted ? "，素材目录已删除" : ""}${result.mediaCleanupWarning ? `；${result.mediaCleanupWarning}` : ""}`,
+      `删除完成：CSV 删除 ${result.deletedNoteRows || 0} 条帖子、${result.deletedCommentRows || 0} 条评论${result.mediaDeleted ? "，素材目录已删除" : ""}${result.mediaCleanupWarning ? `；${result.mediaCleanupWarning}` : ""}`,
       result.mediaCleanupWarning ? "warning" : "success"
     );
     await Promise.all([refreshStats(), refreshPending(), loadPageInfo()]);
@@ -1194,7 +1273,7 @@ async function analyzeCurrentDetailRelevance() {
       relevanceReason: result.relevanceReason, relevanceConfidence: result.relevanceConfidence,
       isRelevant: result.isRelevant };
     renderCurrentDetail(currentDetailNote, false);
-    showToast(result.relevanceStatus === "irrelevant" ? "已判定不相关，并写入 Excel 不相关 Sheet" : result.relevanceStatus === "relevant" ? "已判定与品牌相关" : "证据不足，保持相关性未知");
+    showToast(result.relevanceStatus === "irrelevant" ? "已判定不相关，并保存在 SQLite" : result.relevanceStatus === "relevant" ? "已判定与品牌相关" : "证据不足，保持相关性未知");
     await refreshAll({ quiet: true });
   } catch (error) { showToast(error.message || "AI 判断失败", "error"); }
   finally { elements.currentDetailAnalyze.textContent = "AI 判断相关性"; elements.currentDetailAnalyze.disabled = false; }
@@ -1255,10 +1334,10 @@ function setDeepScanning(value) {
 function renderBridgeState(state) {
   const status = state?.status || (state?.ok ? "online" : "offline");
   elements.bridgeStateDot.dataset.state = status;
-  if (status === "online") elements.bridgeStateText.textContent = "本地 Excel 已就绪";
-  else if (status === "connecting") elements.bridgeStateText.textContent = "正在连接本地 Excel";
-  else if (status === "idle") elements.bridgeStateText.textContent = "等待连接本地 Excel";
-  else elements.bridgeStateText.textContent = "本地 Excel 暂不可用";
+  if (status === "online") elements.bridgeStateText.textContent = "本地 CSV 已就绪";
+  else if (status === "connecting") elements.bridgeStateText.textContent = "正在连接本地 CSV";
+  else if (status === "idle") elements.bridgeStateText.textContent = "等待连接本地 CSV";
+  else elements.bridgeStateText.textContent = "本地 CSV 暂不可用";
   elements.bridgeVersion.textContent = status === "online" ? "数据已同步" : "正在准备数据";
 }
 
@@ -1280,7 +1359,7 @@ function renderNegativeSummary(negative) {
 
 function sourceLabel(source, fallback = "本地数据库") {
   return {
-    existing_xlsx: "Excel 初始总表",
+    existing_xlsx: "CSV 基准总表",
     dom: "浏览器扫描",
     manual_confirm: "已加入拉取"
   }[source] || fallback;
@@ -1379,7 +1458,7 @@ function renderNoteList(notes, options = {}) {
   elements.queueHint.textContent = options.hint || "";
   elements.queueBack.hidden = options.back !== true;
   elements.queueMore.hidden = !options.more;
-  if (options.more) elements.queueMore.textContent = `查看全部 ${options.total || notes.length} 篇 Excel 未找到帖子`;
+  if (options.more) elements.queueMore.textContent = `查看全部 ${options.total || notes.length} 篇 CSV 未找到帖子`;
   activateMetric(options.status || "");
   notes.forEach((note, index) => {
     const item = document.createElement("article");
@@ -1432,7 +1511,7 @@ function renderNoteList(notes, options = {}) {
     if ((note.status || options.status || "") === "new") {
       pullActions.hidden = false;
       pullActions.removeAttribute?.("aria-hidden");
-      pullActions.append(actionButton("拉取到 Excel", async (button) => pullNoteToExcel(note, button)));
+      pullActions.append(actionButton("拉取到 CSV", async (button) => pullNoteToExcel(note, button)));
     } else if (options.status === "known" && ["partial", "failed"].includes(note.pullStatus)) {
       pullActions.hidden = false;
       pullActions.removeAttribute?.("aria-hidden");
@@ -1454,11 +1533,11 @@ function renderNoteList(notes, options = {}) {
         })
       );
       if ((note.status || options.status || "") === "new") actions.append(
-        actionButton("拉取到 Excel", async (button) => pullNoteToExcel(note, button)),
+        actionButton("拉取到 CSV", async (button) => pullNoteToExcel(note, button)),
         actionButton("忽略", async () => {
           const result = await sendRuntime({ type: "ignoreNote", note: { ...note, noteId, url: noteUrl(note) } });
           if (!result?.ok) throw new Error(result?.error || "忽略失败");
-          setStatus("已忽略；该帖子已移出“Excel 未找到”列表", "success");
+          setStatus("已忽略；该帖子不再参与批量同步", "success");
           await Promise.all([refreshStats(), refreshPending()]);
         })
       );
@@ -1516,7 +1595,7 @@ async function pullNoteToExcel(note, button) {
   if (!noteId) throw new Error("缺少帖子 ID，无法拉取");
   if (activePulls.has(noteId)) return;
   activePulls.add(noteId);
-  const originalLabel = button?.textContent || "拉取到 Excel";
+  const originalLabel = button?.textContent || "拉取到 CSV";
   if (button) button.textContent = "读取正文…";
   setStatus(`正在拉取“${note.title || "该帖子"}”：读取完整正文…`);
   try {
@@ -1535,15 +1614,15 @@ async function pullNoteToExcel(note, button) {
     ].filter(Boolean).join("和") || "部分内容";
     setStatus(
       partial
-        ? `已写入 Excel：正文完成，${partialReasons}读取不完整，可稍后重试`
-        : `已写入 Excel：正文 + ${result.commentCount || 0} 条评论；该帖子现在归入“Excel 已有”`,
+        ? `已写入 CSV：正文完成，${partialReasons}读取不完整，可稍后重试`
+        : `已写入 CSV：正文 + ${result.commentCount || 0} 条评论；该帖子现在归入“CSV 已有”`,
       partial ? "warning" : "success"
     );
     await Promise.all([refreshStats(), refreshPending(), loadPageInfo()]);
     if (queueView.type === "status" && queueView.status === "known") {
       await showStatusView("known");
       setStatus(
-        partial ? `已写入 Excel，但${partialReasons}仍未完整采集` : "评论补采完成，已更新 Excel",
+        partial ? `已写入 CSV，但${partialReasons}仍未完整采集` : "评论补采完成，已更新 CSV",
         partial ? "warning" : "success"
       );
     }
@@ -1611,7 +1690,7 @@ async function showAllPosts() {
   if (!result?.ok) throw new Error(result?.error || "帖子列表读取失败");
   queueView = { type: "all", status: "" };
   renderNoteList(result.notes || [], {
-    title: "全部本地去重记录", kicker: "LOCAL RECORDS", hint: "包含 Excel 已有、新相关、待加入 Excel 与已忽略；以 Excel 基准表数字判断是否真正入表",
+    title: "全部本地去重记录", kicker: "LOCAL RECORDS", hint: "包含 CSV 已有、新相关、待加入 CSV 与已忽略；以 CSV 基准表数字判断是否真正入表",
     total: (result.notes || []).length, back: true
   });
   elements.queueSection.scrollIntoView?.({ block: "start" });
@@ -1727,10 +1806,10 @@ async function refreshAll(options = {}) {
     const [pageInfo, stats, pending] = await Promise.all([
       loadPageInfo(), refreshStats(), refreshPending(), refreshAI(), refreshUnreachableNotes().catch(() => null)
     ]);
-    if (!options.quiet && stats?.ok) setStatus("Excel 对比结果已刷新", "success");
+    if (!options.quiet && stats?.ok) setStatus("CSV 对比结果已刷新", "success");
     if (!stats?.ok) {
       renderBridgeState({ status: "offline", error: stats?.error });
-      if (!options.quiet) setStatus(`本地 Excel 暂不可用：${stats?.error || "请重新打开侧边栏"}`, "error");
+      if (!options.quiet) setStatus(`本地 CSV 暂不可用：${stats?.error || "请重新打开侧边栏"}`, "error");
     }
     return { pageInfo, stats, pending };
   })();
@@ -1808,19 +1887,19 @@ async function showNegativeView(type = "note") {
 
 async function startBridgeOnPanelOpen() {
   renderBridgeState({ status: "connecting" });
-  setStatus("正在准备本地 Excel…");
+  setStatus("正在准备本地 CSV…");
   const result = await sendRuntime({ type: "startBridge" });
   renderBridgeState(result);
   if (result?.ok) {
     const excel = await sendRuntime({ type: "reloadExcel" }).catch(() => null);
     setStatus(
       excel?.ok
-        ? "本地 Excel 已准备好"
-        : "本地 Excel 已连接",
+        ? "本地 CSV 已准备好"
+        : "本地 CSV 已连接",
       "success"
     );
   } else {
-    setStatus(`本地 Excel 连接失败：${result?.error || "请重新打开侧边栏"}`, "error");
+    setStatus(`本地 CSV 连接失败：${result?.error || "请重新打开侧边栏"}`, "error");
   }
   return result;
 }
@@ -1830,7 +1909,7 @@ async function scanCurrentPage() {
   let fastResult = null;
   setScanning(true);
   setScanStage("cards");
-  setStatus("正在读取当前页面并与 Excel 核对…");
+  setStatus("正在读取当前页面并与 CSV 核对…");
   try {
     const result = await sendToActiveTab({ type: "scanNow" });
     if (!result?.ok) throw new Error(result?.error || "扫描失败");
@@ -1861,7 +1940,7 @@ async function deepScanCurrentPage(options = {}) {
   if (scanning) return null;
   setDeepScanning(true);
   setScanStage("details", ["cards"]);
-  setStatus("正在核对正文与本地 Excel…");
+  setStatus("正在核对正文与本地 CSV…");
   try {
     const result = await sendToActiveTab({ type: "deepScanNow" });
     if (!result?.ok) throw new Error(result?.error || "文案补全失败");
@@ -1925,6 +2004,10 @@ elements.cancelBatchSync?.addEventListener("click", () => {
 });
 elements.retryBatchFailures?.addEventListener("click", () => {
   retryFailedPulledSync().catch((error) => setStatus(error.message || "失败项重试失败", "error"));
+});
+elements.ignoreAllBatchFailures?.addEventListener("click", () => {
+  const items = (batchSyncViewState.failures || []).filter((item) => item?.noteId);
+  ignoreBatchFailureItems(items, true).catch((error) => setStatus(error.message || "一键忽略失败", "error"));
 });
 elements.deleteUnreachable?.addEventListener("click", () => {
   deleteAllUnreachableNotes().catch((error) => setStatus(error.message || "批量删除失败", "error"));
@@ -2139,7 +2222,7 @@ chrome.runtime.onMessage.addListener((message) => {
       resolve: "准备打开帖子",
       detail: "正在读取完整正文",
       comments: "正在读取可见评论",
-      excel: "正在写入本地 Excel",
+      excel: "正在写入本地 CSV",
       done: "拉取完成",
       failed: "拉取失败"
     }[message.phase] || "正在拉取";

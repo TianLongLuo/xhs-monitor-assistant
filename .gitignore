@@ -10,12 +10,13 @@ bridge/__pycache__/
 *.pyc
 *.spec
 
-# 用户数据（Excel 总表、帖子素材、周报等）
+# 用户数据（CSV 总表、帖子素材、周报等）
 data/
 
 # 导出与临时文件
 bridge/exports/
 *.tmp.xlsx
+*.tmp.csv
 node_modules/
 .playwright-cli/
 

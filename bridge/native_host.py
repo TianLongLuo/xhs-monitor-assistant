@@ -49,7 +49,9 @@ def load_config() -> dict[str, Any]:
         "port": BRIDGE_PORT,
         "db": str(default_root / "data" / "xhs_monitor.db"),
         "export_dir": str(default_root / "exports"),
-        "seed_xlsx": "",
+        "seed_csv": "",
+        "comments_csv": "",
+        "seed_xlsx": "",  # legacy migration input
     }
     path = config_path()
     if path.exists():
@@ -211,7 +213,8 @@ def run_bridge_child() -> None:
     if _port_already_serves_bridge(str(config.get("host", BRIDGE_HOST)), int(config.get("port", BRIDGE_PORT))):
         print("[native-host] a Bridge is already serving this port; exiting to avoid double-bind", file=sys.stderr, flush=True)
         return
-    seed_xlsx = Path(config["seed_xlsx"]) if config.get("seed_xlsx") else None
+    configured_master = config.get("seed_csv") or config.get("seed_xlsx") or ""
+    seed_xlsx = Path(configured_master) if configured_master else None
     try:
         server, _store, inserted = create_server(
             str(config.get("host", BRIDGE_HOST)),
@@ -221,6 +224,16 @@ def run_bridge_child() -> None:
             seed_xlsx,
         )
         assert isinstance(server, ThreadingHTTPServer)
+        # Persist the completed XLSX -> CSV migration so every later launch
+        # goes directly to the lightweight tables.
+        if _store.seed_xlsx_path:
+            config["seed_csv"] = str(_store.seed_xlsx_path)
+            config["comments_csv"] = str(_store.comments_csv_path or "")
+            config["seed_xlsx"] = ""
+            target = config_path()
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, target)
         log_event(f"bridge child running; seeded={inserted}")
         print(f"[native-host] bridge child running; seeded={inserted}", file=sys.stderr, flush=True)
         try:

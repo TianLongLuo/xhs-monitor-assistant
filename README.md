@@ -1,8 +1,8 @@
 # 小红书舆情监控助手
 
-Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 Excel / SQLite，并可调用 AI 进行情绪分析。
+Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 UTF-8 CSV / SQLite，并可调用 AI 进行分析。
 
-当前版本：`0.23.0`
+当前版本：`0.24.0`
 
 当前状态与完整需求见 [小红书舆情监控助手_PRD.md](小红书舆情监控助手_PRD.md)。
 
@@ -10,7 +10,7 @@ Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前�
 
 - 当前页面 DOM 读取，不申请 Cookie 权限，不调用小红书隐藏接口。
 - 帖子正文、评论、图片素材幂等写入。
-- 新用户首次拉取时自动创建标准 Excel。
+- 新用户首次启动时自动创建独立的 UTF-8 BOM 笔记 CSV 与评论 CSV。
 - 本地私有品牌、产品、账号词库。
 - AI 测试连接、自动分析、流式进度条、百分比与完成通知。
 - 侧边栏可缩小为吸附在浏览器右侧的圆形悬浮球。
@@ -49,7 +49,7 @@ bridge/data/relevance_keywords.json
 }
 ```
 
-该文件、数据库、AI 设置、Excel 和素材均被 `.gitignore` 排除。
+该文件、数据库、AI 设置、CSV 总表和素材均被 `.gitignore` 排除。
 
 ## 目录结构
 
@@ -62,7 +62,7 @@ bridge/
   install_native_host.ps1         注册扩展 ID
   uninstall_native_host.ps1       移除注册
   relevance_keywords.example.json 词库示例
-data/                              Excel 与素材（运行时生成，不入库）
+data/                              CSV 总表与素材（运行时生成，不入库）
 setup.ps1 / setup.cmd              一键连接向导
 使用说明.md
 小红书舆情监控助手_PRD.md
@@ -75,13 +75,15 @@ powershell -ExecutionPolicy Bypass -File bridge/build_native_host.ps1
 powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 -ExtensionId "你的32位插件ID"
 ```
 
-已有总表：
+指定笔记 CSV（评论 CSV 会在同目录自动创建）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 `
   -ExtensionId "你的32位插件ID" `
-  -SeedXlsx "D:\路径\小红书笔记评论总表.xlsx"
+  -SeedCsv "D:\路径\小红书_笔记总表.csv"
 ```
+
+旧版 `-SeedXlsx` 仍可用于一次性迁移；校验成功后自动拆分成两个 CSV 并删除旧总表。
 
 ## 本地 API
 
@@ -192,3 +194,10 @@ powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 - 新增同步变更中心与持久化 `sync_runs` / `change_events`：记录新增、删除、修改评论和访问状态变化，支持未读数量、帖子跳转与全部已读。
 - 新增重点帖子观察名单：当前帖子可一键加入或移出，名单按优先级、未读变化和最近变化排序。
 - 新增近 7 天周报：生成本地 HTML 与 Excel，包含新增帖子、评论变化、问题分类和重点观察；每次全量同步完成后自动刷新，也可选择日期手动生成。
+
+## v0.24.0：双 CSV 总表与失败项忽略
+
+- 帖子和评论业务总表由多 Sheet XLSX 迁移为 `*_笔记总表.csv`、`*_评论总表.csv`，统一使用 UTF-8 BOM；迁移逐行校验后才删除旧 XLSX，附加旧 Sheet 归档到 SQLite。
+- 新安装直接创建两个 CSV；拉取、评论同步、访问状态、AI 回写、数据体检、彻底删除及 WPS 行列定位均已切换到 CSV。
+- 批量同步仅以评论新增、删除或实质修改统计“有变化”；仅帖子互动量、时间等元数据刷新仍计为“无变化”。
+- 未完成帖子支持单条忽略和表头一键忽略；忽略项不再参与批量同步，并在运营页折叠展示、支持恢复。

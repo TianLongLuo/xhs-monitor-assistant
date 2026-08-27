@@ -27,10 +27,10 @@
         </div>
       </header>
 
-      <section class="connection connection-quiet" aria-label="本地 Excel 连接状态">
+      <section class="connection connection-quiet" aria-label="本地 CSV 连接状态">
         <span id="bridgeStateDot" class="connection-dot" data-state="idle"></span>
         <div class="connection-copy">
-          <strong id="bridgeStateText">正在连接本地 Excel</strong>
+          <strong id="bridgeStateText">正在连接本地 CSV</strong>
           <span id="bridgeVersion">正在准备数据</span>
         </div>
         <span class="local-pill">LOCAL</span>
@@ -80,12 +80,12 @@
             <button id="currentDetailAnalyze" type="button">AI 判断相关性</button>
           </div>
           <div class="current-detail-card__actions">
-            <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
+            <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 CSV</button>
             <button id="currentDetailSummary" class="current-detail-card__summary" type="button">AI 总结</button>
             <button id="currentDetailComments" class="current-detail-card__comments" type="button">评论区</button>
             <button id="currentDetailWatch" class="current-detail-card__watch" type="button">加入重点观察</button>
             <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
-            <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 Excel、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
+            <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 CSV、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
           <p id="currentDetailHint" class="current-detail-card__hint">点击后会在放大帖子右侧显示 Process，逐步读取正文、图片、评论及 ID。</p>
           </div>
@@ -93,7 +93,7 @@
         <ol id="scanStages" class="scan-stages" hidden aria-label="扫描进度">
           <li data-stage="cards"><span>1</span><strong>读取卡片</strong><small>标题与元数据</small></li>
           <li data-stage="details"><span>2</span><strong>补全正文</strong><small>当前页详情层</small></li>
-          <li data-stage="compare"><span>3</span><strong>Excel 对比</strong><small>已有或未找到</small></li>
+          <li data-stage="compare"><span>3</span><strong>CSV 对比</strong><small>已有或未找到</small></li>
         </ol>
         <button id="scanCurrent" class="scan-button" type="button">
           <span class="scan-button-icon" aria-hidden="true"></span>
@@ -124,7 +124,10 @@
           <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="同步失败帖子">
             <div class="batch-sync-failures__head">
               <strong>未完成帖子诊断</strong>
-              <span id="batchSyncFailureCount">0 篇</span>
+              <span class="batch-sync-failures__head-actions">
+                <span id="batchSyncFailureCount">0 篇</span>
+                <button id="ignoreAllBatchFailures" type="button">一键忽略</button>
+              </span>
             </div>
             <ol id="batchSyncFailureList" class="batch-sync-failures__list"></ol>
           </section>
@@ -142,8 +145,8 @@
         <div id="status" class="status" data-state="idle" role="status" aria-live="polite">准备就绪</div>
       </section>
 
-      <section class="metrics compare-metrics" data-panel-section="overview" aria-label="Excel 对比结果">
-        <button id="knownMetric" class="metric" type="button" data-note-status="known"><span id="knownCount">—</span><small>Excel 已有</small><i>点击查看</i></button>
+      <section class="metrics compare-metrics" data-panel-section="overview" aria-label="CSV 对比结果">
+        <button id="knownMetric" class="metric" type="button" data-note-status="known"><span id="knownCount">—</span><small>CSV 已有</small><i>点击查看</i></button>
         <button id="newMetric" class="metric metric-primary" type="button" data-note-status="new"><span id="newCount">—</span><small>新相关未拉取</small><i>点击查看</i></button>
       </section>
 
@@ -157,12 +160,17 @@
           <button id="refreshOperations" class="operations-refresh" type="button" aria-label="刷新运营数据">↻</button>
         </div>
 
+        <details id="ignoredOperations" class="operations-ignored">
+          <summary><span>已忽略帖子</span><strong id="ignoredOperationsCount">0</strong><small>点击展开</small></summary>
+          <div id="ignoredOperationsList" class="operations-list operations-list--ignored"></div>
+        </details>
+
         <article class="operations-card health-card">
           <header>
             <div><span>DATA HEALTH</span><h3>数据体检中心</h3></div>
             <strong id="healthScore" data-state="idle">—</strong>
           </header>
-          <p id="healthSummary">点击运行体检，核对 Excel、SQLite、评论计数和素材目录。</p>
+          <p id="healthSummary">点击运行体检，核对 CSV、SQLite、评论计数和素材目录。</p>
           <div id="healthMetrics" class="operations-metrics"></div>
           <div id="healthIssues" class="operations-list"></div>
           <div class="operations-actions">
@@ -221,15 +229,15 @@
 
       <section class="data-scope" hidden aria-label="数据统计口径">
         <div class="scope-total">
-          <span>Excel 基准表</span>
+          <span>CSV 基准表</span>
           <strong id="libraryTotal">—</strong>
-          <small>sheet1 帖子总表</small>
+          <small>笔记总表.csv</small>
         </div>
         <div class="scope-split">
-          <span>Excel 未找到 <strong id="inboxTotal">—</strong></span>
+          <span>CSV 未找到 <strong id="inboxTotal">—</strong></span>
           <span>本地去重记录 <strong id="recordTotal">—</strong></span>
         </div>
-        <p>先用帖子 ID、标题和正文对比 Excel；Excel 没有时，只有确认与品牌词、产品词或官方账号相关的帖子才会框选。</p>
+        <p>先用帖子 ID、标题和正文对比笔记 CSV；CSV 没有时，只有确认与品牌词、产品词或官方账号相关的帖子才会框选。</p>
       </section>
 
       <div class="post-shortcuts" data-panel-section="posts" hidden>
@@ -250,7 +258,7 @@
           <label>发布时间起<input id="negativePublished" type="date"></label>
           <label>风险等级<select id="negativeRisk"><option value="">全部</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select></label>
           <label>问题分类<input id="negativeCategory" type="text" placeholder="如 服务态度"></label>
-          <label>业务状态<select id="negativeBusinessStatus"><option value="">全部</option><option value="new">Excel 未找到</option><option value="known">Excel 已有</option><option value="confirmed">待加入 Excel</option><option value="ignored">已忽略</option></select></label>
+          <label>业务状态<select id="negativeBusinessStatus"><option value="">全部</option><option value="new">CSV 未找到</option><option value="known">CSV 已有</option><option value="confirmed">待加入 CSV</option><option value="ignored">已忽略</option></select></label>
           <label>AI 状态<select id="negativeAIStatus"><option value="">全部</option><option value="completed">已完成</option><option value="failed">失败</option><option value="analyzing">分析中</option></select></label>
           <label>复核状态<select id="negativeReviewStatus"><option value="">全部</option><option value="pending_review">待复核</option><option value="pending_action">待处理</option><option value="in_progress">处理中</option><option value="resolved">已解决</option><option value="false_positive">误判</option><option value="no_action_needed">无需处理</option></select></label>
           <label>来源词<input id="negativeSourceKeyword" type="text" placeholder="品牌词 / 账号名"></label>
@@ -264,15 +272,15 @@
           <div>
             <div id="queueKicker" class="section-kicker">采集队列</div>
             <h2 id="queueTitle">新相关未拉取</h2>
-            <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地 Excel 中还没有</p>
+            <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地笔记 CSV 中还没有</p>
           </div>
           <span id="pendingCount" class="count-pill">0</span>
         </div>
         <div id="pendingList" class="pending-list"></div>
-        <button id="queueMore" class="queue-more" type="button" hidden>查看全部 Excel 未找到帖子</button>
+        <button id="queueMore" class="queue-more" type="button" hidden>查看全部 CSV 未找到帖子</button>
         <div id="pendingEmpty" class="empty-state">
           <span class="empty-glyph" aria-hidden="true">✓</span>
-          <strong>没有发现 Excel 之外的新相关帖子</strong>
+          <strong>没有发现 CSV 之外的新相关帖子</strong>
           <p>继续下滑或重新扫描后，新加载的品牌相关帖子会出现在这里。</p>
         </div>
       </section>
@@ -317,7 +325,7 @@
       </details>
 
       <footer>
-        <span>本地 Excel 对比</span>
+        <span>本地 CSV 对比</span>
         <span id="lastScan">尚未扫描</span>
       </footer>
     </main>

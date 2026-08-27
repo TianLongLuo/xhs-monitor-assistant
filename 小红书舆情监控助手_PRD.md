@@ -17,15 +17,16 @@
 | 项目 | 当前状态 |
 |---|---|
 | Bridge 健康检查 | 正常，`ok=true` |
-| Bridge 版本 | `0.18.0` |
+| Bridge 版本 | `0.24.0` |
 | 本地服务 | `http://127.0.0.1:17881` |
 | Native Host | `com.xhsmonitor.bridge` |
 | Native Host 程序 | `舆论监控插件联动\bridge\dist\xhs_monitor_native_host.exe` |
 | Chrome 插件 ID | `kbmhklcbiobifehkcpknngmichcogeho` |
 | Chrome 当前加载目录 | `舆论监控插件联动\extension` |
 | SQLite | `舆论监控插件联动\bridge\data\xhs_monitor.db` |
-| Excel 总表 | `舆论监控插件联动\data\Origani_total_post\Origani_笔记评论总表_20260703.xlsx` |
-| 素材目录 | Excel 同目录下的 `posts_materials` |
+| 笔记 CSV | `舆论监控插件联动\data\Origani_total_post\Origani_笔记总表.csv` |
+| 评论 CSV | `舆论监控插件联动\data\Origani_total_post\Origani_评论总表.csv` |
+| 素材目录 | CSV 同目录下的 `posts_materials` |
 
 系统中可看到两个同名 Native Host 进程，它们是 PyInstaller one-file 程序的父子进程关系，不代表启动了两个独立 Bridge 服务。
 
@@ -64,18 +65,18 @@
 
 - 用户数据约 2.1 GB。
 - 文件约 1,059 个。
-- Excel 总表存在，大小约 427 KB。
+- 笔记与评论总表使用两个独立的 UTF-8 BOM CSV。
 - 素材目录存在。
 
 ## 2. 产品目标
 
-为品牌舆情人员提供一个在本机运行的小红书信息采集与分析工具。用户在正常登录和浏览小红书的过程中，从当前页面可见 DOM 读取帖子、评论与图片链接，将结果保存到本地 Excel / SQLite，并可调用 AI 完成情绪判断、风险分类和结果回写。
+为品牌舆情人员提供一个在本机运行的小红书信息采集与分析工具。用户在正常登录和浏览小红书的过程中，从当前页面可见 DOM 读取帖子、评论与图片链接，将结果保存到本地 CSV / SQLite，并可调用 AI 完成情绪判断、风险分类和结果回写。
 
 ## 3. 目标用户
 
 1. 品牌市场与舆情人员。
 2. 客服、消费者洞察与门店运营人员。
-3. 需要将浏览器页面信息结构化保存到 Excel 的个人用户。
+3. 需要将浏览器页面信息结构化保存到 CSV 的个人用户。
 
 ## 4. 核心使用流程
 
@@ -85,9 +86,9 @@
 4. 用户登录小红书，打开搜索结果、推荐页或帖子详情。
 5. 用户打开插件侧边栏并执行页面核对。
 6. 用户点击帖子上的“拉取”，扩展读取当前页面详情、评论和图片 URL。
-7. Bridge 将帖子、评论和素材写入 SQLite、Excel 及素材目录。
+7. Bridge 将帖子、评论和素材写入 SQLite、两个 CSV 及素材目录。
 8. AI 自动分析任务入队，界面显示状态、估算百分比与完成提示。
-9. 用户在 Excel 或插件差评中心查看和复核结果。
+9. 用户在 WPS/CSV 或插件运营中心查看和复核结果。
 
 ## 5. 功能需求
 
@@ -113,16 +114,16 @@
 ### FR-04 本地写入
 
 - 按帖子 ID、标题和正文进行幂等匹配。
-- 写入本地 SQLite 与 Excel。
-- 首次运行没有 Excel 时自动创建标准工作簿。
-- 图片保存到 Excel 同目录的 `posts_materials`。
+- 写入本地 SQLite、笔记 CSV 与评论 CSV。
+- 首次运行没有总表时自动创建两个 UTF-8 BOM CSV。
+- 图片保存到 CSV 同目录的 `posts_materials`。
 
 ### FR-05 AI 分析
 
 - 支持 AI 连接测试。
 - 帖子和评论拉取后自动进入分析队列。
 - 分析结果包括情绪、风险等级、问题分类、摘要、置信度和建议动作。
-- 分析成功后写回 Excel 并显示底部居中完成提示。
+- 分析成功后写回对应 CSV 并显示底部居中完成提示。
 - 失败任务保留错误原因并支持重试。
 
 ### FR-06 进度反馈
@@ -228,7 +229,7 @@
 - `GET http://127.0.0.1:17881/api/health` 返回 `ok=true`、`version=0.18.0`。
 - `GET /api/relevance` 正常返回本机私有词库，当前为品牌词 7 个、产品词 96 个、账号词 3 个。
 - Native Messaging 注册表指向新目录中的 `bridge/com.xhsmonitor.bridge.json`。
-- `bridge/native_host_config.json` 中 SQLite、导出目录和 Excel 总表均指向新项目目录。
+- `bridge/native_host_config.json` 中 SQLite、导出目录和两个 CSV 总表均指向新项目目录。
 - Git 跟踪文件中未发现个人绝对路径、私有品牌词、访问 Token 或运行时数据。
 
 ### 10.2 保留限制

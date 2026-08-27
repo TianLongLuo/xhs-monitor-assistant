@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.23.12";
+  const CONTENT_VERSION = "0.24.0";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -76,7 +76,7 @@
     { id: "body", label: "正文与字段", hint: "标题、正文、话题、作者" },
     { id: "comments", label: "评论及 ID", hint: "读取评论并生成稳定 ID" },
     { id: "media", label: "素材文件", hint: "提取图片 / 视频并保存帖子文件夹" },
-    { id: "excel", label: "Excel / SQLite", hint: "按总表字段幂等写入" }
+    { id: "excel", label: "CSV / SQLite", hint: "按总表字段幂等写入" }
   ];
 
   const PROCESS_NOTE_FIELDS = [
@@ -307,7 +307,7 @@
 
   function processStatusText(message = {}) {
     if (message.error) return message.error;
-    if (message.done) return message.pullStatus === "partial" ? "已写入，部分内容可重试" : "已完成并写入本地 Excel";
+    if (message.done) return message.pullStatus === "partial" ? "已写入，部分内容可重试" : "已完成并写入本地 CSV";
     return message.title || PROCESS_STEPS.find((step) => step.id === message.phase)?.hint || "处理中…";
   }
 
@@ -599,7 +599,7 @@
     heading.append(eyebrow, title, status, headStates);
     const actions = document.createElement("div");
     actions.className = `${PROCESS_PANEL_CLASS}__actions`;
-    const pullButton = processButton("拉取到 Excel", `${PROCESS_PANEL_CLASS}__pull`, () => {
+    const pullButton = processButton("拉取到 CSV", `${PROCESS_PANEL_CLASS}__pull`, () => {
       pullFromProcessPanel(panel).catch(() => {});
     });
     pullButton.textContent = "拉取";
@@ -663,7 +663,7 @@
         open.dataset.artifact = step.id;
         open.textContent = "打开";
         open.disabled = true;
-        open.title = step.id === "media" ? "打开该帖子的素材文件夹" : "打开 Excel 并定位到该帖子";
+        open.title = step.id === "media" ? "打开该帖子的素材文件夹" : "使用 WPS 打开笔记 CSV 并定位到该帖子";
         open.addEventListener("click", async (event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -704,7 +704,7 @@
     const fieldHead = document.createElement("div");
     fieldHead.className = `${PROCESS_PANEL_CLASS}__section-head`;
     const fieldLabel = document.createElement("strong");
-    fieldLabel.textContent = "Excel 字段对齐";
+    fieldLabel.textContent = "CSV 字段对齐";
     const fieldCount = document.createElement("span");
     fieldCount.className = `${PROCESS_PANEL_CLASS}__field-count`;
     fieldHead.append(fieldLabel, fieldCount);
@@ -1669,7 +1669,7 @@
     const intro = document.createElement("p");
     intro.className = `${PROCESS_PANEL_CLASS}__change-intro`;
     intro.textContent = result.canPrune
-      ? "已展开全部可见评论并与本地 Excel / 数据库完成对比。"
+      ? "已展开全部可见评论并与本地 CSV / 数据库完成对比。"
       : "已发现新内容；部分回复仍未完整加载，暂不删除本地疑似消失评论。";
 
     const list = document.createElement("div");
@@ -1888,7 +1888,7 @@
       const pullButton = panel.querySelector(`.${PROCESS_PANEL_CLASS}__pull`);
       if (heading) heading.textContent = "当前帖子";
       if (status) status.textContent = cachedPulled
-        ? "已在 Excel，正在读取本地素材"
+        ? "已在 CSV，正在读取本地素材"
         : info.loading ? "正文加载中，可直接开始拉取" : "点击拉取正文、图片与评论";
       if (cachedPulled) {
         const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
@@ -2145,7 +2145,7 @@
       if (showProcess) {
         updateProcessPanel({
           process: true, noteId: note.noteId, phase: "body",
-          title: "详情已打开，正在读取正文与 Excel 字段", note
+          title: "详情已打开，正在读取正文与 CSV 字段", note
         });
       }
       let detail = null;
@@ -2456,11 +2456,11 @@
   }
 
   const STATE_META = {
-    unloaded: { label: "未拉取", hint: "本地 Excel 标题中没有匹配记录；点击“拉取”保存完整帖子" },
-    unrelated: { label: "未拉取", hint: "当前卡片尚未写入本地 Excel；点击“拉取”后再判断并保存" },
-    new: { label: "未拉取", hint: "本地 Excel 中没有匹配记录，点击“拉取”保存完整帖子" },
-    known: { label: "Excel 已有", hint: "已存在于本地 Excel 帖子总表" },
-    confirmed: { label: "已加入拉取", hint: "已加入本地拉取队列，当前仍未写入 Excel" },
+    unloaded: { label: "未拉取", hint: "本地笔记 CSV 中没有匹配记录；点击“拉取”保存完整帖子" },
+    unrelated: { label: "未拉取", hint: "当前卡片尚未写入本地 CSV；点击“拉取”后再判断并保存" },
+    new: { label: "未拉取", hint: "本地笔记 CSV 中没有匹配记录，点击“拉取”保存完整帖子" },
+    known: { label: "CSV 已有", hint: "已存在于本地笔记 CSV 总表" },
+    confirmed: { label: "已加入拉取", hint: "已加入本地拉取队列，当前仍未写入 CSV" },
     partial: { label: "部分拉取", hint: "正文已保存，但图片或评论仍可重试" },
     pulling: { label: "拉取中…", hint: "正在当前小红书页面读取正文、图片和评论" },
     ignored: { label: "已忽略", hint: "已从新相关帖子列表移除" }
