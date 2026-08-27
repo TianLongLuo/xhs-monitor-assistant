@@ -43,7 +43,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.25.0"
+VERSION = "0.25.1"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -415,6 +415,8 @@ def preferred_url(current: Any, candidate: Any) -> str:
 
 def valid_note_id(value: Any) -> str:
     note_id = text(value, 128)
+    if note_id.casefold() in {"undefined", "null", "none", "unknown", "nan"}:
+        return ""
     if not NOTE_ID_RE.fullmatch(note_id):
         return ""
     return note_id
@@ -432,9 +434,8 @@ def note_url_identity(value: Any) -> str:
             if marker in parts:
                 index = parts.index(marker) + 1
                 if index < len(parts):
-                    candidate = valid_note_id(parts[index])
-                    if candidate:
-                        return candidate
+                    return valid_note_id(parts[index])
+                return ""
         return urlunparse(parsed._replace(query="", fragment="")).rstrip("/").casefold()
     except ValueError:
         return match_key(raw, 2000)
@@ -1140,27 +1141,51 @@ class MonitorStore:
             # matching was introduced.
             rows = db.execute(
                 """
-                SELECT note_id, title, content, tags, title_key, content_key,
+                SELECT note_id, url, title, author, content, tags, title_key, content_key,
                        title_content_key, status, source, is_relevant, payload_json
-                FROM notes
+                FROM notes ORDER BY note_id
                 """
             ).fetchall()
-            for row in rows:
+            payload_repaired_at = now_iso()
+            for row_number, row in enumerate(rows, 1):
+                note_id = str(row["note_id"])
                 title_value, content_value, combined_value = identity_keys(row["title"], row["content"])
-                tags_value = text(row["tags"])
-                seeded_payload: Any = {}
-                if not tags_value and row["payload_json"]:
-                    try:
-                        seeded_payload = json.loads(row["payload_json"])
-                    except (TypeError, ValueError):
+                raw_payload = str(row["payload_json"] or "")
+                try:
+                    seeded_payload = json.loads(raw_payload or "{}")
+                    if not isinstance(seeded_payload, dict):
                         seeded_payload = {}
-                    tags_value = tag_text(seeded_payload.get("tags")) if isinstance(seeded_payload, dict) else ""
-                media_value = ""
-                if isinstance(seeded_payload, dict):
-                    media_value = text(seeded_payload.get("mediaText"), 6000)
-                # This startup pass repairs identity keys only. Reclassifying old
-                # rows here is destructive when a user edits or temporarily omits
-                # the private keyword file; fresh scans update relevance normally.
+                except (TypeError, ValueError):
+                    seeded_payload = {}
+                tags_value = text(row["tags"]) or tag_text(seeded_payload.get("tags"))
+                payload_id = text(seeded_payload.get("noteId"), 128)
+                payload_url_id = note_url_identity(seeded_payload.get("url"))
+                payload_identity_mismatch = (
+                    payload_id != note_id
+                    or bool(payload_url_id and payload_url_id != note_id)
+                )
+                next_payload_json = raw_payload
+                if payload_identity_mismatch:
+                    db.execute(
+                        """INSERT OR IGNORE INTO data_repair_archive
+                           (repair_id,source_name,row_number,reason,row_json,archived_at)
+                           VALUES(?,'notes.payload_json',?,
+                                  'payload_note_id_mismatch',?,?)""",
+                        (f"v0.25.1-note-payload-identity:{note_id}", row_number,
+                         json.dumps({"noteId": note_id, "payload": raw_payload}, ensure_ascii=False),
+                         payload_repaired_at),
+                    )
+                    seeded_payload["noteId"] = note_id
+                    seeded_payload["url"] = text(row["url"], 4000) or f"https://www.xiaohongshu.com/explore/{note_id}"
+                    for payload_name, column_name, limit in (
+                        ("title", "title", 1000), ("author", "author", 500), ("content", "content", 12000)
+                    ):
+                        canonical_value = text(row[column_name], limit)
+                        if canonical_value:
+                            seeded_payload[payload_name] = canonical_value
+                    next_payload_json = json.dumps(seeded_payload, ensure_ascii=False)
+                # Reclassifying old rows here would be destructive when a user
+                # edits the private keyword file; fresh scans update relevance.
                 next_relevant = int(row["is_relevant"])
                 next_status = row["status"]
                 if (
@@ -1170,12 +1195,13 @@ class MonitorStore:
                     or row["title_content_key"] != combined_value
                     or int(row["is_relevant"]) != next_relevant
                     or row["status"] != next_status
+                    or next_payload_json != raw_payload
                 ):
                     db.execute(
                         """
                         UPDATE notes
                         SET tags = ?, title_key = ?, content_key = ?, title_content_key = ?,
-                            is_relevant = ?, status = ?
+                            is_relevant = ?, status = ?, payload_json = ?
                         WHERE note_id = ?
                         """,
                         (
@@ -1185,7 +1211,8 @@ class MonitorStore:
                             combined_value,
                             next_relevant,
                             next_status,
-                            row["note_id"],
+                            next_payload_json,
+                            note_id,
                         ),
                     )
 
@@ -1521,8 +1548,9 @@ class MonitorStore:
         """Find a local note with Excel-safe fallbacks for truncated DOM text."""
         if note_id:
             row = db.execute("SELECT * FROM notes WHERE note_id = ?", (note_id,)).fetchone()
-            if row is not None:
-                return row, "note_id"
+            # A valid XHS note ID is the canonical identity. Never let a title
+            # or body fallback map one card to a different already-pulled post.
+            return (row, "note_id") if row is not None else (None, "")
         if combined_value:
             row = db.execute(
                 "SELECT * FROM notes WHERE title_content_key = ? ORDER BY first_seen_at DESC LIMIT 1",
@@ -1647,13 +1675,8 @@ class MonitorStore:
             }
 
         with self.lock, self._session() as db:
-            excel_rows: list[sqlite3.Row] = []
-            excel_by_title: dict[str, list[sqlite3.Row]] = {}
             stored_by_id: dict[str, sqlite3.Row] = {}
             if title_only:
-                excel_rows = db.execute("SELECT * FROM notes WHERE source='existing_xlsx'").fetchall()
-                for row in excel_rows:
-                    excel_by_title.setdefault(str(row["title_key"] or ""), []).append(row)
                 stored_by_id = {
                     str(row["note_id"]): row
                     for row in db.execute("SELECT * FROM notes").fetchall()
@@ -1674,24 +1697,11 @@ class MonitorStore:
                 title_value, content_value, combined_value = identity_keys(title, content)
                 payload_json = json.dumps(raw_note, ensure_ascii=False)
                 if title_only:
-                    exact_excel = excel_by_title.get(title_value, []) if title_value else []
-                    excel_existing = exact_excel[0] if exact_excel else None
-                    matched_by = "excel_title" if excel_existing is not None else ""
-                    partial_title = title_value.rstrip(".…·•-_—~～")
-                    if excel_existing is None and len(partial_title) >= 8:
-                        partial_matches = [
-                            row for row in excel_rows
-                            if partial_title in str(row["title_key"] or "").rstrip(".…·•-_—~～")
-                            or str(row["title_key"] or "").rstrip(".…·•-_—~～") in partial_title
-                        ]
-                        if len(partial_matches) == 1:
-                            excel_existing = partial_matches[0]
-                            matched_by = "excel_title_partial"
-                    existing = excel_existing or stored_by_id.get(note_id)
-                    if not matched_by and existing is not None:
-                        matched_by = "note_id"
+                    # Lightweight cards still expose a canonical URL ID. Exact
+                    # ID matching is mandatory; equal titles are not identity.
+                    existing = stored_by_id.get(note_id)
+                    matched_by = "note_id" if existing is not None else ""
                 else:
-                    excel_existing = None
                     existing, matched_by = self._find_match(
                         db, note_id, title_value, content_value, combined_value, bool(raw_note.get("detailRead"))
                     )
@@ -1779,6 +1789,9 @@ class MonitorStore:
                     update_content_value = "" if preserve_excel else content_value
                     update_combined_value = "" if preserve_excel else combined_value
                     update_content_hash = "" if preserve_excel else content_hash
+                    # A card scan is discovery metadata, not a replacement for
+                    # the rich payload captured during an actual pull.
+                    update_payload_json = str(existing["payload_json"] or "{}") if preserve_excel else payload_json
                     db.execute(
                         """
                         UPDATE notes
@@ -1821,7 +1834,7 @@ class MonitorStore:
                             update_combined_value,
                             update_combined_value,
                             scanned_at,
-                            payload_json,
+                            update_payload_json,
                             update_content_hash,
                             update_content_hash,
                             update_content_hash,
@@ -3714,7 +3727,7 @@ class MonitorStore:
         with self.lock, self._session() as db:
             note_rows = [dict(row) for row in db.execute(
                 """SELECT note_id,title,url,source,pull_status,media_status,media_dir,media_file_count,
-                   comment_count_collected,access_status FROM notes"""
+                   comment_count_collected,access_status,payload_json FROM notes"""
             ).fetchall()]
             db_note_ids = {row["note_id"] for row in note_rows}
             pulled_ids = {
@@ -3758,6 +3771,24 @@ class MonitorStore:
             if not exists:
                 (pending_media if row.get("media_status") == "partial" else missing_media).append(row["note_id"])
         review_access = [row["note_id"] for row in note_rows if row.get("access_status") == "check_failed"]
+        payload_cross_ids: list[str] = []
+        payload_invalid_ids: list[str] = []
+        for row in note_rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (TypeError, ValueError):
+                payload = {}
+            raw_payload_id = text(payload.get("noteId"), 128)
+            payload_url_id = note_url_identity(payload.get("url"))
+            valid_payload_id = valid_note_id(raw_payload_id)
+            if valid_payload_id and valid_payload_id != row["note_id"]:
+                payload_cross_ids.append(row["note_id"])
+            elif raw_payload_id != row["note_id"]:
+                payload_invalid_ids.append(row["note_id"])
+            elif payload_url_id and payload_url_id != row["note_id"]:
+                payload_cross_ids.append(row["note_id"])
         media_dir_owners: dict[str, list[str]] = {}
         for row in note_rows:
             folder = text(row.get("media_dir"), 4000)
@@ -3784,6 +3815,12 @@ class MonitorStore:
                   len(shared_media_ids), False, shared_media_ids)
         add_issue("access_review", "info", "帖子等待访问复核", "这些帖子上次未完成访问核验，不等于打不开。",
                   len(review_access), False, review_access)
+        add_issue("sqlite_payload_cross_note_id", "critical", "SQLite 帖子快照发生串帖",
+                  "payload_json 中的笔记 ID/URL 与数据库主键不同，会导致页面卡片误判为已拉取。",
+                  len(payload_cross_ids), True, payload_cross_ids)
+        add_issue("sqlite_payload_invalid_note_id", "warning", "SQLite 帖子快照缺少有效 ID",
+                  "历史快照含空值或 undefined；安全修复会按数据库主键补齐。",
+                  len(payload_invalid_ids), True, payload_invalid_ids)
         add_issue("orphan_watchlist", "warning", "观察名单存在失效引用", "观察名单关联的帖子已经不在数据库中。",
                   orphan_watch, True)
 
@@ -3927,7 +3964,8 @@ class MonitorStore:
                 "relationshipsConsistent": not any(item["id"] in {
                     "csv_invalid_note_rows", "csv_note_url_mismatch", "csv_sqlite_media_path_mismatch", "csv_comment_missing_note_id",
                     "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_url_mismatch",
-                    "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory"
+                    "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory",
+                    "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
                 } for item in issues),
                 "issueCount": len(issues),
                 "repairableCount": sum(1 for item in issues if item["repairable"]),
@@ -4682,37 +4720,13 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         return normalized
 
     def _resolve_pull_identity(self, note: dict[str, Any]) -> tuple[str, str]:
-        """Resolve a pull to one canonical local note before any file is written.
-
-        Exact note ID wins. If the ID only belongs to a transient DOM record,
-        an already-synced Excel row with the same complete title+content wins so
-        retries cannot create a second material folder, SQLite note, or Excel row.
-        """
+        """Resolve a pull strictly by its canonical XHS note ID."""
         incoming_id = valid_note_id(note.get("noteId"))
         if not incoming_id:
             raise ValueError("noteId is required")
-        title_value, content_value, combined_value = identity_keys(note.get("title"), note.get("content"))
         with self.lock, self._session() as db:
-            exact = db.execute(
-                "SELECT note_id,source,pull_status FROM notes WHERE note_id=?",
-                (incoming_id,),
-            ).fetchone()
-            if exact and (str(exact["source"]) == "existing_xlsx" or str(exact["pull_status"]) in {"synced", "partial"}):
-                return incoming_id, "note_id"
-            if combined_value:
-                canonical = db.execute(
-                    """SELECT note_id FROM notes
-                       WHERE title_content_key=?
-                         AND (source='existing_xlsx' OR pull_status IN ('synced','partial'))
-                       ORDER BY CASE WHEN source='existing_xlsx' THEN 0 ELSE 1 END, first_seen_at
-                       LIMIT 1""",
-                    (combined_value,),
-                ).fetchone()
-                if canonical:
-                    return str(canonical["note_id"]), "title_content"
-            if exact:
-                return incoming_id, "note_id"
-        return incoming_id, "new"
+            exact = db.execute("SELECT 1 FROM notes WHERE note_id=?", (incoming_id,)).fetchone()
+        return incoming_id, "note_id" if exact else "new"
 
     def _media_root(self) -> Path:
         xlsx_path = getattr(self, "seed_xlsx_path", None)
@@ -5221,28 +5235,6 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     existing_note_row = row_number
                     matched_by = "note_id"
                     break
-            # Defensive Excel-side fallback for legacy rows whose note ID was
-            # missing or changed, but whose fully-read title and body are equal.
-            if existing_note_row is None:
-                incoming_title, incoming_content, incoming_combined = identity_keys(
-                    note.get("title"), note.get("content")
-                )
-                if incoming_combined:
-                    title_column = note_headers.get("笔记标题")
-                    content_column = note_headers.get("笔记内容")
-                    if title_column and content_column:
-                        for row_number in range(2, note_sheet.max_row + 1):
-                            _, _, row_combined = identity_keys(
-                                note_sheet.cell(row_number, title_column).value,
-                                note_sheet.cell(row_number, content_column).value,
-                            )
-                            if row_combined == incoming_combined:
-                                existing_note_row = row_number
-                                matched_by = "title_content"
-                                stored_id = valid_note_id(note_sheet.cell(row_number, note_id_column).value)
-                                if stored_id:
-                                    note_id = stored_id
-                                break
             is_new_note = existing_note_row is None
             note_row = existing_note_row or max(2, note_sheet.max_row + 1)
             if is_new_note:
@@ -5421,18 +5413,6 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         existing_index = next((index for index, row in enumerate(note_rows)
                                if valid_note_id(row.get("笔记ID")) == note_id), None)
         matched_by = "note_id" if existing_index is not None else "new"
-        if existing_index is None:
-            _title, _content, incoming_combined = identity_keys(note.get("title"), note.get("content"))
-            if incoming_combined:
-                for index, row in enumerate(note_rows):
-                    _rt, _rc, row_combined = identity_keys(row.get("笔记标题"), row.get("笔记内容"))
-                    if row_combined == incoming_combined:
-                        existing_index = index
-                        matched_by = "title_content"
-                        stored_id = valid_note_id(row.get("笔记ID"))
-                        if stored_id:
-                            note_id = stored_id
-                        break
         is_new_note = existing_index is None
         if is_new_note:
             note_row_data: dict[str, Any] = {name: "" for name in note_headers}

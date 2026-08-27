@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 UTF-8 CSV / SQLite，并可调用 AI 进行分析。
 
-当前版本：`0.25.0`
+当前版本：`0.25.1`
 
 当前状态与完整需求见 [小红书舆情监控助手_PRD.md](小红书舆情监控助手_PRD.md)。
 
@@ -217,3 +217,10 @@ powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 - 单帖和批量同步无论评论是否变化，都会校准笔记 CSV、评论 CSV、SQLite、`note.json`、`comments.json` 和正文快照，并执行 ID 集合校验。
 - 本地删除成功后立即广播到所有小红书标签页和侧边栏，外部帖子卡片即时从“CSV 已有”更新为“未拉取”。
 - 数据体检新增双向外键、异常行、孤立评论、CSV/SQLite 评论集合、URL 串帖及共享素材目录检查。
+
+## v0.25.1：卡片状态严格按笔记 ID
+
+- 修复个人主页中同名帖子被标题回退错误匹配为另一篇已拉取帖的问题；有效笔记 ID 不再允许用标题或正文跨帖匹配。
+- 扫描、拉取、CSV 写入三层均只按小红书笔记 ID 判断身份；前端同时拦截 `matchedNoteId` 不一致的旧返回。
+- 已拉取帖的轻量卡片扫描不再覆盖完整 `payload_json`；历史 `undefined` 或串帖快照会按 SQLite 主键安全归一并归档。
+- 数据体检增加 SQLite 帖子快照 ID/URL 串帖检查。

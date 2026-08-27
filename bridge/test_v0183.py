@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from data_relationships import repair_relationship_rows
-from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, replace_with_retry
+from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, replace_with_retry, valid_note_id
 
 
 class MediaHandler(BaseHTTPRequestHandler):
@@ -106,6 +106,82 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue(result["statuses"][0]["inExcel"])
         self.assertEqual("known", result["statuses"][0]["status"])
         self.assertEqual("帖子ID", result["statuses"][0]["matchLabel"])
+
+    def test_same_title_different_note_id_is_never_marked_as_pulled(self):
+        timestamp = "2026-08-27T15:00:00+08:00"
+        original_payload = {
+            "noteId": "pulledtitle123", "url": "https://www.xiaohongshu.com/explore/pulledtitle123",
+            "title": "Origani", "author": "已拉取作者", "content": "已拉取正文",
+        }
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes
+                (note_id,url,title,author,content,first_seen_at,last_seen_at,status,is_relevant,source,
+                 title_key,content_key,title_content_key,pull_status,payload_json)
+                VALUES(?,?,?,?,?,?,?,'known',1,'existing_xlsx','origani','已拉取正文','origani已拉取正文','synced',?)
+            """, ("pulledtitle123", original_payload["url"], "Origani", "已拉取作者", "已拉取正文",
+                  timestamp, timestamp, json.dumps(original_payload, ensure_ascii=False)))
+
+        result = self.store.scan({
+            "titleOnly": True, "returnAllStatuses": True, "keyword": "origani",
+            "notes": [{"noteId": "deletedtitle456", "url": "https://www.xiaohongshu.com/explore/deletedtitle456",
+                       "title": "origani", "author": "另一位作者", "content": ""}]
+        })
+
+        status = result["statuses"][0]
+        self.assertEqual("deletedtitle456", status["noteId"])
+        self.assertEqual("deletedtitle456", status["matchedNoteId"])
+        self.assertFalse(status["inExcel"])
+        self.assertEqual("not_started", status["pullStatus"])
+        self.assertEqual("none", status["matchedBy"])
+        with self.store._session() as db:
+            stored = json.loads(db.execute(
+                "SELECT payload_json FROM notes WHERE note_id='pulledtitle123'"
+            ).fetchone()[0])
+        self.assertEqual("pulledtitle123", stored["noteId"])
+        self.assertEqual("已拉取作者", stored["author"])
+
+    def test_pull_and_csv_sync_never_deduplicate_different_note_ids_by_text(self):
+        notes_path, _comments_path = self._configure_csv("strict-identity")
+        first = {"noteId": "strictnote123", "url": "https://www.xiaohongshu.com/explore/strictnote123",
+                 "title": "完全相同标题", "content": "完全相同正文", "detailRead": True}
+        second = {**first, "noteId": "strictnote456",
+                  "url": "https://www.xiaohongshu.com/explore/strictnote456"}
+        self.store._sync_pull_to_xlsx(first, [], {})
+        self.store._sync_pull_to_xlsx(second, [], {})
+        rows = self._csv_rows(notes_path, NOTE_CSV_HEADERS)
+        self.assertEqual({"strictnote123", "strictnote456"}, {row["笔记ID"] for row in rows})
+        self.store.confirm(first)
+        resolved, matched_by = self.store._resolve_pull_identity(second)
+        self.assertEqual("strictnote456", resolved)
+        self.assertEqual("new", matched_by)
+
+    def test_placeholder_note_ids_are_rejected(self):
+        for value in ("undefined", "null", "None", "UNKNOWN", "nan"):
+            self.assertEqual("", valid_note_id(value))
+
+    def test_startup_repairs_and_archives_cross_note_payload_identity(self):
+        timestamp = "2026-08-27T15:00:00+08:00"
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes(note_id,url,title,author,content,first_seen_at,last_seen_at,payload_json)
+                VALUES(?,?,?,?,?,?,?,?)
+            """, ("payloadnote123", "https://www.xiaohongshu.com/explore/payloadnote123",
+                  "正确标题", "正确作者", "正确正文", timestamp, timestamp,
+                  json.dumps({"noteId": "othernote456", "url": "https://www.xiaohongshu.com/explore/othernote456",
+                              "title": "错误标题"}, ensure_ascii=False)))
+        repaired_store = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        with repaired_store._session() as db:
+            payload = json.loads(db.execute(
+                "SELECT payload_json FROM notes WHERE note_id='payloadnote123'"
+            ).fetchone()[0])
+            archived = db.execute(
+                "SELECT COUNT(*) FROM data_repair_archive WHERE repair_id LIKE 'v0.25.1-note-payload-identity%'"
+            ).fetchone()[0]
+        self.assertEqual("payloadnote123", payload["noteId"])
+        self.assertIn("/payloadnote123", payload["url"])
+        self.assertEqual("正确标题", payload["title"])
+        self.assertGreaterEqual(archived, 1)
 
     def test_pulled_note_status_hydrates_artifacts_and_comments(self):
         root = self.store.export_dir.parent
@@ -277,6 +353,8 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("deletePulledNoteAndBroadcast", worker)
         self.assertIn('type: "localNoteStateChanged"', worker)
         self.assertIn("评论无变化，正在校准 CSV、SQLite 与素材快照", worker)
+        self.assertIn("enforceExactNoteIdentity", worker)
+        self.assertIn("identityConflictBlocked", content)
         self.assertIn('message.type === "localNoteStateChanged"', content)
         self.assertIn('message.type === "localNoteStateChanged"', panel)
 

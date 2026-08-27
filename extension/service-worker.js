@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.25.0";
+const CONTENT_SCRIPT_VERSION = "0.25.1";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -287,7 +287,7 @@ if (chrome.windows?.onBoundsChanged?.addListener) {
   });
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   const current = await chrome.storage.local.get(DEFAULT_CONFIG);
   const targetKeywords = normalizeKeywords([
     ...(Array.isArray(current.targetKeywords) ? current.targetKeywords : []),
@@ -305,6 +305,15 @@ chrome.runtime.onInstalled.addListener(async () => {
     enabled: current.enabled !== false
   });
   await configureSidePanel();
+  // Existing tabs retain the old isolated content-script world after an
+  // unpacked extension update. Reload XHS tabs once so stale card badges and
+  // listeners cannot survive the version change.
+  if (details?.reason === "update") {
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    await Promise.all(tabs
+      .filter((tab) => tab?.id && isXhsPageUrl(tab.url))
+      .map((tab) => chrome.tabs.reload(tab.id).catch(() => null)));
+  }
 });
 chrome.runtime.onStartup.addListener(() => configureSidePanel().catch(() => {}));
 configureSidePanel().catch(() => {});
@@ -474,6 +483,36 @@ async function getRelevanceGroups(force = false) {
   return relevanceGroupsCache;
 }
 
+function enforceExactNoteIdentity(result) {
+  const statuses = Array.isArray(result?.statuses) ? result.statuses.map((status) => {
+    const noteId = String(status?.noteId || "").trim();
+    const matchedNoteId = String(status?.matchedNoteId || noteId).trim();
+    if (!noteId || !matchedNoteId || matchedNoteId === noteId) return status;
+    return {
+      ...status,
+      matchedNoteId: noteId,
+      matchedBy: "none",
+      matchLabel: "",
+      status: "new",
+      isNew: true,
+      inExcel: false,
+      excelStatus: "missing",
+      pullStatus: "not_started",
+      pullError: "",
+      mediaStatus: "not_started",
+      mediaDir: "",
+      mediaFileCount: 0,
+      identityConflictBlocked: true
+    };
+  }) : [];
+  return {
+    ...result,
+    statuses,
+    excelMatchedCount: statuses.filter((status) => status?.inExcel).length,
+    excelMissingCount: statuses.filter((status) => !status?.inExcel).length
+  };
+}
+
 async function scanPage(payload) {
   const config = await getConfig();
   const allNotes = Array.isArray(payload?.notes) ? payload.notes : [];
@@ -484,13 +523,13 @@ async function scanPage(payload) {
     directRelevantCount: directlyRelevantNotes.length
   };
   try {
-    const result = await bridgeApi("/api/scan", {
+    const rawResult = await bridgeApi("/api/scan", {
       method: "POST",
-      // Bridge must see every card. It checks Excel identity before applying
-      // the relevance gate, otherwise an Excel row with an unloaded caption
-      // can disappear before comparison.
+      // Bridge must see every card. Canonical XHS note ID remains the only
+      // identity allowed to mark a card as already pulled.
       body: JSON.stringify({ ...payload, notes: allNotes })
     });
+    const result = enforceExactNoteIdentity(rawResult);
     setBridgeState("online", { bridgeUrl: config.bridgeUrl, error: "", version: result.version || bridgeState.version || "" });
     return {
       ...result,

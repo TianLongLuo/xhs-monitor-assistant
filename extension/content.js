@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.25.0";
+  const CONTENT_VERSION = "0.25.1";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -178,7 +178,7 @@
     try {
       const url = new URL(value, location.href);
       const match = url.pathname.match(/\/(?:explore|discovery\/item|search_result|item|note)\/([A-Za-z0-9_-]+)/);
-      return match ? match[1] : "";
+      return validNoteId(match ? match[1] : "");
     } catch (_error) {
       return "";
     }
@@ -186,6 +186,12 @@
 
   function clean(value, limit = 600) {
     return String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+  }
+
+  function validNoteId(value) {
+    const noteId = clean(value, 128);
+    if (!/^[A-Za-z0-9_-]{6,128}$/.test(noteId)) return "";
+    return ["undefined", "null", "none", "unknown", "nan"].includes(noteId.toLocaleLowerCase()) ? "" : noteId;
   }
 
   function processValue(value, limit = 220) {
@@ -1302,7 +1308,7 @@
         ? anchor
         : Array.from(anchor.querySelectorAll?.("a[href]") || []).find((link) => noteIdFromUrl(link.href));
       const noteId = noteIdFromUrl(anchor.href || descendantLink?.href)
-        || clean(anchor.getAttribute?.("data-note-id") || anchor.getAttribute?.("note-id") || anchor.getAttribute?.("data-noteid"), 128);
+        || validNoteId(anchor.getAttribute?.("data-note-id") || anchor.getAttribute?.("note-id") || anchor.getAttribute?.("data-noteid"));
       if (!noteId) continue;
       const candidate = descendantLink || anchor;
       const existing = bestAnchorById.get(noteId);
@@ -1500,7 +1506,7 @@
       root?.getAttribute?.("data-id"),
       root?.dataset?.noteId,
       root?.dataset?.noteid
-    ].map((value) => clean(value, 128)).find(Boolean);
+    ].map((value) => validNoteId(value)).find(Boolean);
     if (direct) return direct;
     return Array.from(root?.querySelectorAll?.(NOTE_LINK_SELECTOR) || [])
       .map((link) => noteIdFromUrl(link.href))
@@ -1539,7 +1545,7 @@
       return { note, loading: false };
     }
 
-    const noteId = noteIdFromUrl(location.href) || detailNoteId(detailRoot) || clean(hint.noteId, 128);
+    const noteId = noteIdFromUrl(location.href) || detailNoteId(detailRoot) || validNoteId(hint.noteId);
     if (!noteId) return { note: null, loading: true };
     const title = detailTitle(detailRoot, hint.title);
     const note = {
@@ -2577,11 +2583,34 @@
     card.prepend(toolbar);
   }
 
+  function exactIdentityStatus(note, status) {
+    if (!status) return status;
+    const noteId = clean(note?.noteId, 128);
+    const matchedNoteId = clean(status.matchedNoteId || noteId, 128);
+    if (!noteId || !matchedNoteId || matchedNoteId === noteId) return status;
+    return {
+      ...status,
+      matchedNoteId: noteId,
+      matchedBy: "none",
+      matchLabel: "",
+      status: "new",
+      isNew: true,
+      inExcel: false,
+      excelStatus: "missing",
+      pullStatus: "not_started",
+      pullError: "",
+      mediaStatus: "not_started",
+      mediaDir: "",
+      mediaFileCount: 0,
+      identityConflictBlocked: true
+    };
+  }
+
   function decorate(notes, statuses) {
     const statusById = new Map((statuses || []).map((status) => [status.noteId, status]));
     for (const note of notes) {
       const card = document.querySelector(`[${CARD_MARK}="${CSS.escape(note.noteId)}"]`);
-      const status = statusById.get(note.noteId);
+      const status = exactIdentityStatus(note, statusById.get(note.noteId));
       if (card) {
         renderDecoration(card, note, status || {
           noteId: note.noteId,
@@ -2720,7 +2749,7 @@
     const target = event.target?.closest?.(`${NOTE_LINK_SELECTOR}, [data-note-id], [note-id]`);
     if (!target || isPluginOwnedNode(target)) return;
     const noteId = noteIdFromUrl(target.href || "")
-      || clean(target.getAttribute?.("data-note-id") || target.getAttribute?.("note-id"), 128);
+      || validNoteId(target.getAttribute?.("data-note-id") || target.getAttribute?.("note-id"));
     if (!noteId) return;
     const card = candidateCard(target);
     const title = extractTitle(card, target);
