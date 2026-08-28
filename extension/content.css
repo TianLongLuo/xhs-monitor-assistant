@@ -633,7 +633,7 @@
 .xhs-monitor-process__target-states { display: none !important; }
 
 
-/* v0.16 — magnetic Process panel, aligned with ORIGANI Radar side panel */
+/* v0.16 — magnetic Process panel, aligned with XHS Monitor side panel */
 .xhs-monitor-process {
   --process-paper: #f7f8f5;
   --process-surface: #ffffff;

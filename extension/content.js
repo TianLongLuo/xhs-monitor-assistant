@@ -585,7 +585,7 @@
     heading.className = `${PROCESS_PANEL_CLASS}__heading`;
     const eyebrow = document.createElement("span");
     eyebrow.className = `${PROCESS_PANEL_CLASS}__eyebrow`;
-    eyebrow.textContent = "ORIGANI RADAR";
+    eyebrow.textContent = "XHS MONITOR";
     const title = document.createElement("strong");
     title.className = `${PROCESS_PANEL_CLASS}__title`;
     title.textContent = "拉取进度";

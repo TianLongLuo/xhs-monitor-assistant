@@ -97,7 +97,7 @@ class V0183Tests(unittest.TestCase):
             """, ("existing123456", "https://www.xiaohongshu.com/explore/existing123456",
                   "Excel保存的旧标题", timestamp, timestamp, "excel保存的旧标题"))
         result = self.store.scan({
-            "titleOnly": True, "returnAllStatuses": True, "keyword": "origani",
+            "titleOnly": True, "returnAllStatuses": True, "keyword": "samplebrand",
             "notes": [{"noteId": "existing123456", "url": "https://www.xiaohongshu.com/explore/existing123456",
                        "title": "小红书当前展示的新标题", "content": ""}]
         })
@@ -111,21 +111,21 @@ class V0183Tests(unittest.TestCase):
         timestamp = "2026-08-27T15:00:00+08:00"
         original_payload = {
             "noteId": "pulledtitle123", "url": "https://www.xiaohongshu.com/explore/pulledtitle123",
-            "title": "Origani", "author": "已拉取作者", "content": "已拉取正文",
+            "title": "samplebrand", "author": "已拉取作者", "content": "已拉取正文",
         }
         with self.store._session() as db:
             db.execute("""
                 INSERT INTO notes
                 (note_id,url,title,author,content,first_seen_at,last_seen_at,status,is_relevant,source,
                  title_key,content_key,title_content_key,pull_status,payload_json)
-                VALUES(?,?,?,?,?,?,?,'known',1,'existing_xlsx','origani','已拉取正文','origani已拉取正文','synced',?)
-            """, ("pulledtitle123", original_payload["url"], "Origani", "已拉取作者", "已拉取正文",
+                VALUES(?,?,?,?,?,?,?,'known',1,'existing_xlsx','samplebrand','已拉取正文','samplebrand已拉取正文','synced',?)
+            """, ("pulledtitle123", original_payload["url"], "samplebrand", "已拉取作者", "已拉取正文",
                   timestamp, timestamp, json.dumps(original_payload, ensure_ascii=False)))
 
         result = self.store.scan({
-            "titleOnly": True, "returnAllStatuses": True, "keyword": "origani",
+            "titleOnly": True, "returnAllStatuses": True, "keyword": "samplebrand",
             "notes": [{"noteId": "deletedtitle456", "url": "https://www.xiaohongshu.com/explore/deletedtitle456",
-                       "title": "origani", "author": "另一位作者", "content": ""}]
+                       "title": "samplebrand", "author": "另一位作者", "content": ""}]
         })
 
         status = result["statuses"][0]
@@ -827,7 +827,7 @@ class V0183Tests(unittest.TestCase):
         note = {
             "noteId": "operations123456", "title": "重点观察测试帖", "author": "测试作者",
             "content": "有人反馈价格和推销问题", "url": "https://www.xiaohongshu.com/explore/operations123456",
-            "keyword": "origani", "detailRead": True, "likeCount": 1,
+            "keyword": "samplebrand", "detailRead": True, "likeCount": 1,
         }
         self.store.confirm(note)
         original = {"commentId": "operations-comment-1", "author": "用户甲", "content": "价格多少", "publishedAt": "08-26"}

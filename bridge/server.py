@@ -2729,7 +2729,7 @@ class MonitorStore:
                             for item in comments if isinstance(item, dict) and text(item.get("content"), 2000)]
         schema = {"relevance_status": "relevant/irrelevant/uncertain", "confidence": 0.0,
                   "reason": "简短、可核验理由", "matched_topics": []}
-        data = {"monitor_brand": "ORIGANI（含品牌、产品、门店、员工/账号 Talia 等品牌舆情）",
+        data = {"monitor_brand": "请在本地词库中配置要监控的品牌、产品、门店和账号",
                 "title": title, "content": content, "tags": tags, "author": text(note.get("author"), 500),
                 "comments": compact_comments}
         messages = [
@@ -2990,7 +2990,7 @@ class MonitorStore:
                 (persona,),
             ).fetchall()]
         persona_instruction = (
-            "你代表ORIGANI品牌官方账号。只回应用户当前问题，不把评论写成广告。"
+            "你代表当前监控品牌的官方账号。只回应用户当前问题，不把评论写成广告。"
             if persona == "brand" else
             "你是普通社区用户。自然接话，但不冒充消费者，不虚构购买、使用、门店经历或品牌内幕。"
         )
@@ -4431,7 +4431,7 @@ class MonitorStore:
         }
         report_dir = self.weekly_report_dir()
         report_dir.mkdir(parents=True, exist_ok=True)
-        base_name = f"ORIGANI舆情周报_{period_start.replace('-', '')}_{period_end.replace('-', '')}"
+        base_name = f"小红书舆情周报_{period_start.replace('-', '')}_{period_end.replace('-', '')}"
         xlsx_path = report_dir / f"{base_name}.xlsx"
         html_path = report_dir / f"{base_name}.html"
 
@@ -4442,7 +4442,7 @@ class MonitorStore:
         workbook = Workbook()
         overview = workbook.active
         overview.title = "周报总览"
-        overview.append(["ORIGANI 小红书舆情周报", f"{period_start} 至 {period_end}"])
+        overview.append(["小红书舆情周报", f"{period_start} 至 {period_end}"])
         overview.append(["指标", "数量"])
         for label, value in (
             ("新增帖子", summary["newNotes"]), ("发生变化帖子", summary["changedNotes"]),
@@ -4514,7 +4514,7 @@ h1{{margin:6px 0 0;font-size:30px}}.meta{{opacity:.72}}.grid{{display:grid;grid-
 section{{margin-top:14px}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;padding:10px;border-bottom:1px solid #eee;vertical-align:top}}
 th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #eee}}
 @media(max-width:720px){{.grid{{grid-template-columns:repeat(2,1fr)}}}}
-</style></head><body><main><header><div class='meta'>ORIGANI RADAR · WEEKLY BRIEF</div><h1>小红书舆情周报</h1><p>{period_start} 至 {period_end}</p></header>
+</style></head><body><main><header><div class='meta'>XHS MONITOR · WEEKLY BRIEF</div><h1>小红书舆情周报</h1><p>{period_start} 至 {period_end}</p></header>
 <div class='grid'>
 <div class='metric'><span>新增帖子</span><strong>{summary['newNotes']}</strong></div>
 <div class='metric'><span>发生变化帖子</span><strong>{summary['changedNotes']}</strong></div>
