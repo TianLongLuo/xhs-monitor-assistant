@@ -6,13 +6,13 @@
     <title>XHS-Monitor 帖子核对</title>
     <link rel="stylesheet" href="sidepanel.css">
   </head>
-  <body>
+  <body class="apple-utility-ui" data-panel-view="overview">
     <main class="shell">
       <header class="brand-header">
-        <div class="brand-mark" aria-hidden="true">O</div>
+        <div class="brand-mark" aria-hidden="true">X</div>
         <div class="brand-copy">
-          <div class="eyebrow">XIAOHONGSHU MONITOR</div>
-          <h1>帖子核对</h1>
+          <div class="eyebrow">XHS MONITOR</div>
+          <h1>舆情雷达</h1>
         </div>
         <div class="header-actions">
           <button id="toggleFloating" class="icon-button icon-button--float" type="button" title="缩小为悬浮窗" aria-label="缩小为悬浮窗">
@@ -27,51 +27,32 @@
         </div>
       </header>
 
-      <section class="connection connection-quiet" aria-label="本地 Excel 连接状态">
+      <section class="connection connection-quiet" aria-label="本地 CSV 连接状态">
         <span id="bridgeStateDot" class="connection-dot" data-state="idle"></span>
         <div class="connection-copy">
-          <strong id="bridgeStateText">正在连接本地 Excel</strong>
+          <strong id="bridgeStateText">正在连接本地 CSV</strong>
           <span id="bridgeVersion">正在准备数据</span>
         </div>
         <span class="local-pill">LOCAL</span>
       </section>
-      <section class="ai-strip" hidden aria-label="AI 与后台任务状态">
-        <div><span id="aiStateDot" class="mini-dot"></span><strong id="aiStateText">DeepSeek 未配置</strong></div>
-        <button id="aiQueueCount" class="task-pill task-pill-button" type="button" aria-expanded="false">AI 队列 0</button>
-        <span id="commentJobCount" class="task-pill">评论任务 0</span>
-      </section>
 
-      <section id="aiProgressBlock" class="ai-progress-block" hidden aria-label="AI 分析进度">
-        <div class="ai-progress-head">
-          <span id="aiProgressLabel">AI 分析中…</span>
-          <strong id="aiProgressPercent">0%</strong>
-        </div>
-        <div class="ai-progress-track">
-          <div id="aiProgressBar" class="ai-progress-fill" data-state="active" style="width:0%"></div>
-        </div>
-      </section>
+      <nav class="utility-tabs utility-tabs--three" role="tablist" aria-label="主要区域">
+        <button id="overviewTab" class="utility-tab is-active" type="button" role="tab" aria-selected="true" data-panel-view="overview">
+          <span>概览</span>
+        </button>
+        <button id="postsTab" class="utility-tab" type="button" role="tab" aria-selected="false" data-panel-view="posts">
+          <span>帖子</span><i id="postsTabBadge" class="utility-tab__badge" hidden>0</i>
+        </button>
+        <button id="toolsTab" class="utility-tab" type="button" role="tab" aria-selected="false" data-panel-view="tools">
+          <span>运营</span><i id="toolsTabBadge" class="utility-tab__badge" hidden>0</i>
+        </button>
+      </nav>
 
-      <section id="aiActivity" class="ai-activity" hidden aria-label="AI 处理中心">
-        <div class="ai-activity-head">
-          <div>
-            <div class="section-kicker">AI PROCESS</div>
-            <h2>AI 处理中心</h2>
-            <p id="aiActivitySummary">正在读取任务状态…</p>
-          </div>
-          <button id="closeAIActivity" class="ai-close" type="button" aria-label="关闭 AI 处理中心">×</button>
-        </div>
-        <div class="ai-process-key" aria-label="AI 分析流程">
-          <span>1 入队</span><i>→</i><span>2 模型分析</span><i>→</i><span>3 保存结果</span>
-        </div>
-        <div id="aiJobList" class="ai-job-list"></div>
-        <p id="aiJobEmpty" class="ai-job-empty">暂无 AI 任务。点击帖子旁的“AI 分析”即可创建任务。</p>
-      </section>
-
-      <section class="scan-console">
+      <section class="scan-console" data-panel-section="overview">
         <div id="scanTrack" class="scan-track" aria-hidden="true">
           <span></span><i></i><i></i><i></i><i></i><i></i>
         </div>
-        <div class="section-kicker">CURRENT SURFACE</div>
+        <div class="section-kicker">当前页面</div>
         <div class="page-heading">
           <div>
             <h2 id="pageKeyword">等待小红书页面</h2>
@@ -80,24 +61,39 @@
           <span class="page-badge">DOM</span>
         </div>
         <div id="currentDetailCard" class="current-detail-card" hidden>
+          <div id="currentDetailVisual" class="current-detail-card__visual" hidden aria-hidden="true">
+            <img id="currentDetailThumb" alt="" referrerpolicy="no-referrer">
+            <span>LIVE NOTE</span>
+          </div>
+          <div class="current-detail-card__body">
           <div class="current-detail-card__head">
             <div>
-              <span class="current-detail-card__kicker">OPEN DETAIL</span>
+              <span class="current-detail-card__kicker">当前帖子</span>
               <strong id="currentDetailTitle">当前打开帖子</strong>
             </div>
             <span id="currentDetailState" class="current-detail-card__state" data-state="ready">可操作</span>
           </div>
           <p id="currentDetailMeta" class="current-detail-card__meta"></p>
+          <div class="current-detail-card__statuses">
+            <span id="currentDetailPullStatus" data-state="missing">拉取：未拉取</span>
+            <span id="currentDetailRelevance" data-state="unknown">相关性：未知</span>
+            <button id="currentDetailAnalyze" type="button">AI 判断相关性</button>
+          </div>
           <div class="current-detail-card__actions">
-            <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 Excel</button>
+            <button id="currentDetailPull" class="current-detail-card__pull" type="button">拉取到 CSV</button>
+            <button id="currentDetailSummary" class="current-detail-card__summary" type="button">AI 总结</button>
+            <button id="currentDetailComments" class="current-detail-card__comments" type="button">评论区</button>
+            <button id="currentDetailWatch" class="current-detail-card__watch" type="button">加入重点观察</button>
             <button id="currentDetailRefresh" class="current-detail-card__refresh" type="button" title="重新读取当前详情">刷新详情</button>
+            <button id="currentDetailDelete" class="current-detail-card__delete" type="button" title="删除 CSV、数据库及素材目录中的该帖子" hidden>删除本地帖子</button>
           </div>
           <p id="currentDetailHint" class="current-detail-card__hint">点击后会在放大帖子右侧显示 Process，逐步读取正文、图片、评论及 ID。</p>
+          </div>
         </div>
         <ol id="scanStages" class="scan-stages" hidden aria-label="扫描进度">
           <li data-stage="cards"><span>1</span><strong>读取卡片</strong><small>标题与元数据</small></li>
           <li data-stage="details"><span>2</span><strong>补全正文</strong><small>当前页详情层</small></li>
-          <li data-stage="compare"><span>3</span><strong>Excel 对比</strong><small>已有或未找到</small></li>
+          <li data-stage="compare"><span>3</span><strong>CSV 对比</strong><small>已有或未找到</small></li>
         </ol>
         <button id="scanCurrent" class="scan-button" type="button">
           <span class="scan-button-icon" aria-hidden="true"></span>
@@ -109,12 +105,121 @@
           <span id="deepScanButtonLabel">仅深读未判断帖子</span>
           <small>可单独重试</small>
         </button>
+        <button id="syncAllPulled" class="batch-sync-button" type="button">
+          <span class="batch-sync-button__glyph" aria-hidden="true">↻</span>
+          <span class="batch-sync-button__copy">
+            <strong id="syncAllPulledLabel">同步全部已拉取帖子</strong>
+            <small>后台逐篇打开并自动更新评论</small>
+          </span>
+          <span aria-hidden="true">→</span>
+        </button>
+        <section id="batchSyncProgress" class="batch-sync-progress" hidden aria-label="批量评论同步进度" aria-live="polite">
+          <div class="batch-sync-progress__head">
+            <strong id="batchSyncTitle">准备同步</strong>
+            <span id="batchSyncCount">0 / 0</span>
+          </div>
+          <div class="batch-sync-progress__track"><i id="batchSyncBar"></i></div>
+          <p id="batchSyncCurrent">正在读取已拉取帖子列表…</p>
+          <p id="batchSyncStats" class="batch-sync-progress__stats">有变化 0 · 无变化 0 · 打不开 0 · 其他失败 0</p>
+          <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="同步失败帖子">
+            <div class="batch-sync-failures__head">
+              <strong>未完成帖子诊断</strong>
+              <span class="batch-sync-failures__head-actions">
+                <span id="batchSyncFailureCount">0 篇</span>
+                <button id="ignoreAllBatchFailures" type="button">一键忽略</button>
+              </span>
+            </div>
+            <ol id="batchSyncFailureList" class="batch-sync-failures__list"></ol>
+          </section>
+          <button id="cancelBatchSync" class="batch-sync-progress__cancel" type="button">停止同步</button>
+          <button id="retryBatchFailures" class="batch-sync-progress__retry" type="button" hidden>重新核验失败项</button>
+        </section>
+        <button id="deleteUnreachable" class="unreachable-delete-button" type="button" disabled>
+          <span class="unreachable-delete-button__glyph" aria-hidden="true">×</span>
+          <span class="unreachable-delete-button__copy">
+            <strong id="deleteUnreachableLabel">删除打不开帖子</strong>
+            <small id="unreachableHint">仅删除经双重证据确认失效的帖子及关联数据</small>
+          </span>
+          <span id="unreachableCount" class="unreachable-delete-button__count">0</span>
+        </button>
         <div id="status" class="status" data-state="idle" role="status" aria-live="polite">准备就绪</div>
       </section>
 
-      <section class="metrics compare-metrics" aria-label="Excel 对比结果">
-        <button id="knownMetric" class="metric" type="button" data-note-status="known"><span id="knownCount">—</span><small>Excel 已有</small><i>点击查看</i></button>
+      <section class="metrics compare-metrics" data-panel-section="overview" aria-label="CSV 对比结果">
+        <button id="knownMetric" class="metric" type="button" data-note-status="known"><span id="knownCount">—</span><small>CSV 已有</small><i>点击查看</i></button>
         <button id="newMetric" class="metric metric-primary" type="button" data-note-status="new"><span id="newCount">—</span><small>新相关未拉取</small><i>点击查看</i></button>
+      </section>
+
+      <section id="operationsCenter" class="operations-center" data-panel-section="tools" aria-label="运营工具中心">
+        <div class="operations-intro">
+          <div>
+            <span class="section-kicker">OPERATIONS</span>
+            <h2>运营工作台</h2>
+            <p>检查数据、查看变化、跟踪重点帖子并生成周报。</p>
+          </div>
+          <button id="refreshOperations" class="operations-refresh" type="button" aria-label="刷新运营数据">↻</button>
+        </div>
+
+        <details id="ignoredOperations" class="operations-ignored">
+          <summary><span>已忽略帖子</span><strong id="ignoredOperationsCount">0</strong><small>点击展开</small></summary>
+          <div id="ignoredOperationsList" class="operations-list operations-list--ignored"></div>
+        </details>
+
+        <article class="operations-card health-card">
+          <header>
+            <div><span>DATA HEALTH</span><h3>数据体检中心</h3></div>
+            <strong id="healthScore" data-state="idle">—</strong>
+          </header>
+          <p id="healthSummary">点击运行体检，核对 CSV、SQLite、评论计数和素材目录。</p>
+          <div id="healthMetrics" class="operations-metrics"></div>
+          <div id="healthIssues" class="operations-list"></div>
+          <div class="operations-actions">
+            <button id="runHealthCheck" class="operations-primary" type="button">运行体检</button>
+            <button id="repairHealth" type="button" disabled>安全修复</button>
+          </div>
+        </article>
+
+        <article class="operations-card changes-card">
+          <header>
+            <div><span>CHANGE CENTER</span><h3>同步变更中心</h3></div>
+            <strong id="changeUnreadCount">0</strong>
+          </header>
+          <div id="changeMetrics" class="operations-metrics"></div>
+          <div id="changeList" class="operations-list operations-list--changes"></div>
+          <div class="operations-actions">
+            <button id="refreshChanges" class="operations-primary" type="button">刷新变化</button>
+            <button id="acknowledgeChanges" type="button" disabled>全部已读</button>
+          </div>
+        </article>
+
+        <article class="operations-card watch-card">
+          <header>
+            <div><span>WATCHLIST</span><h3>重点帖子观察名单</h3></div>
+            <strong id="watchCount">0</strong>
+          </header>
+          <p class="operations-card__hint">在当前帖子卡点击“加入重点观察”，后续变化会优先显示。</p>
+          <div id="watchList" class="operations-list operations-list--watch"></div>
+          <div class="operations-actions">
+            <button id="refreshWatchlist" class="operations-primary" type="button">刷新名单</button>
+          </div>
+        </article>
+
+        <article class="operations-card report-card">
+          <header>
+            <div><span>WEEKLY BRIEF</span><h3>周报自动生成</h3></div>
+            <strong id="weeklyReportState">未生成</strong>
+          </header>
+          <div class="report-period">
+            <label>开始日期<input id="weeklyStartDate" type="date"></label>
+            <label>结束日期<input id="weeklyEndDate" type="date"></label>
+          </div>
+          <p id="weeklyReportSummary">全量同步结束后会自动刷新本周周报，也可立即手动生成。</p>
+          <div class="operations-actions operations-actions--report">
+            <button id="generateWeeklyReport" class="operations-primary" type="button">生成周报</button>
+            <button id="openWeeklyReport" type="button" disabled>打开网页版</button>
+            <button id="openWeeklyExcel" type="button" disabled>打开 Excel</button>
+          </div>
+        </article>
       </section>
 
       <div hidden aria-hidden="true">
@@ -124,28 +229,28 @@
 
       <section class="data-scope" hidden aria-label="数据统计口径">
         <div class="scope-total">
-          <span>Excel 基准表</span>
+          <span>CSV 基准表</span>
           <strong id="libraryTotal">—</strong>
-          <small>sheet1 帖子总表</small>
+          <small>笔记总表.csv</small>
         </div>
         <div class="scope-split">
-          <span>Excel 未找到 <strong id="inboxTotal">—</strong></span>
+          <span>CSV 未找到 <strong id="inboxTotal">—</strong></span>
           <span>本地去重记录 <strong id="recordTotal">—</strong></span>
         </div>
-        <p>先用帖子 ID、标题和正文对比 Excel；Excel 没有时，只有确认与品牌词、产品词或官方账号相关的帖子才会框选。</p>
+        <p>先用帖子 ID、标题和正文对比笔记 CSV；CSV 没有时，只有确认与品牌词、产品词或官方账号相关的帖子才会框选。</p>
       </section>
 
-      <div class="post-shortcuts" hidden>
+      <div class="post-shortcuts" data-panel-section="posts" hidden>
         <button id="allPosts" type="button">全部本地记录</button>
         <button id="ignoredPosts" type="button">已忽略（可恢复）</button>
       </div>
 
-      <nav id="negativeTabs" class="negative-tabs" hidden aria-label="差评类型">
+      <nav id="negativeTabs" class="negative-tabs" data-panel-section="posts" hidden aria-label="差评类型">
         <button type="button" data-negative-type="note">负面帖子</button>
         <button type="button" data-negative-type="comment">负面评论</button>
         <button type="button" data-negative-type="suspected">待人工确认</button>
       </nav>
-      <details id="negativeFilters" class="negative-filters" hidden>
+      <details id="negativeFilters" class="negative-filters" data-panel-section="posts" hidden>
         <summary>筛选差评</summary>
         <div class="filter-grid">
           <label>关键词<input id="negativeKeyword" type="search" placeholder="标题、正文、作者"></label>
@@ -153,7 +258,7 @@
           <label>发布时间起<input id="negativePublished" type="date"></label>
           <label>风险等级<select id="negativeRisk"><option value="">全部</option><option>P0</option><option>P1</option><option>P2</option><option>P3</option></select></label>
           <label>问题分类<input id="negativeCategory" type="text" placeholder="如 服务态度"></label>
-          <label>业务状态<select id="negativeBusinessStatus"><option value="">全部</option><option value="new">Excel 未找到</option><option value="known">Excel 已有</option><option value="confirmed">待加入 Excel</option><option value="ignored">已忽略</option></select></label>
+          <label>业务状态<select id="negativeBusinessStatus"><option value="">全部</option><option value="new">CSV 未找到</option><option value="known">CSV 已有</option><option value="confirmed">待加入 CSV</option><option value="ignored">已忽略</option></select></label>
           <label>AI 状态<select id="negativeAIStatus"><option value="">全部</option><option value="completed">已完成</option><option value="failed">失败</option><option value="analyzing">分析中</option></select></label>
           <label>复核状态<select id="negativeReviewStatus"><option value="">全部</option><option value="pending_review">待复核</option><option value="pending_action">待处理</option><option value="in_progress">处理中</option><option value="resolved">已解决</option><option value="false_positive">误判</option><option value="no_action_needed">无需处理</option></select></label>
           <label>来源词<input id="negativeSourceKeyword" type="text" placeholder="品牌词 / 账号名"></label>
@@ -161,21 +266,21 @@
         <button id="applyNegativeFilters" class="secondary-button" type="button">应用筛选</button>
       </details>
 
-      <section id="queueSection" class="pending-section">
+      <section id="queueSection" class="pending-section" data-panel-section="posts">
         <div class="section-heading">
           <button id="queueBack" class="queue-back" type="button" hidden aria-label="返回待处理队列">←</button>
           <div>
-            <div id="queueKicker" class="section-kicker">NEW &amp; RELEVANT</div>
+            <div id="queueKicker" class="section-kicker">采集队列</div>
             <h2 id="queueTitle">新相关未拉取</h2>
-            <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地 Excel 中还没有</p>
+            <p id="queueHint" class="queue-hint">与 XHS-Monitor 品牌相关，但本地笔记 CSV 中还没有</p>
           </div>
           <span id="pendingCount" class="count-pill">0</span>
         </div>
         <div id="pendingList" class="pending-list"></div>
-        <button id="queueMore" class="queue-more" type="button" hidden>查看全部 Excel 未找到帖子</button>
+        <button id="queueMore" class="queue-more" type="button" hidden>查看全部 CSV 未找到帖子</button>
         <div id="pendingEmpty" class="empty-state">
           <span class="empty-glyph" aria-hidden="true">✓</span>
-          <strong>没有发现 Excel 之外的新相关帖子</strong>
+          <strong>没有发现 CSV 之外的新相关帖子</strong>
           <p>继续下滑或重新扫描后，新加载的品牌相关帖子会出现在这里。</p>
         </div>
       </section>
@@ -211,8 +316,6 @@
             <label>最大并发<input id="aiConcurrency" type="number" min="1" max="3" value="1"></label>
             <label>每日上限<input id="aiDailyLimit" type="number" min="1" max="10000" value="300"></label>
           </div>
-          <label class="switch-row"><input id="autoAnalyzePosts" type="checkbox"> 自动分析新帖子</label>
-          <label class="switch-row"><input id="autoAnalyzeComments" type="checkbox"> 自动分析新评论</label>
           <div class="button-pair">
             <button id="testAI" class="secondary-button" type="button">测试连接</button>
             <button id="saveAI" class="secondary-button" type="button">保存 AI 设置</button>
@@ -222,10 +325,53 @@
       </details>
 
       <footer>
-        <span>本地 Excel 对比</span>
+        <span>本地 CSV 对比</span>
         <span id="lastScan">尚未扫描</span>
       </footer>
     </main>
+    <section id="summaryPage" class="summary-page" hidden aria-label="帖子舆情总结">
+      <header class="summary-page__header">
+        <button id="summaryBack" type="button" aria-label="返回主页面">←</button>
+        <div><span>DEEPSEEK BRIEF</span><h2>正文与评论总结</h2></div>
+        <button id="summaryRerun" type="button">重新分析</button>
+      </header>
+      <div class="summary-page__context">
+        <strong id="summaryTitle">当前帖子</strong>
+        <span id="summaryMeta">等待分析</span>
+      </div>
+      <div id="summaryLoading" class="summary-loading" hidden>
+        <i></i><strong>DeepSeek 正在综合正文与评论区</strong><span>读取观点、共识、争议与品牌风险…</span>
+      </div>
+      <div id="summaryError" class="summary-error" hidden></div>
+      <article id="summaryResult" class="summary-result" hidden>
+        <section class="summary-hero"><span id="summarySentiment">待判断</span><p id="summaryOverview"></p></section>
+        <section><h3>正文核心</h3><ul id="summaryKeyPoints"></ul></section>
+        <section><h3>评论区共识</h3><ul id="summaryConsensus"></ul></section>
+        <section><h3>争议与分歧</h3><ul id="summaryDisagreements"></ul></section>
+        <section><h3>品牌风险</h3><ul id="summaryRisks"></ul></section>
+        <section><h3>建议动作</h3><ul id="summaryActions"></ul></section>
+        <section><h3>代表评论</h3><ul id="summaryComments"></ul></section>
+      </article>
+    </section>
+    <section id="commentsPage" class="comments-page" hidden aria-label="帖子评论区助手">
+      <header class="comments-page__header">
+        <button id="commentsBack" type="button" aria-label="返回主页面">←</button>
+        <div><span>COMMENT DESK</span><h2>评论区回复助手</h2></div>
+        <button id="commentsReload" type="button">刷新</button>
+      </header>
+      <div class="comments-page__context">
+        <strong id="commentsTitle">当前帖子</strong>
+        <span id="commentsMeta">正在读取评论…</span>
+      </div>
+      <div class="persona-switch" role="group" aria-label="回复身份">
+        <button type="button" data-persona="brand" class="is-active">品牌方</button>
+        <button type="button" data-persona="community">路人交流</button>
+        <small id="personaHint">官方身份：承接问题，提供可核验处理路径。</small>
+      </div>
+      <div id="commentsLoading" class="summary-loading" hidden><i></i><strong>正在展开并读取全部可见评论</strong><span>主评论与子评论都会保留层级</span></div>
+      <div id="commentsError" class="summary-error" hidden></div>
+      <div id="commentsList" class="comments-list"></div>
+    </section>
     <script src="sidepanel.js"></script>
   </body>
 </html>

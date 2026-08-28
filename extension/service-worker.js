@@ -9,9 +9,15 @@ const NATIVE_HOST_NAME = "com.xhsmonitor.bridge";
 const REQUEST_TIMEOUT_MS = 6500;
 const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
-const DETAIL_LOAD_TIMEOUT_MS = 12000;
+const DETAIL_LOAD_TIMEOUT_MS = 18000;
+const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
+const CONTENT_SCRIPT_VERSION = "0.25.1";
+const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
+const CONTENT_STYLE_FILES = ["content.css"];
+const contentInjectionTasks = new Map();
 
 let nativeStartPromise = null;
+let bridgeEnsurePromise = null;
 let deepScanPromise = null;
 let pageTaskPromise = null;
 let deepScanCancelled = false;
@@ -19,6 +25,18 @@ let relevanceGroupsCache = null;
 let relevanceGroupsFetchedAt = 0;
 let readerTabId = null;
 let readerCloseTimer = null;
+let batchCommentSyncPromise = null;
+let batchCommentSyncCancelled = false;
+let batchCommentSyncState = {
+  ok: true, running: false, done: false, cancelled: false,
+  total: 0, current: 0, currentNoteId: "", currentTitle: "",
+  changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
+  accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
+  statusSyncFailures: 0,
+  newComments: 0, removedComments: 0, changedComments: 0,
+  failures: [], mode: "all", phase: "idle", error: "", startedAt: "",
+  updatedAt: "", finishedAt: ""
+};
 let bridgeState = {
   status: "idle",
   bridgeUrl: DEFAULT_CONFIG.bridgeUrl,
@@ -33,7 +51,8 @@ const FLOATING_WINDOW_DEFAULTS = {
   floatingBallTop: 0,
   floatingBounds: { width: 400, height: 760 }
 };
-const FLOATING_BALL_SIZE = 92;
+const FLOATING_DOCK_WIDTH = 292;
+const FLOATING_DOCK_HEIGHT = 126;
 
 // AI 任务进度估算（Bridge 无实时进度事件，按状态+耗时估算，用于流式进度条）
 function estimateJobPercent(job, now = Date.now()) {
@@ -183,10 +202,10 @@ async function restoreSidePanel() {
   return closeFloatingWindow();
 }
 
-// 缩小为右侧吸附的圆形悬浮球（类 iPhone 辅助触控）
+// 缩小为右侧吸附的紧凑状态卡片
 async function openBallWindow() {
   if (!chrome.windows?.create) {
-    return { ok: false, error: "当前 Chrome 不支持悬浮球模式" };
+    return { ok: false, error: "当前 Chrome 不支持快捷悬浮窗模式" };
   }
   const saved = await chrome.storage.local.get(FLOATING_WINDOW_DEFAULTS);
   const existingId = Number(saved.floatingWindowId) || 0;
@@ -202,15 +221,15 @@ async function openBallWindow() {
     ? Number(saved.floatingBallTop)
     : Math.round(baseTop + baseHeight * 0.3);
   const popup = await chrome.windows.create({
-    width: FLOATING_BALL_SIZE,
-    height: FLOATING_BALL_SIZE,
-    left: Math.max(0, Math.round(baseLeft + baseWidth - FLOATING_BALL_SIZE - 6)),
+    width: FLOATING_DOCK_WIDTH,
+    height: FLOATING_DOCK_HEIGHT,
+    left: Math.max(0, Math.round(baseLeft + baseWidth - FLOATING_DOCK_WIDTH - 10)),
     top,
     focused: true,
     type: "popup",
     url: chrome.runtime.getURL("sidepanel.html?mode=ball")
   });
-  if (!popup?.id) return { ok: false, error: "悬浮球创建失败" };
+  if (!popup?.id) return { ok: false, error: "快捷悬浮窗创建失败" };
   await chrome.storage.local.set({
     floatingWindowId: popup.id,
     floatingWindowKind: "ball",
@@ -220,7 +239,7 @@ async function openBallWindow() {
   return { ok: true, windowId: popup.id, originWindowId: origin?.id || null };
 }
 
-// 点击悬浮球：展开为完整悬浮窗
+// 点击紧凑状态卡片：展开为完整悬浮窗
 async function expandBallWindow() {
   const saved = await chrome.storage.local.get(FLOATING_WINDOW_DEFAULTS);
   const ballId = Number(saved.floatingWindowId) || 0;
@@ -268,7 +287,7 @@ if (chrome.windows?.onBoundsChanged?.addListener) {
   });
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
+chrome.runtime.onInstalled.addListener(async (details) => {
   const current = await chrome.storage.local.get(DEFAULT_CONFIG);
   const targetKeywords = normalizeKeywords([
     ...(Array.isArray(current.targetKeywords) ? current.targetKeywords : []),
@@ -286,6 +305,15 @@ chrome.runtime.onInstalled.addListener(async () => {
     enabled: current.enabled !== false
   });
   await configureSidePanel();
+  // Existing tabs retain the old isolated content-script world after an
+  // unpacked extension update. Reload XHS tabs once so stale card badges and
+  // listeners cannot survive the version change.
+  if (details?.reason === "update") {
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    await Promise.all(tabs
+      .filter((tab) => tab?.id && isXhsPageUrl(tab.url))
+      .map((tab) => chrome.tabs.reload(tab.id).catch(() => null)));
+  }
 });
 chrome.runtime.onStartup.addListener(() => configureSidePanel().catch(() => {}));
 configureSidePanel().catch(() => {});
@@ -369,7 +397,7 @@ function requestNativeBridge() {
       clearTimeout(timer);
       resolve(result);
     };
-    const timer = setTimeout(() => finish({ ok: false, nativeHost: false, error: "Native Host 启动超时" }), 15000);
+    const timer = setTimeout(() => finish({ ok: false, nativeHost: false, error: "Native Host 启动超时" }), 35000);
     chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { type: "ensure_bridge" }, (response) => {
       if (chrome.runtime.lastError) {
         finish({ ok: false, nativeHost: false, error: chrome.runtime.lastError.message });
@@ -383,22 +411,54 @@ function requestNativeBridge() {
   return nativeStartPromise;
 }
 
-async function ensureBridge() {
+async function waitForBridgeHealth(config, timeoutMs = 18000) {
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 18000);
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await checkBridgeHealth(config);
+    if (latest.ok) return latest;
+    await delay(420);
+  }
+  return latest || { ok: false, error: "Bridge 健康检查超时" };
+}
+
+async function ensureBridgeInternal() {
   const config = await getConfig();
   setBridgeState("connecting", { bridgeUrl: config.bridgeUrl, error: "" });
   const existing = await checkBridgeHealth(config);
   if (existing.ok) return { ok: true, started: false, alreadyRunning: true, ...existing };
 
-  const nativeResult = await requestNativeBridge();
-  if (!nativeResult?.ok) {
-    setBridgeState("error", { bridgeUrl: config.bridgeUrl, error: nativeResult?.error || "Native Host 启动失败" });
-    return { ...nativeResult, ...bridgeState };
+  let lastResult = existing;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    setBridgeState("connecting", {
+      bridgeUrl: config.bridgeUrl, error: "",
+      attempt, statusText: `正在启动本地 Bridge（${attempt}/3）`
+    });
+    const nativeResult = await requestNativeBridge();
+    lastResult = nativeResult;
+    if (nativeResult?.ok) {
+      const health = await waitForBridgeHealth(config, 18000);
+      if (health?.ok) return { ...nativeResult, ...health, ok: true, attempt };
+      lastResult = { ...nativeResult, ...health, ok: false };
+    }
+    const fatalNativeError = /host.*not found|未找到.*host|not registered|权限|forbidden/i.test(
+      String(nativeResult?.error || "")
+    );
+    if (fatalNativeError) break;
+    await delay(500 * attempt);
   }
-  const health = await checkBridgeHealth(config);
-  if (!health.ok) {
-    return { ok: false, started: Boolean(nativeResult.started), nativeHost: true, ...health };
-  }
-  return { ...nativeResult, ...health, ok: true };
+  const nativeError = lastResult?.error || "Native Host 启动失败";
+  const error = `${nativeError}（当前插件 ID：${chrome.runtime.id}）`;
+  setBridgeState("error", { bridgeUrl: config.bridgeUrl, error, extensionId: chrome.runtime.id });
+  return { ...(lastResult || {}), ...bridgeState, error, extensionId: chrome.runtime.id, ok: false };
+}
+
+function ensureBridge() {
+  if (bridgeEnsurePromise) return bridgeEnsurePromise;
+  bridgeEnsurePromise = ensureBridgeInternal().finally(() => {
+    bridgeEnsurePromise = null;
+  });
+  return bridgeEnsurePromise;
 }
 
 async function getRelevanceGroups(force = false) {
@@ -423,6 +483,36 @@ async function getRelevanceGroups(force = false) {
   return relevanceGroupsCache;
 }
 
+function enforceExactNoteIdentity(result) {
+  const statuses = Array.isArray(result?.statuses) ? result.statuses.map((status) => {
+    const noteId = String(status?.noteId || "").trim();
+    const matchedNoteId = String(status?.matchedNoteId || noteId).trim();
+    if (!noteId || !matchedNoteId || matchedNoteId === noteId) return status;
+    return {
+      ...status,
+      matchedNoteId: noteId,
+      matchedBy: "none",
+      matchLabel: "",
+      status: "new",
+      isNew: true,
+      inExcel: false,
+      excelStatus: "missing",
+      pullStatus: "not_started",
+      pullError: "",
+      mediaStatus: "not_started",
+      mediaDir: "",
+      mediaFileCount: 0,
+      identityConflictBlocked: true
+    };
+  }) : [];
+  return {
+    ...result,
+    statuses,
+    excelMatchedCount: statuses.filter((status) => status?.inExcel).length,
+    excelMissingCount: statuses.filter((status) => !status?.inExcel).length
+  };
+}
+
 async function scanPage(payload) {
   const config = await getConfig();
   const allNotes = Array.isArray(payload?.notes) ? payload.notes : [];
@@ -433,13 +523,13 @@ async function scanPage(payload) {
     directRelevantCount: directlyRelevantNotes.length
   };
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/scan"), {
+    const rawResult = await bridgeApi("/api/scan", {
       method: "POST",
-      // Bridge must see every card. It checks Excel identity before applying
-      // the relevance gate, otherwise an Excel row with an unloaded caption
-      // can disappear before comparison.
+      // Bridge must see every card. Canonical XHS note ID remains the only
+      // identity allowed to mark a card as already pulled.
       body: JSON.stringify({ ...payload, notes: allNotes })
     });
+    const result = enforceExactNoteIdentity(rawResult);
     setBridgeState("online", { bridgeUrl: config.bridgeUrl, error: "", version: result.version || bridgeState.version || "" });
     return {
       ...result,
@@ -465,7 +555,19 @@ function delay(milliseconds) {
 }
 
 async function acquireReaderTab() {
-  throw new Error("当前版本只允许在已打开的小红书页面内读取，不创建后台标签页");
+  if (readerCloseTimer) {
+    clearTimeout(readerCloseTimer);
+    readerCloseTimer = null;
+  }
+  if (readerTabId) {
+    const existing = await chrome.tabs.get(readerTabId).catch(() => null);
+    if (existing?.id) return existing;
+    readerTabId = null;
+  }
+  const tab = await chrome.tabs.create({ url: "https://www.xiaohongshu.com/", active: false });
+  if (!tab?.id) throw new Error("后台同步标签页创建失败");
+  readerTabId = tab.id;
+  return tab;
 }
 
 function releaseReaderTabSoon(delayMilliseconds = 8000) {
@@ -497,6 +599,16 @@ async function extractCommentsFromTab(tabId, note) {
     await delay(400);
   }
   return { extracted, totalClicked };
+}
+
+function noteIdFromXhsUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    const match = url.pathname.match(/\/(?:search_result|explore|discovery\/item)\/([A-Za-z0-9_-]{6,128})/);
+    return match?.[1] || "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 function validXhsNoteUrl(value) {
@@ -545,6 +657,108 @@ async function restoreDeepScanSurface(tabId, pageUrl) {
   if (!isSearchSurfaceUrl(pageUrl)) return false;
   await chrome.tabs.update(tabId, { url: pageUrl, active: true }).catch(() => {});
   return true;
+}
+
+function isInjectableXhsUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "https:" && (url.hostname === "xiaohongshu.com" || url.hostname.endsWith(".xiaohongshu.com"));
+  } catch (_error) { return false; }
+}
+
+function reloadTabAndWait(tabId, timeoutMs = 18000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      if (error) reject(error);
+      else resolve();
+    };
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") finish();
+    };
+    const timer = setTimeout(() => finish(new Error("小红书页面自动刷新超时")), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId).catch(finish);
+  });
+}
+
+async function ensureContentInjected(tabId) {
+  const safeTabId = Number(tabId) || 0;
+  if (!safeTabId) throw new Error("没有找到当前小红书标签页");
+  const tab = await chrome.tabs.get(safeTabId).catch(() => null);
+  if (!tab || !isInjectableXhsUrl(tab.url)) throw new Error("当前标签页不是小红书页面");
+  const ping = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+  if (ping?.contentVersion === CONTENT_SCRIPT_VERSION) {
+    return { ok: true, injected: false, tabId: safeTabId, contentVersion: ping.contentVersion };
+  }
+  if (contentInjectionTasks.has(safeTabId)) return contentInjectionTasks.get(safeTabId);
+  const task = (async () => {
+    // An older content script cannot be safely overlaid: it owns observers and
+    // wheel/click handlers. Reload once so Chrome removes the old world and
+    // automatically injects this extension version—no manual refresh needed.
+    if (ping) {
+      await reloadTabAndWait(safeTabId);
+      await delay(180);
+      const reloaded = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+      if (reloaded?.contentVersion === CONTENT_SCRIPT_VERSION) {
+        return { ok: true, injected: true, reloaded: true, tabId: safeTabId, contentVersion: reloaded.contentVersion };
+      }
+    }
+    await chrome.scripting.insertCSS({ target: { tabId: safeTabId }, files: CONTENT_STYLE_FILES }).catch(() => {});
+    await chrome.scripting.executeScript({ target: { tabId: safeTabId }, files: CONTENT_SCRIPT_FILES });
+    await delay(120);
+    const ready = await chrome.tabs.sendMessage(safeTabId, { type: "getPageInfo" }).catch(() => null);
+    if (!ready || ready.contentVersion !== CONTENT_SCRIPT_VERSION) {
+      throw new Error("插件自动注入后版本未就绪，请稍后重试");
+    }
+    return { ok: true, injected: true, tabId: safeTabId, contentVersion: ready.contentVersion };
+  })();
+  contentInjectionTasks.set(safeTabId, task);
+  try { return await task; }
+  finally { contentInjectionTasks.delete(safeTabId); }
+}
+
+async function sendTabMessage(tabId, message) {
+  try { return await chrome.tabs.sendMessage(tabId, message); }
+  catch (_error) {
+    await ensureContentInjected(tabId);
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
+async function broadcastLocalNoteState(noteId, state = {}) {
+  const safeNoteId = String(noteId || "").trim();
+  if (!safeNoteId) return;
+  const message = { type: "localNoteStateChanged", noteId: safeNoteId, ...state };
+  chrome.runtime.sendMessage(message).catch(() => {});
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  await Promise.all(tabs
+    .filter((tab) => tab?.id && isXhsPageUrl(tab.url))
+    .map(async (tab) => {
+      const ready = await chrome.tabs.sendMessage(tab.id, { type: "getPageInfo" }).catch(() => null);
+      if (ready?.contentVersion !== CONTENT_SCRIPT_VERSION) {
+        await ensureContentInjected(tab.id).catch(() => null);
+      }
+      return chrome.tabs.sendMessage(tab.id, message).catch(() => null);
+    }));
+}
+
+async function deletePulledNoteAndBroadcast(noteId) {
+  const safeNoteId = String(noteId || "").trim();
+  const result = await bridgeApi("/api/note/delete", {
+    method: "POST", body: JSON.stringify({ noteId: safeNoteId }), timeoutMs: 300000
+  });
+  if (result?.ok) {
+    await broadcastLocalNoteState(safeNoteId, {
+      deleted: true, found: false, inExcel: false, status: "new",
+      pullStatus: "not_started", relevanceStatus: "unknown"
+    });
+  }
+  return result;
 }
 
 async function activeXhsTab(preferredTabId = null) {
@@ -629,16 +843,16 @@ async function collectComments(note) {
     const config = await getConfig();
     chrome.runtime.sendMessage({ type: "commentCollectionProgress", noteId: note.noteId, status: "collecting", current: 0 }).catch(() => {});
     try {
-      await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/collection/start"), {
+      await bridgeApi("/api/comments/collection/start", {
         method: "POST", body: JSON.stringify({ noteId: note.noteId })
       });
       const activeTab = await activeXhsTab();
       if (!activeTab?.id) throw new Error("找不到当前小红书页面");
       const extracted = await chrome.tabs.sendMessage(activeTab.id, {
-        type: "readNoteInPage", note
+        type: "readNoteInPage", note: { ...note, allComments: true }
       }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
       if (!extracted?.ok) throw new Error(extracted?.error || "评论区尚未加载完成");
-      const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/upsert"), {
+      const result = await bridgeApi("/api/comments/upsert", {
         method: "POST",
         body: JSON.stringify({
           noteId: note.noteId,
@@ -646,14 +860,15 @@ async function collectComments(note) {
           expectedCount: extracted.expectedCount || 0,
           status: extracted.status || "partial",
           collectedAt: new Date().toISOString()
-        })
-      }, 20000);
+        }),
+        timeoutMs: 20000
+      });
       const finalResult = { ...result, expandedCount: extracted.expandedCount || 0, expectedCount: extracted.expectedCount || 0 };
       chrome.runtime.sendMessage({ type: "commentCollectionProgress", noteId: note.noteId, done: true, ...finalResult }).catch(() => {});
       return finalResult;
     } catch (error) {
       const config = await getConfig();
-      await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/comments/upsert"), {
+      await bridgeApi("/api/comments/upsert", {
         method: "POST",
         body: JSON.stringify({ noteId: note.noteId, comments: [], status: "failed", error: error.message, collectedAt: new Date().toISOString() })
       }).catch(() => {});
@@ -693,6 +908,777 @@ async function resolvePullUrl(note) {
   throw new Error("当前页面没有可用的帖子访问链接，请先刷新小红书搜索结果页后重试");
 }
 
+async function getNoteStatus(noteId) {
+  if (!noteId) return { ok: true, found: false, inExcel: false, pullStatus: "not_started", relevanceStatus: "unknown" };
+  return bridgeApi(`/api/note/status?noteId=${encodeURIComponent(noteId)}`);
+}
+
+async function analyzeNoteRelevance(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法判断相关性" };
+  return runExclusivePageTask(async () => {
+    const noteId = note.noteId;
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    try {
+      broadcastPullProgress({ noteId, phase: "body", process: true, mode: "relevance",
+      title: "正在读取正文，准备判断品牌相关性", note }, activeTab.id);
+    const extracted = await chrome.tabs.sendMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: true, process: true, relevanceAnalysis: true }
+    }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
+    if (!extracted?.ok || !extracted.note?.content) {
+      throw new Error(extracted?.error || "尚未读到完整正文，稍后重试");
+    }
+    const comments = Array.isArray(extracted.comments) ? extracted.comments : [];
+    broadcastPullProgress({ noteId, phase: "excel", process: true, mode: "relevance",
+      title: `正文与 ${comments.length} 条评论已读取，DeepSeek 正在判断相关性`,
+      note: extracted.note, commentCount: comments.length }, activeTab.id);
+    const config = await getConfig();
+    const result = await bridgeApi("/api/relevance/analyze", {
+      method: "POST", body: JSON.stringify({ note: extracted.note, comments,
+        expectedCount: extracted.expectedCount || comments.length,
+        commentStatus: extracted.status || "partial" }),
+      timeoutMs: 120000
+    });
+    broadcastPullProgress({ noteId, phase: "done", process: true, mode: "relevance", done: true, ok: true,
+      title: result.relevanceStatus === "relevant" ? "AI 判断：相关" : result.relevanceStatus === "irrelevant" ? "AI 判断：不相关，已写入不相关 Sheet" : "AI 证据不足：保持未知",
+      relevanceStatus: result.relevanceStatus, note: extracted.note }, activeTab.id);
+      return result;
+    } catch (error) {
+      broadcastPullProgress({ noteId, phase: "failed", process: true, mode: "relevance", done: true,
+        ok: false, error: error?.message || "AI 判断失败", title: error?.message || "AI 判断失败", note }, activeTab.id);
+      throw error;
+    }
+  });
+}
+
+async function summarizeCurrentNote(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法总结" };
+  return runExclusivePageTask(async () => {
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    const extracted = await sendTabMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: false, process: false, allComments: true }
+    }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
+    if (!extracted?.ok || !extracted.note?.content) {
+      throw new Error(extracted?.error || "正文尚未读取成功");
+    }
+    const config = await getConfig();
+    return bridgeApi("/api/ai/summary", {
+      method: "POST",
+      body: JSON.stringify({
+        note: extracted.note,
+        comments: Array.isArray(extracted.comments) ? extracted.comments : [],
+        expectedCount: extracted.expectedCount || 0
+      }),
+      timeoutMs: 180000
+    });
+  });
+}
+
+async function readCurrentNoteComments(note, preferredTabId = null) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID" };
+  return runExclusivePageTask(async () => {
+    const activeTab = await activeXhsTab(preferredTabId);
+    if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+    const result = await sendTabMessage(activeTab.id, {
+      type: "readNoteInPage", note: { ...note, showProcess: false, process: false, allComments: true }
+    });
+    if (!result?.ok) {
+      const error = new Error(result?.error || "评论区读取失败");
+      error.accessStatus = "check_failed";
+      error.accessEvidence = result?.access || {};
+      throw error;
+    }
+    return result;
+  });
+}
+
+async function setNoteAccessStatus(noteId, status, error = "") {
+  if (!noteId) return { ok: false, error: "缺少帖子 ID" };
+  return bridgeApi("/api/note/access-status", {
+    method: "POST",
+    body: JSON.stringify({ noteId, status, error }),
+    timeoutMs: 60000
+  });
+}
+
+async function setNoteAccessStatuses(items = [], runId = 0) {
+  const updates = Array.isArray(items) ? items.filter((item) => item?.noteId) : [];
+  if (!updates.length) return { ok: true, updated: 0, items: [] };
+  return bridgeApi("/api/notes/access-status/batch", {
+    method: "POST",
+    body: JSON.stringify({ items: updates, runId: Number(runId) || 0 }),
+    timeoutMs: 120000
+  });
+}
+
+async function getUnreachableNotes() {
+  return bridgeApi("/api/notes/unreachable", { timeoutMs: 30000 });
+}
+
+async function deleteUnreachableNotes() {
+  // Import manual changes to the CSV status column before selecting rows.
+  await bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
+  const result = await bridgeApi("/api/notes/unreachable/delete", {
+    method: "POST", body: "{}", timeoutMs: 300000
+  });
+  for (const item of result?.deleted || []) {
+    await broadcastLocalNoteState(item.noteId, {
+      deleted: true, found: false, inExcel: false, status: "new",
+      pullStatus: "not_started", relevanceStatus: "unknown"
+    });
+  }
+  return result;
+}
+
+async function deleteReviewedFailures(noteIds = []) {
+  const requested = [...new Set((Array.isArray(noteIds) ? noteIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!requested.length) return { ok: false, error: "没有可删除的待复核帖子" };
+  await getBatchCommentSyncState();
+  const deleted = [];
+  const failures = [];
+  for (const noteId of requested) {
+    try {
+      const result = await deletePulledNoteAndBroadcast(noteId);
+      if (!result?.ok) throw new Error(result?.error || "删除失败");
+      deleted.push({ noteId, ...result });
+    } catch (error) {
+      failures.push({ noteId, error: error?.message || "删除失败" });
+    }
+  }
+  const deletedIds = new Set(deleted.map((item) => item.noteId));
+  const remaining = (batchCommentSyncState.failures || []).filter((item) => !deletedIds.has(String(item?.noteId || "")));
+  const state = await publishBatchCommentSync({
+    failures: remaining,
+    failedPosts: remaining.length,
+    reviewPosts: remaining.filter((item) => !item?.markedUnreachable).length,
+    unreachablePosts: remaining.filter((item) => item?.markedUnreachable).length
+  });
+  return { ok: failures.length === 0, deleted, failures, deletedCount: deleted.length, state,
+    error: failures.length ? `${failures.length} 篇删除失败` : "" };
+}
+
+async function ignoreBatchFailures(noteIds = []) {
+  const requested = [...new Set((Array.isArray(noteIds) ? noteIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!requested.length) return { ok: false, error: "没有可忽略的未完成帖子" };
+  await getBatchCommentSyncState();
+  const ignored = [];
+  const failures = [];
+  for (const noteId of requested) {
+    try {
+      const result = await bridgeApi("/api/ignore", {
+        method: "POST", body: JSON.stringify({ noteId }), timeoutMs: 30000
+      });
+      if (!result?.ok) throw new Error(result?.error || "忽略失败");
+      ignored.push(noteId);
+    } catch (error) {
+      failures.push({ noteId, error: error?.message || "忽略失败" });
+    }
+  }
+  const ignoredIds = new Set(ignored);
+  const remaining = (batchCommentSyncState.failures || []).filter((item) => !ignoredIds.has(String(item?.noteId || "")));
+  const state = await publishBatchCommentSync({
+    failures: remaining, failedPosts: remaining.length,
+    reviewPosts: remaining.filter((item) => !item?.markedUnreachable).length,
+    unreachablePosts: remaining.filter((item) => item?.markedUnreachable).length
+  });
+  return { ok: failures.length === 0, ignoredCount: ignored.length, ignored, failures, state,
+    error: failures.length ? `${failures.length} 篇忽略失败` : "" };
+}
+
+async function auditCurrentNoteComments(note, preferredTabId = null) {
+  let extracted;
+  try {
+    extracted = await readCurrentNoteComments(note, preferredTabId);
+  } catch (error) {
+    await setNoteAccessStatus(note.noteId, "check_failed", error?.message || "本次访问核验未完成").catch(() => {});
+    throw error;
+  }
+  await setNoteAccessStatus(note.noteId, "ok").catch(() => {});
+  const snapshot = {
+    note: extracted.note || note,
+    comments: Array.isArray(extracted.comments) ? extracted.comments : [],
+    expectedCount: Number(extracted.expectedCount) || 0,
+    status: extracted.status || "partial"
+  };
+  const comparison = await bridgeApi("/api/comments/compare", {
+    method: "POST", body: JSON.stringify({ noteId: note.noteId, ...snapshot }), timeoutMs: 60000
+  });
+  return { ...comparison, snapshot };
+}
+
+async function syncCurrentNoteComments(payload) {
+  const snapshot = payload?.snapshot || {};
+  const noteId = payload?.noteId || snapshot.note?.noteId || "";
+  const result = await bridgeApi("/api/comments/sync", {
+    method: "POST",
+    body: JSON.stringify({
+      noteId,
+      note: snapshot.note || payload?.note || {},
+      comments: Array.isArray(snapshot.comments) ? snapshot.comments : [],
+      expectedCount: Number(snapshot.expectedCount) || 0,
+      status: snapshot.status || "partial",
+      runId: Number(payload?.runId) || 0
+    }),
+    timeoutMs: 120000
+  });
+  if (result?.ok) {
+    await broadcastLocalNoteState(noteId, {
+      deleted: false, found: true, inExcel: true, status: "known",
+      pullStatus: "synced", locallyReconciled: true,
+      consistencyVerified: Boolean(result.consistencyVerified)
+    });
+  }
+  return result;
+}
+
+function batchSyncState(overrides = {}) {
+  batchCommentSyncState = {
+    ...batchCommentSyncState,
+    ...overrides,
+    updatedAt: new Date().toISOString()
+  };
+  return { ...batchCommentSyncState };
+}
+
+async function publishBatchCommentSync(overrides = {}) {
+  const state = batchSyncState(overrides);
+  await chrome.storage.local.set({ [BATCH_COMMENT_SYNC_KEY]: state }).catch(() => {});
+  chrome.runtime.sendMessage({ type: "batchCommentSyncProgress", ...state }).catch(() => {});
+  return state;
+}
+
+async function getBatchCommentSyncState() {
+  if (batchCommentSyncState.running) return { ...batchCommentSyncState };
+  const stored = await chrome.storage.local.get({ [BATCH_COMMENT_SYNC_KEY]: null }).catch(() => ({}));
+  const state = stored?.[BATCH_COMMENT_SYNC_KEY];
+  if (state && typeof state === "object") {
+    const interrupted = Boolean(state.running);
+    batchCommentSyncState = {
+      ...batchCommentSyncState,
+      ...state,
+      running: false,
+      done: interrupted ? true : Boolean(state.done),
+      phase: interrupted ? "interrupted" : state.phase,
+      error: interrupted ? "浏览器后台曾中断批量同步，可点击按钮从头重新核对" : (state.error || ""),
+      finishedAt: interrupted ? new Date().toISOString() : (state.finishedAt || "")
+    };
+    if (interrupted) {
+      await chrome.storage.local.set({ [BATCH_COMMENT_SYNC_KEY]: batchCommentSyncState }).catch(() => {});
+    }
+  }
+  return { ...batchCommentSyncState };
+}
+
+function batchReaderUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (!isXhsPageUrl(url.href)) return "";
+    url.searchParams.set("xhs_monitor_batch", "1");
+    return url.href;
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function liveNoteUrlsFromOpenTabs(noteId, excludedTabId = 0) {
+  if (!noteId) return [];
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  const eligible = tabs.filter((tab) => tab?.id && tab.id !== excludedTabId && isXhsPageUrl(tab.url || ""));
+  const resolvedUrls = await Promise.all(eligible.map((tab) =>
+    sendTabMessage(tab.id, { type: "resolveNoteUrl", noteId }).catch(() => null)
+  ));
+  const values = resolvedUrls.map((resolved) => resolved?.url).filter(desktopAccessibleUrl);
+  return [...new Set(values)];
+}
+
+function batchReaderCandidates(note = {}, liveUrls = []) {
+  const candidates = [];
+  for (const url of liveUrls) {
+    candidates.push({ url: batchReaderUrl(url), waitForCard: false, source: "live-tab-url" });
+  }
+  const storedUrlId = noteIdFromXhsUrl(note.url);
+  if (validXhsNoteUrl(note.url) && (!storedUrlId || storedUrlId === note.noteId)) {
+    candidates.push({ url: batchReaderUrl(note.url), waitForCard: false, source: "stored-url" });
+  }
+  if (note.noteId) {
+    candidates.push({
+      url: batchReaderUrl(`https://www.xiaohongshu.com/explore/${encodeURIComponent(note.noteId)}`),
+      waitForCard: false,
+      source: "canonical-explore"
+    });
+    candidates.push({
+      url: batchReaderUrl(`https://www.xiaohongshu.com/discovery/item/${encodeURIComponent(note.noteId)}`),
+      waitForCard: false,
+      source: "canonical-discovery"
+    });
+  }
+  if (isXhsPageUrl(note.authorUrl || "")) {
+    candidates.push({ url: batchReaderUrl(note.authorUrl), waitForCard: true, source: "author-profile" });
+  }
+  const title = String(note.title || "").trim();
+  if (title) {
+    const searchUrl = new URL("https://www.xiaohongshu.com/search_result");
+    searchUrl.searchParams.set("keyword", title.slice(0, 80));
+    searchUrl.searchParams.set("source", "web_search_result_notes");
+    searchUrl.searchParams.set("xhs_monitor_batch", "1");
+    candidates.push({ url: searchUrl.href, waitForCard: true, source: "title-search" });
+  }
+  const seen = new Set();
+  return candidates.filter((item) => item.url && !seen.has(item.url) && seen.add(item.url));
+}
+
+function isBatchInfrastructureError(message) {
+  return /自动注入|内容脚本|插件.*连接|权限|登录|验证码|验证|风控|网络|ERR_|后台同步标签页|用户已停止/i
+    .test(String(message || ""));
+}
+
+function accessFailureDiagnosis(error = {}, local = {}) {
+  const evidence = Array.isArray(error.accessEvidence) ? error.accessEvidence : [];
+  const states = new Set(evidence.map((item) => item?.state).filter(Boolean));
+  const mediaCount = Array.isArray(local.mediaFiles) ? local.mediaFiles.length : 0;
+  const commentCount = Math.max(0, Number(local.commentCount) || 0);
+  const hasLocalCopy = Boolean(local.found && (local.inExcel || local.note?.content || mediaCount || commentCount));
+  const linkMismatchSummary = states.has("link_id_mismatch") ? " · 保存链接指向其他帖子" : "";
+  const localSummary = hasLocalCopy
+    ? `本地已拉取${mediaCount ? ` · 素材 ${mediaCount} 个` : ""}${commentCount ? ` · 评论 ${commentCount} 条` : ""}${linkMismatchSummary}`
+    : `本地尚无完整副本${linkMismatchSummary}`;
+  let code = "link_needs_review";
+  let label = "链接待复核";
+  let summary = "桌面链接未能完成核验，禁止自动删除";
+  if (error.unreachable) {
+    code = "confirmed_unreachable";
+    label = "已确认失效";
+    summary = "至少两个独立详情入口明确显示已删除、下架或不存在";
+  } else if (states.has("accessible_surface") || error.opened) {
+    code = "accessible_extraction_failed";
+    label = "可打开，读取未完成";
+    summary = "帖子页面可访问，仅详情层提取失败，不属于失效帖子";
+  } else if (states.has("definitive_unreachable")) {
+    code = "suspected_unreachable";
+    label = "疑似删除/链接失效";
+    summary = "至少一个详情入口明确显示“页面不见了”，但证据尚未达到安全删除标准";
+  } else if (states.has("mobile_only")) {
+    code = "mobile_only";
+    label = "仅手机/扫码可看";
+    summary = "桌面端要求扫码，不能据此认定帖子已删除";
+  } else if (states.has("authentication_required")) {
+    code = "authentication_required";
+    label = "登录验证受限";
+    summary = "登录、验证码或风控阻止读取，不属于失效帖子";
+  } else if (states.has("temporary_blocked")) {
+    code = "temporary_blocked";
+    label = "桌面暂时受限";
+    summary = "页面暂时无法浏览，稍后应重新核验";
+  } else if (states.has("link_id_mismatch")) {
+    code = "stored_link_id_mismatch";
+    label = "本地链接串帖";
+    summary = "保存的链接指向另一篇帖子，已停止误读并尝试按原帖子 ID、作者页和标题重新找回";
+  } else if (hasLocalCopy) {
+    code = "stored_link_needs_refresh";
+    label = "本地有副本，链接待修复";
+    summary = "已找到本地正文、评论或素材，保留数据并重新解析有效链接";
+  }
+  return { code, label, summary, localSummary, hasLocalCopy, mediaCount, commentCount };
+}
+
+async function readPulledNoteInReader(tabId, note) {
+  const liveUrls = await liveNoteUrlsFromOpenTabs(note.noteId, tabId);
+  const candidates = batchReaderCandidates(note, liveUrls);
+  if (!candidates.length) {
+    const error = new Error("没有可用的帖子链接或标题");
+    error.unreachable = false;
+    error.accessStatus = "check_failed";
+    throw error;
+  }
+  let lastError = "帖子详情读取失败";
+  let infrastructureFailure = false;
+  const storedUrlId = noteIdFromXhsUrl(note.url);
+  const accessEvidence = storedUrlId && storedUrlId !== note.noteId
+    ? [{
+        source: "stored-url",
+        state: "link_id_mismatch",
+        marker: storedUrlId,
+        reason: `本地链接指向另一篇帖子 ${storedUrlId}`,
+        targetRoute: false
+      }]
+    : [];
+  for (const candidate of candidates) {
+    if (batchCommentSyncCancelled) throw new Error("用户已停止批量同步");
+    try {
+      await navigateBackgroundTab(tabId, candidate.url);
+      await ensureContentInjected(tabId);
+      await delay(candidate.waitForCard ? 650 : 220);
+      let prepared = await sendTabMessage(tabId, {
+        type: "prepareBatchProcess",
+        note: { ...note, noteId: note.noteId, batchSync: true }
+      }).catch(() => null);
+      if (!prepared?.ok || !prepared.expanded) {
+        await delay(140);
+        prepared = await sendTabMessage(tabId, {
+          type: "prepareBatchProcess",
+          note: { ...note, noteId: note.noteId, batchSync: true }
+        }).catch(() => null);
+      }
+      if (!prepared?.ok || !prepared.expanded) {
+        throw new Error("同步进度窗口尚未展开，已暂停本帖读取");
+      }
+      const extracted = await sendTabMessage(tabId, {
+        type: "readNoteInPage",
+        note: {
+          ...note,
+          noteId: note.noteId,
+          allComments: true,
+          batchSync: true,
+          waitForCard: candidate.waitForCard,
+          showProcess: true,
+          process: true
+        }
+      });
+      if (extracted?.ok) return { ...extracted, accessCandidate: candidate.source };
+      lastError = extracted?.error || lastError;
+      const evidence = extracted?.access || {};
+      accessEvidence.push({
+        source: candidate.source,
+        state: evidence.state || "unknown",
+        marker: evidence.marker || "",
+        reason: evidence.reason || "",
+        targetRoute: Boolean(evidence.targetRoute)
+      });
+      if (["temporary_blocked", "mobile_only", "authentication_required"].includes(evidence.state)) infrastructureFailure = true;
+    } catch (error) {
+      lastError = error?.message || lastError;
+      infrastructureFailure = infrastructureFailure || isBatchInfrastructureError(lastError);
+      accessEvidence.push({ source: candidate.source, state: "request_failed", marker: lastError });
+    }
+  }
+  const error = new Error(lastError);
+  const explicitSources = new Set(
+    accessEvidence.filter((item) => item.state === "definitive_unreachable").map((item) => item.source)
+  );
+  const accessible = accessEvidence.some((item) => item.state === "accessible_surface" || item.state === "ok");
+  error.unreachable = !accessible && !infrastructureFailure && explicitSources.size >= 2;
+  error.opened = accessible;
+  error.accessStatus = error.unreachable ? "unreachable" : (accessible ? "ok" : "check_failed");
+  error.accessEvidence = accessEvidence;
+  throw error;
+}
+
+async function syncPulledNoteInReader(tabId, note, runId = 0) {
+  let extracted;
+  try {
+    extracted = await readPulledNoteInReader(tabId, note);
+  } catch (error) {
+    error.syncStage = "open";
+    throw error;
+  }
+  const snapshot = {
+    note: extracted.note || note,
+    comments: Array.isArray(extracted.comments) ? extracted.comments : [],
+    expectedCount: Number(extracted.expectedCount) || 0,
+    status: extracted.status || "partial"
+  };
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    title: `已读取 ${snapshot.comments.length} 条评论，正在与本地数据对比`,
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
+  let comparison;
+  try {
+    comparison = await bridgeApi("/api/comments/compare", {
+      method: "POST",
+      body: JSON.stringify({ noteId: note.noteId, ...snapshot }),
+      timeoutMs: 60000
+    });
+  } catch (error) {
+    error.syncStage = "compare";
+    throw error;
+  }
+  if (!comparison?.ok) {
+    const error = new Error(comparison?.error || "评论对比失败");
+    error.syncStage = "compare";
+    throw error;
+  }
+  const hasCommentChanges = Boolean(comparison.commentHasChanges);
+  // Every successful read is written through all local stores even when the
+  // business-facing result remains “无变化”. This repairs drift without
+  // counting volatile post metadata as a comment change.
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    title: hasCommentChanges
+      ? `发现 ${Number(comparison.newCount || 0) + Number(comparison.removedCount || 0) + Number(comparison.changedCount || 0)} 项变化，正在同步全部本地数据`
+      : "评论无变化，正在校准 CSV、SQLite 与素材快照",
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
+  let synced;
+  try {
+    synced = await syncCurrentNoteComments({ noteId: note.noteId, snapshot, runId });
+  } catch (error) {
+    error.syncStage = "sync";
+    throw error;
+  }
+  if (!synced?.ok || !synced.consistencyVerified) {
+    const error = new Error(synced?.error || "本地数据一致性校验失败");
+    error.syncStage = "sync";
+    throw error;
+  }
+  await sendTabMessage(tabId, {
+    type: "batchSyncNoteProgress",
+    noteId: note.noteId,
+    note: snapshot.note,
+    phase: "excel",
+    done: true,
+    title: hasCommentChanges ? "评论变化及全部本地数据已同步" : "评论无变化，本地数据已全部校准",
+    commentCount: snapshot.comments.length,
+    commentRows: snapshot.comments.slice(0, 12)
+  }).catch(() => {});
+  return {
+    ok: true, changed: hasCommentChanges, comparison, synced,
+    collectedCount: synced.collectedCount || snapshot.comments.length
+  };
+}
+
+async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
+  const source = await getNotes("", 1000);
+  if (!source?.ok) throw new Error(source?.error || "已拉取帖子列表读取失败");
+  const selection = Array.isArray(selectedNoteIds) && selectedNoteIds.length
+    ? new Set(selectedNoteIds.map((item) => String(item || "")).filter(Boolean))
+    : null;
+  const seen = new Set();
+  const notes = (source.notes || []).filter((note) => {
+    const pulled = note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
+    return pulled && note.status !== "ignored" && note.noteId && (!selection || selection.has(note.noteId))
+      && !seen.has(note.noteId) && seen.add(note.noteId);
+  });
+  const startedAt = new Date().toISOString();
+  await publishBatchCommentSync({
+    ok: true, running: true, done: false, cancelled: false,
+    total: notes.length, current: 0, currentNoteId: "", currentTitle: "",
+    changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
+    accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
+    statusSyncFailures: 0,
+    newComments: 0, removedComments: 0, changedComments: 0,
+    failures: [], mode, phase: notes.length ? "preparing" : "done", error: "",
+    startedAt, finishedAt: notes.length ? "" : startedAt
+  });
+  if (!notes.length) return publishBatchCommentSync({ running: false, done: true, phase: "done" });
+
+  const reader = await acquireReaderTab();
+  const runStarted = await bridgeApi("/api/sync-runs/start", {
+    method: "POST",
+    body: JSON.stringify({ runType: "batch", totalNotes: notes.length, detail: { mode } }),
+    timeoutMs: 30000
+  }).catch(() => ({ ok: false, runId: 0 }));
+  const syncRunId = Number(runStarted?.runId) || 0;
+  const accessUpdates = [];
+  try {
+    for (let index = 0; index < notes.length; index += 1) {
+      if (batchCommentSyncCancelled) break;
+      const note = notes[index];
+      await publishBatchCommentSync({
+        phase: "reading", current: index, currentNoteId: note.noteId,
+        currentTitle: note.title || "未命名帖子"
+      });
+      try {
+        const result = await syncPulledNoteInReader(reader.id, note, syncRunId);
+        const comparison = result.comparison || {};
+        accessUpdates.push({ noteId: note.noteId, status: "ok", result: "opened" });
+        await publishBatchCommentSync({
+          phase: result.changed ? "synced" : "unchanged",
+          current: index + 1,
+          changedPosts: batchCommentSyncState.changedPosts + (result.changed ? 1 : 0),
+          unchangedPosts: batchCommentSyncState.unchangedPosts + (result.changed ? 0 : 1),
+          accessiblePosts: batchCommentSyncState.accessiblePosts + 1,
+          newComments: batchCommentSyncState.newComments + Number(comparison.newCount || 0),
+          removedComments: batchCommentSyncState.removedComments + Number(comparison.removedCount || 0),
+          changedComments: batchCommentSyncState.changedComments + Number(comparison.changedCount || 0)
+        });
+      } catch (error) {
+        if (batchCommentSyncCancelled) break;
+        await sendTabMessage(reader.id, {
+          type: "batchSyncNoteProgress",
+          noteId: note.noteId,
+          note,
+          phase: error?.syncStage === "open" ? "open" : "excel",
+          done: true,
+          error: error?.message || "本帖同步失败",
+          title: "本帖同步暂停，已记录失败原因"
+        }).catch(() => {});
+        const opened = Boolean(error?.opened || (error?.syncStage && error.syncStage !== "open"));
+        const accessStatus = opened ? "ok" : (error?.accessStatus === "unreachable" ? "unreachable" : "check_failed");
+        const markedUnreachable = accessStatus === "unreachable";
+        const localStatus = await getNoteStatus(note.noteId).catch(() => ({ ok: false, found: false }));
+        const diagnosis = accessFailureDiagnosis({ ...error, opened, unreachable: markedUnreachable }, localStatus || {});
+        accessUpdates.push({
+          noteId: note.noteId,
+          status: accessStatus,
+          result: opened ? "opened_extract_failed" : (markedUnreachable ? "confirmed_v2" : diagnosis.code),
+          error: opened ? "" : `${diagnosis.label}：${diagnosis.summary}`
+        });
+        const failure = {
+          noteId: note.noteId,
+          url: noteIdFromXhsUrl(note.url) === note.noteId
+            ? note.url
+            : `https://www.xiaohongshu.com/explore/${encodeURIComponent(note.noteId)}`,
+          storedUrl: note.url || "",
+          title: note.title || "未命名帖子",
+          error: error?.message || "同步未完成",
+          stage: error?.syncStage || "unknown",
+          markedUnreachable,
+          accessStatus,
+          diagnosis,
+          localEvidence: {
+            found: Boolean(localStatus?.found),
+            inExcel: Boolean(localStatus?.inExcel),
+            pullStatus: localStatus?.pullStatus || "",
+            mediaDir: localStatus?.mediaDir || "",
+            mediaCount: diagnosis.mediaCount,
+            commentCount: diagnosis.commentCount
+          },
+          accessEvidence: error?.accessEvidence || []
+        };
+        await publishBatchCommentSync({
+          phase: "failed-note", current: index + 1,
+          failedPosts: batchCommentSyncState.failedPosts + 1,
+          accessiblePosts: batchCommentSyncState.accessiblePosts + (opened ? 1 : 0),
+          reviewPosts: batchCommentSyncState.reviewPosts + (accessStatus === "check_failed" ? 1 : 0),
+          unreachablePosts: batchCommentSyncState.unreachablePosts + (markedUnreachable ? 1 : 0),
+          processingFailedPosts: batchCommentSyncState.processingFailedPosts + (markedUnreachable ? 0 : 1),
+          failures: [...batchCommentSyncState.failures, failure].slice(-1000)
+        });
+      }
+      if (!batchCommentSyncCancelled) await delay(420);
+    }
+  } finally {
+    if (accessUpdates.length) {
+      const accessResult = await setNoteAccessStatuses(accessUpdates, syncRunId).catch((error) => ({
+        ok: false,
+        error: error?.message || "访问状态写入失败"
+      }));
+      if (!accessResult?.ok) {
+        await publishBatchCommentSync({
+          statusSyncFailures: accessUpdates.length,
+          error: `评论已核对，但访问状态写入失败：${accessResult?.error || "请关闭 CSV 表格后重试"}`
+        });
+      }
+    }
+    releaseReaderTabSoon(350);
+  }
+  const cancelled = Boolean(batchCommentSyncCancelled);
+  const statusWriteFailed = Boolean(batchCommentSyncState.statusSyncFailures);
+  if (syncRunId) {
+    const runStatus = cancelled ? "cancelled"
+      : (batchCommentSyncState.failedPosts || statusWriteFailed) ? "partial" : "completed";
+    await bridgeApi("/api/sync-runs/finish", {
+      method: "POST",
+      body: JSON.stringify({
+        runId: syncRunId,
+        status: runStatus,
+        processedNotes: batchCommentSyncState.current,
+        changedNotes: batchCommentSyncState.changedPosts,
+        unchangedNotes: batchCommentSyncState.unchangedPosts,
+        failedNotes: batchCommentSyncState.failedPosts,
+        newComments: batchCommentSyncState.newComments,
+        removedComments: batchCommentSyncState.removedComments,
+        changedComments: batchCommentSyncState.changedComments,
+        detail: { mode, failures: batchCommentSyncState.failures || [] }
+      }),
+      timeoutMs: 30000
+    }).catch(() => null);
+  }
+  let weeklyReport = null;
+  if (mode === "all" && !cancelled) {
+    weeklyReport = await bridgeApi("/api/reports/weekly", {
+      method: "POST", body: JSON.stringify({ auto: true }), timeoutMs: 120000
+    }).catch(() => null);
+  }
+  return publishBatchCommentSync({
+    ok: !statusWriteFailed, running: false, done: true, cancelled,
+    phase: cancelled ? "cancelled" : (statusWriteFailed ? "status-write-failed" : "done"),
+    currentNoteId: "", currentTitle: "",
+    weeklyReport: weeklyReport?.ok ? weeklyReport : null,
+    finishedAt: new Date().toISOString()
+  });
+}
+
+async function startPulledCommentSync(selectedNoteIds = null, mode = "all") {
+  if (batchCommentSyncPromise) return { ok: true, joinedExisting: true, ...batchCommentSyncState };
+  batchCommentSyncCancelled = false;
+  const startedAt = new Date().toISOString();
+  const startingState = batchSyncState({
+    ok: true, running: true, done: false, cancelled: false,
+    total: 0, current: 0, currentNoteId: "", currentTitle: "",
+    changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
+    accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
+    statusSyncFailures: 0,
+    newComments: 0, removedComments: 0, changedComments: 0,
+    failures: [], mode, phase: "preparing", error: "", startedAt, finishedAt: ""
+  });
+  chrome.storage.local.set({ [BATCH_COMMENT_SYNC_KEY]: startingState }).catch(() => {});
+  const task = runPulledCommentSync(selectedNoteIds, mode).catch(async (error) => publishBatchCommentSync({
+    ok: false, running: false, done: true, phase: "failed",
+    error: error?.message || "批量同步失败", finishedAt: new Date().toISOString()
+  }));
+  batchCommentSyncPromise = task;
+  task.finally(() => {
+    if (batchCommentSyncPromise === task) batchCommentSyncPromise = null;
+  });
+  return { ok: true, started: true, ...batchCommentSyncState };
+}
+
+async function startAllPulledCommentSync() {
+  return startPulledCommentSync(null, "all");
+}
+
+async function startFailedPulledCommentSync() {
+  const state = await getBatchCommentSyncState();
+  const failedTotal = Math.max(0, Number(state.failedPosts) || 0);
+  const failedIds = [...new Set((state.failures || []).map((item) => item?.noteId).filter(Boolean))];
+  if (!failedTotal && !failedIds.length) return { ok: false, error: "当前没有需要重新核验的失败帖子" };
+  // v0.21.0 only retained the last 30 failure records. When the aggregate is
+  // larger than the retained IDs, rerun the full pulled set so none are lost.
+  const legacyIncomplete = failedTotal > failedIds.length;
+  return startPulledCommentSync(legacyIncomplete ? null : failedIds, legacyIncomplete ? "reconcile-all" : "failed");
+}
+
+async function cancelAllPulledCommentSync() {
+  batchCommentSyncCancelled = true;
+  return publishBatchCommentSync({ cancelled: true, phase: "stopping" });
+}
+
+async function suggestCommentReply(payload, preferredTabId = null) {
+  const note = payload?.note || {};
+  let comments = Array.isArray(payload?.comments) ? payload.comments : [];
+  let freshNote = note;
+  if (!comments.length || !freshNote.content) {
+    const extracted = await readCurrentNoteComments(note, preferredTabId);
+    comments = extracted.comments || [];
+    freshNote = extracted.note || note;
+  }
+  const config = await getConfig();
+  return bridgeApi("/api/ai/reply-suggestion", {
+    method: "POST",
+    body: JSON.stringify({ note: freshNote, comments, targetComment: payload.targetComment, persona: payload.persona }),
+    timeoutMs: 180000
+  });
+}
+
+async function applyCommentReply(payload, preferredTabId = null) {
+  const activeTab = await activeXhsTab(preferredTabId);
+  if (!activeTab?.id) throw new Error("找不到当前小红书页面");
+  return sendTabMessage(activeTab.id, {
+    type: "fillCommentReply", note: payload.note, comment: payload.comment, reply: payload.reply
+  });
+}
+
 async function pullNote(note, preferredTabId = null) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法拉取" };
   return runExclusivePageTask(async () => {
@@ -715,7 +1701,7 @@ async function pullNote(note, preferredTabId = null) {
       }, progressTabId);
       const inline = await chrome.tabs.sendMessage(activeTab.id, {
         type: "readNoteInPage",
-        note: { ...note, noteId, showProcess }
+        note: { ...note, noteId, showProcess, allComments: true }
       }).catch((error) => ({ ok: false, error: error?.message || "当前页面未连接插件" }));
       if (!inline?.ok || !inline.note?.content) {
         throw new Error(inline?.error || "当前页面尚未读到完整正文，请先让帖子卡片和详情层加载完成");
@@ -729,16 +1715,17 @@ async function pullNote(note, preferredTabId = null) {
 
       broadcastPullProgress({
         noteId, phase: "media", process: showProcess,
-        title: `正文与评论已读取，正在保存 ${detail.note.imageUrls?.length || 0} 张素材图片`,
+        title: `正文与评论已读取，正在保存 ${detail.note.imageUrls?.length || 0} 张图片、${detail.note.videoUrls?.length || 0} 个视频`,
         note: showProcess ? detail.note : undefined,
         imageCount: detail.note.imageUrls?.length || 0,
+        videoCount: detail.note.videoUrls?.length || 0,
         commentCount: comments.length,
         commentRows: showProcess ? comments.slice(0, 12) : undefined
       }, progressTabId);
       // Let the content-side panel paint the media stage before the bridge
       // request begins the combined media/Excel/SQLite write.
       await delay(120);
-      const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/pull"), {
+      const result = await bridgeApi("/api/pull", {
         method: "POST",
         body: JSON.stringify({
           note: detail.note,
@@ -747,17 +1734,19 @@ async function pullNote(note, preferredTabId = null) {
           commentStatus,
           commentError,
           collectedAt: new Date().toISOString()
-        })
-      }, 60000);
+        }),
+        timeoutMs: 10 * 60 * 1000
+      });
       broadcastPullProgress({
         noteId, phase: "excel", process: showProcess,
-        title: "素材与 Excel / SQLite 已写入，正在核对结果",
+        title: "素材与 CSV / SQLite 已写入，正在核对结果",
         note: showProcess ? {
           ...detail.note,
           mediaDir: result.mediaDir || "",
           mediaFiles: Array.isArray(result.mediaFiles) ? result.mediaFiles : []
         } : undefined,
-        imageCount: result.mediaCount ?? detail.note.imageUrls?.length ?? 0,
+        imageCount: result.imageCount ?? result.mediaCount ?? detail.note.imageUrls?.length ?? 0,
+        videoCount: result.videoCount ?? detail.note.videoUrls?.length ?? 0,
         mediaFileCount: result.mediaFileCount || 0,
         mediaDir: result.mediaDir || "",
         mediaFiles: result.mediaFiles || [],
@@ -783,6 +1772,11 @@ async function pullNote(note, preferredTabId = null) {
         process: showProcess
       };
       broadcastPullProgress({ noteId, phase: "done", done: true, ...finalResult }, progressTabId);
+      await broadcastLocalNoteState(noteId, {
+        deleted: false, found: true, inExcel: true, status: "known",
+        pullStatus: finalResult.pullStatus || "synced", relevanceStatus: "relevant",
+        consistencyVerified: Boolean(finalResult.consistencyVerified)
+      });
       return finalResult;
     } catch (error) {
       const result = { ok: false, noteId, process: showProcess, phase: "excel", error: error.message || "拉取失败" };
@@ -792,9 +1786,25 @@ async function pullNote(note, preferredTabId = null) {
   });
 }
 
+function isBridgeConnectivityError(error) {
+  const message = String(error?.message || error || "");
+  return /failed to fetch|networkerror|network error|err_connection|connection refused|load failed|响应超时|fetch.*failed/i.test(message);
+}
+
 async function bridgeApi(path, options = {}) {
   const config = await getConfig();
-  return fetchJson(bridgeEndpoint(config.bridgeUrl, path), options, options.timeoutMs || REQUEST_TIMEOUT_MS);
+  const { timeoutMs = REQUEST_TIMEOUT_MS, noRecovery = false, ...fetchOptions } = options || {};
+  const endpoint = bridgeEndpoint(config.bridgeUrl, path);
+  try {
+    return await fetchJson(endpoint, fetchOptions, timeoutMs);
+  } catch (firstError) {
+    if (noRecovery || !isBridgeConnectivityError(firstError)) throw firstError;
+    const recovered = await ensureBridge();
+    if (!recovered?.ok) {
+      throw new Error(`Bridge 连接失败：${recovered?.error || firstError.message || "启动失败"}`);
+    }
+    return fetchJson(endpoint, fetchOptions, timeoutMs);
+  }
 }
 
 function broadcastDeepScanProgress(progress) {
@@ -923,7 +1933,7 @@ async function confirmNote(note) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法收录" };
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/confirm"), {
+    const result = await bridgeApi("/api/confirm", {
       method: "POST",
       body: JSON.stringify(note)
     });
@@ -939,7 +1949,7 @@ async function ignoreNote(note) {
   if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法忽略" };
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/ignore"), {
+    const result = await bridgeApi("/api/ignore", {
       method: "POST",
       body: JSON.stringify(note)
     });
@@ -954,7 +1964,7 @@ async function ignoreNote(note) {
 async function getStats() {
   const config = await getConfig();
   try {
-    const result = await fetchJson(bridgeEndpoint(config.bridgeUrl, "/api/stats"));
+    const result = await bridgeApi("/api/stats");
     setBridgeState("online", { bridgeUrl: config.bridgeUrl, error: "", version: result.version || "" });
     return result;
   } catch (error) {
@@ -971,11 +1981,16 @@ async function getNotes(status = "", limit = 100) {
     const result = await fetchJson(
       bridgeEndpoint(config.bridgeUrl, `/api/notes?status=${encodeURIComponent(safeStatus)}&limit=${safeLimit}`)
     );
-    const notes = (result.notes || []).map((note) => ({
+    const notes = (result.notes || []).map((note) => {
+      let payload = {};
+      try { payload = JSON.parse(note.payload_json || "{}"); } catch (_error) { payload = {}; }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) payload = {};
+      return {
       noteId: note.note_id || "",
       title: note.title || "未命名帖子",
       author: note.author || "",
-      url: note.url || "",
+      authorUrl: payload.authorUrl || payload.userUrl || "",
+      url: note.url || payload.url || "",
       firstSeenAt: note.first_seen_at || "",
       lastSeenAt: note.last_seen_at || "",
       status: note.status || safeStatus,
@@ -998,8 +2013,12 @@ async function getNotes(status = "", limit = 100) {
       mediaStatus: note.media_status || "not_started",
       mediaDir: note.media_dir || "",
       mediaFileCount: Number(note.media_file_count) || 0,
-      mediaError: note.media_error || ""
-    }));
+      mediaError: note.media_error || "",
+      accessStatus: note.access_status || "",
+      accessError: note.access_error || "",
+      lastAccessCheckedAt: note.last_access_checked_at || ""
+    };
+    });
     return { ok: true, notes };
   } catch (error) {
     return { ok: false, offline: true, notes: [], error: error.message };
@@ -1031,9 +2050,41 @@ async function setConfig(nextConfig) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    if (message.type === "ensureContentInjected") {
+      const tab = await activeXhsTab(message.tabId || sender.tab?.id || null);
+      if (!tab?.id) throw new Error("没有找到当前小红书标签页");
+      return ensureContentInjected(tab.id);
+    }
+    if (message.type === "sendToActiveXhsTab") {
+      const tab = await activeXhsTab(message.tabId || sender.tab?.id || null);
+      if (!tab?.id) throw new Error("没有找到当前小红书标签页");
+      return sendTabMessage(tab.id, message.payload || {});
+    }
     if (message.type === "scanPage") return scanPage(message.payload || {});
     if (message.type === "confirmNote") return confirmNote(message.note || {});
     if (message.type === "pullNote") return pullNote(message.note || {}, sender.tab?.id || null);
+    if (message.type === "deletePulledNote") {
+      return deletePulledNoteAndBroadcast(message.noteId || message.note?.noteId || "");
+    }
+    if (message.type === "getNoteStatus") return getNoteStatus(message.noteId || message.note?.noteId || "");
+    if (message.type === "analyzeNoteRelevance") return analyzeNoteRelevance(message.note || {}, sender.tab?.id || null);
+    if (message.type === "summarizeCurrentNote") return summarizeCurrentNote(message.note || {}, sender.tab?.id || null);
+    if (message.type === "getCurrentNoteComments") return readCurrentNoteComments(message.note || {}, sender.tab?.id || null);
+    if (message.type === "auditCurrentNoteComments") return auditCurrentNoteComments(message.note || {}, sender.tab?.id || null);
+    if (message.type === "syncCurrentNoteComments") return syncCurrentNoteComments(message);
+    if (message.type === "syncAllPulledComments") return startAllPulledCommentSync();
+    if (message.type === "syncFailedPulledComments") return startFailedPulledCommentSync();
+    if (message.type === "cancelAllPulledComments") return cancelAllPulledCommentSync();
+    if (message.type === "getBatchCommentSyncState") return getBatchCommentSyncState();
+    if (message.type === "getUnreachableNotes") return getUnreachableNotes();
+    if (message.type === "deleteUnreachableNotes") return deleteUnreachableNotes();
+    if (message.type === "deleteReviewedFailures") return deleteReviewedFailures(message.noteIds || []);
+    if (message.type === "ignoreBatchFailures") return ignoreBatchFailures(message.noteIds || []);
+    if (message.type === "suggestCommentReply") return suggestCommentReply(message, sender.tab?.id || null);
+    if (message.type === "applyCommentReply") return applyCommentReply(message, sender.tab?.id || null);
+    if (message.type === "getNoteSummary") {
+      return bridgeApi(`/api/ai/summary?noteId=${encodeURIComponent(message.noteId || "")}`);
+    }
     if (message.type === "openLocalArtifact") {
       return bridgeApi("/api/open", {
         method: "POST",
@@ -1051,6 +2102,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "restoreSidePanel") return restoreSidePanel();
     if (message.type === "getBridgeState") return checkBridgeHealth();
     if (message.type === "getStats") return getStats();
+    if (message.type === "getDataHealth") return bridgeApi("/api/data-health", { timeoutMs: 60000 });
+    if (message.type === "repairDataHealth") {
+      return bridgeApi("/api/data-health/repair", { method: "POST", body: "{}", timeoutMs: 180000 });
+    }
+    if (message.type === "getChangeEvents") {
+      const query = new URLSearchParams({
+        limit: String(message.limit || 100),
+        unreadOnly: message.unreadOnly ? "true" : "false"
+      });
+      return bridgeApi(`/api/changes?${query}`, { timeoutMs: 30000 });
+    }
+    if (message.type === "acknowledgeChangeEvents") {
+      return bridgeApi("/api/changes/ack", {
+        method: "POST", body: JSON.stringify({ ids: message.ids || [], all: Boolean(message.all) }), timeoutMs: 30000
+      });
+    }
+    if (message.type === "getWatchlist") {
+      return bridgeApi(`/api/watchlist?limit=${encodeURIComponent(message.limit || 200)}`, { timeoutMs: 30000 });
+    }
+    if (message.type === "setWatchlist") {
+      return bridgeApi("/api/watchlist", { method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 30000 });
+    }
+    if (message.type === "generateWeeklyReport") {
+      return bridgeApi("/api/reports/weekly", { method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 120000 });
+    }
+    if (message.type === "getLatestWeeklyReport") return bridgeApi("/api/reports/weekly/latest", { timeoutMs: 30000 });
+    if (message.type === "openWeeklyReport") {
+      return bridgeApi("/api/reports/weekly/open", {
+        method: "POST", body: JSON.stringify({ target: message.target || "html" }), timeoutMs: 30000
+      });
+    }
     if (message.type === "reloadExcel") return bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
     if (message.type === "getPendingNotes") return getPendingNotes(message.limit);
     if (message.type === "getNotes") return getNotes(message.status, message.limit);

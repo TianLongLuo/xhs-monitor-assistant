@@ -210,16 +210,85 @@
     };
   }
 
+  function findCommentElement(root, comment = {}) {
+    const targetId = clean(comment.commentId || comment.comment_id, 256);
+    if (targetId) {
+      for (const selector of [
+        `[data-comment-id="${CSS.escape(targetId)}"]`, `[comment-id="${CSS.escape(targetId)}"]`,
+        `#${CSS.escape(targetId)}`, `#comment-${CSS.escape(targetId)}`
+      ]) {
+        const direct = root.querySelector?.(selector);
+        if (direct) return direct.matches?.(".comment-item, [class*='comment-item'], [class*='reply-item']")
+          ? direct : direct.closest?.(".comment-item, [class*='comment-item'], [class*='reply-item']") || direct;
+      }
+      for (const candidate of root.querySelectorAll?.(ITEM_SELECTORS.join(",")) || []) {
+        if (elementCommentId(candidate) === targetId) return candidate;
+      }
+    }
+    const targetContent = clean(comment.content, 300);
+    const targetAuthor = clean(comment.author, 120);
+    return Array.from(root.querySelectorAll?.(ITEM_SELECTORS.join(",")) || []).find((candidate) => {
+      const basics = commentBasics(candidate, { noteId: comment.noteId || "" });
+      return targetContent && basics.content.includes(targetContent.slice(0, 80))
+        && (!targetAuthor || basics.author === targetAuthor);
+    }) || null;
+  }
+
+  function replyButtonFor(element) {
+    if (!element) return null;
+    const ownerSelector = ITEM_SELECTORS.join(",");
+    const owner = element.matches?.(ownerSelector) ? element : element.closest?.(ownerSelector) || element;
+    const anchor = owner.querySelector?.(CONTENT_SELECTORS.join(",")) || element;
+    const anchorRect = anchor.getBoundingClientRect?.() || { left: 0, bottom: 0 };
+    const scopes = [];
+    let cursor = owner;
+    for (let depth = 0; cursor && depth < 5; depth += 1) {
+      scopes.push(cursor);
+      if (depth > 0 && cursor.matches?.(".parent-comment, [class*='parent-comment'], [class*='comment-thread']")) break;
+      cursor = cursor.parentElement;
+    }
+    const nodes = [];
+    const seen = new Set();
+    for (const scope of scopes) {
+      for (const node of scope.querySelectorAll?.("button, [role='button'], a, span, p, div") || []) {
+        if (seen.has(node)) continue;
+        seen.add(node);
+        const label = clean(
+          node.getAttribute?.("aria-label") || node.getAttribute?.("title") || node.innerText || node.textContent,
+          40
+        );
+        if (!/^(?:回复|回覆)(?:\s*\d+)?$/.test(label)) continue;
+        if (node.offsetParent === null || node.getClientRects?.().length === 0) continue;
+        const candidateOwner = node.closest?.(ownerSelector);
+        let ownerPenalty = 0;
+        if (candidateOwner && candidateOwner !== owner) {
+          if (owner.contains?.(candidateOwner)) ownerPenalty = 10000;
+          else if (!candidateOwner.contains?.(owner)) ownerPenalty = 100000;
+        }
+        const rect = node.getBoundingClientRect?.() || { left: 0, top: 0 };
+        nodes.push({
+          node,
+          score: ownerPenalty + Math.abs(rect.top - anchorRect.bottom) * 10 + Math.abs(rect.left - anchorRect.left)
+        });
+      }
+    }
+    nodes.sort((left, right) => left.score - right.score);
+    return nodes[0]?.node || null;
+  }
+
   function expandableButtons(root) {
-    return Array.from(root.querySelectorAll?.("button, [role='button'], span") || []).filter((element) => {
+    const matched = Array.from(root.querySelectorAll?.("button, [role='button'], span, a, div") || []).filter((element) => {
       if (element.offsetParent === null) return false;
       const label = clean(element.innerText || element.getAttribute?.("aria-label"), 80);
-      return /展开\s*\d*\s*条?回复|查看更多回复|更多回复|展开回复/.test(label);
+      return /^(?:展开(?:更多|全部|剩余)?\s*\d*\s*条?回复|查看(?:更多|全部|剩余)?\s*\d*\s*条?回复|更多回复|展开回复)$/.test(label);
     });
+    // XHS often wraps the visible label in several nested div/span nodes.
+    // Keep only the innermost clickable match so one group is clicked once.
+    return matched.filter((element) => !matched.some((other) => other !== element && element.contains(other)));
   }
 
   return {
     clean, numericText, profileIdFromUrl, isPostAuthorComment, stableCommentId, isReplyElement,
-    extractExpectedCount, extractComments, expandableButtons
+    extractExpectedCount, extractComments, expandableButtons, findCommentElement, replyButtonFor
   };
 });

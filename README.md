@@ -1,43 +1,56 @@
 # 小红书舆情监控助手
 
-Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 Excel / SQLite，并可调用 AI 进行情绪分析。
+一个面向品牌舆情监控的 Chrome Manifest V3 扩展与 Windows 本地 Bridge。扩展读取当前小红书页面已加载的 DOM，采集帖子、评论、图片和视频，并幂等写入本地 UTF-8 CSV 与 SQLite。
 
-当前版本：`0.14.0`
+公开版版本：`0.25.2`
 
-## 特性
+## 公开版说明
 
-- 当前页面 DOM 读取，不申请 Cookie 权限，不调用小红书隐藏接口。
-- 帖子正文、评论、图片素材幂等写入。
-- 新用户首次拉取时自动创建标准 Excel。
-- 本地私有品牌、产品、账号词库。
-- AI 测试连接、自动分析、流式进度条、百分比与完成通知。
-- 侧边栏可缩小为吸附在浏览器右侧的圆形悬浮球。
-- Bridge 仅监听 `127.0.0.1:17881`。
+- 仓库不包含任何具体品牌名称、产品词、账号词、本机目录、Cookie、API Key 或业务数据。
+- 首次安装后，请在本机配置自己的品牌词库；私有词库与运行数据均被 `.gitignore` 排除。
+- 所有采集结果默认只保存在本机，Bridge 仅监听 `127.0.0.1:17881`。
+- 扩展不申请 Cookie、`webRequest` 等权限，也不调用小红书隐藏接口。
 
-## 快速开始
+## 主要功能
 
-前置环境：Windows、Chrome、Python 3.10+。
+- 当前页面帖子核对与增量扫描。
+- 帖子正文、一级/二级评论、图片与视频素材采集。
+- CSV / SQLite 幂等写入、严格按笔记 ID 去重。
+- 已拉取帖子评论增量同步与全库巡检。
+- 数据体检、同步变更中心、重点帖子观察名单与近 7 天周报。
+- 可选 DeepSeek：品牌相关性判断、正文与评论总结、评论回复建议。
+- 侧边栏与详情页磁吸 Process 面板。
+
+## 环境要求
+
+- Windows 10/11
+- Chrome 114+
+- Python 3.10+
+
+## 直接 Clone 与安装
 
 ```powershell
+git clone https://github.com/TianLongLuo/xhs-monitor-assistant.git
+cd xhs-monitor-assistant
 pip install -r bridge/requirements.txt
 ```
 
-1. 打开 `chrome://extensions`，开启开发者模式。
-2. 点击“加载已解压的扩展程序”，选择 `extension/`。
-3. 双击 `setup.cmd`。向导会尝试自动识别扩展 ID；必要时按提示粘贴扩展卡片上的 32 位 ID。
-4. 在扩展管理页点击“重新加载”，并刷新已打开的小红书页面。
+1. 打开 `chrome://extensions` 并启用“开发者模式”。
+2. 点击“加载已解压的扩展程序”，选择仓库中的 `extension` 目录。
+3. 双击 `setup.cmd`，按向导完成 Native Messaging 注册。
+4. 回到扩展管理页点击“重新加载”，然后刷新已打开的小红书页面。
 
-完整步骤见 [使用说明.md](使用说明.md)。
+详细安装与故障排查见 [使用说明.md](使用说明.md)。
 
-## 监控词库
+## 配置品牌词库
 
-安装向导会从示例生成本机文件：
+安装向导会根据示例在本机生成：
 
 ```text
 bridge/data/relevance_keywords.json
 ```
 
-格式：
+示例格式：
 
 ```json
 {
@@ -47,7 +60,7 @@ bridge/data/relevance_keywords.json
 }
 ```
 
-该文件、数据库、AI 设置、Excel 和素材均被 `.gitignore` 排除。
+也可以编辑 `extension/relevance.js` 中的公开占位词，或通过本地 Bridge 维护私有词库。
 
 ## 目录结构
 
@@ -60,55 +73,57 @@ bridge/
   install_native_host.ps1         注册扩展 ID
   uninstall_native_host.ps1       移除注册
   relevance_keywords.example.json 词库示例
-data/                              Excel 与素材（运行时生成，不入库）
-setup.ps1 / setup.cmd              一键连接向导
+data/                              运行时生成，不提交
+setup.ps1 / setup.cmd              一键安装向导
 使用说明.md
-小红书舆情监控助手_PRD.md
 ```
 
-## 手动安装
+## 手动安装 Native Host
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File bridge/build_native_host.ps1
 powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 -ExtensionId "你的32位插件ID"
 ```
 
-已有总表：
+如需导入已有笔记 CSV：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 `
-  -ExtensionId "你的32位插件ID" `
-  -SeedXlsx "D:\路径\小红书笔记评论总表.xlsx"
+powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 \
+  -ExtensionId "你的32位插件ID" \
+  -SeedCsv "D:\path\to\小红书_笔记总表.csv"
 ```
 
-## 本地 API
+评论 CSV 会在同目录自动创建。旧版 `-SeedXlsx` 可用于一次性迁移。
 
-主要端点：
+## 本地数据与隐私
+
+以下内容默认不进入 Git：
+
+- `bridge/data/`
+- SQLite 数据库
+- 笔记与评论 CSV
+- 素材目录
+- AI 设置与加密后的 API Key
+- 本机 Native Messaging 清单
+- 私有品牌词库
+
+## 常用本地 API
 
 ```text
 GET  /api/health
 GET  /api/stats
-GET  /api/relevance
 GET  /api/notes
 GET  /api/comments
-GET  /api/ai/status
-GET  /api/ai/jobs
+GET  /api/relevance
 POST /api/scan
 POST /api/pull
 POST /api/comments/upsert
 POST /api/ai/test
 POST /api/ai/analyze
-POST /api/review
+POST /api/data-health/repair-relations
 ```
 
-## 安全与隐私
-
-- 扩展权限不包含 `cookies`、`webRequest`。
-- 页面脚本只操作可见 DOM。
-- 图片使用页面提供的 CDN URL 下载，不附带浏览器 Cookie。
-- 用户数据、密钥、私有词库、构建产物和本机注册清单不会提交到仓库。
-
-## 卸载 Bridge 注册
+## 卸载 Native Host
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1

@@ -2,7 +2,8 @@
 # This file is intentionally ASCII-only for Windows PowerShell 5.1 compatibility.
 param(
   [string]$ExtensionId = '',
-  [string]$SeedXlsx = '',
+  [Alias('SeedXlsx')]
+  [string]$SeedCsv = '',
   [switch]$SkipBuild
 )
 
@@ -38,6 +39,20 @@ function Find-LocalExtensionId {
   return $ids.ToArray()
 }
 
+function Get-UnpackedExtensionId {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  $normalized = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+  $bytes = [System.Text.Encoding]::Unicode.GetBytes($normalized)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+  $builder = New-Object System.Text.StringBuilder
+  for ($i = 0; $i -lt 16; $i++) {
+    [void]$builder.Append([char]([int][char]'a' + (($hash[$i] -shr 4) -band 15)))
+    [void]$builder.Append([char]([int][char]'a' + ($hash[$i] -band 15)))
+  }
+  return $builder.ToString()
+}
+
 Write-Host 'XHS Monitor setup wizard' -ForegroundColor Cyan
 Write-Host "Project: $root"
 
@@ -53,9 +68,12 @@ if (-not $ExtensionId) {
 }
 
 if (-not $ExtensionId) {
-  Write-Host 'Open chrome://extensions, load the extension folder, then copy its 32-letter ID.' -ForegroundColor Yellow
-  Write-Host "Extension folder: $extensionDir"
-  $ExtensionId = Read-Host 'Extension ID'
+  # Unpacked Chrome extensions without a manifest key derive their ID from the
+  # canonical Windows path (SHA-256 over UTF-16LE, first 16 bytes -> a-p).
+  # Computing it here prevents Native Host manifests from retaining an ID from
+  # an older folder and producing "Access ... is forbidden".
+  $ExtensionId = Get-UnpackedExtensionId -Path $extensionDir
+  Write-Host "Computed extension ID: $ExtensionId" -ForegroundColor Green
 }
 $ExtensionId = $ExtensionId.Trim()
 if ($ExtensionId -notmatch '^[a-p]{32}$') { throw 'Invalid Chrome extension ID.' }
@@ -74,7 +92,7 @@ if (-not $SkipBuild -or -not (Test-Path -LiteralPath $hostExe)) {
 }
 
 $installArgs = @{ ExtensionId = $ExtensionId }
-if ($SeedXlsx) { $installArgs.SeedXlsx = $SeedXlsx }
+if ($SeedCsv) { $installArgs.SeedCsv = $SeedCsv }
 & (Join-Path $bridgeDir 'install_native_host.ps1') @installArgs
 
 Start-Process -FilePath $hostExe -ArgumentList '--bridge' -WindowStyle Hidden

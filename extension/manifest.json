@@ -2,17 +2,20 @@
   "manifest_version": 3,
   "minimum_chrome_version": "114",
   "name": "小红书舆情监控助手",
-  "version": "0.14.0",
-  "description": "为当前小红书页面的帖子提供同页详情拉取、Process 进度面板、卡片框选与可选悬浮窗，把正文、图片和评论幂等写入本地 Excel 与 SQLite。",
+  "version": "0.25.2",
+  "description": "为小红书帖子提供同页核对、Process 进度、图片/视频/评论完整采集，并幂等写入本地 UTF-8 CSV / SQLite。",
   "permissions": [
     "storage",
     "nativeMessaging",
     "sidePanel",
-    "windows"
+    "windows",
+    "scripting"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "https://www.xiaohongshu.com/*",
+    "https://xiaohongshu.com/*"
   ],
   "background": {
     "service_worker": "service-worker.js"

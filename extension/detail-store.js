@@ -17,7 +17,8 @@
           ...note,
           url: root.XhsMonitorNoteUtils?.preferredUrl?.(existing.url, note.url) || note.url || existing.url || "",
           tags: unique([...(existing.tags || []), ...(note.tags || [])]),
-          imageUrls: unique([...(existing.imageUrls || []), ...(note.imageUrls || [])])
+          imageUrls: unique([...(existing.imageUrls || []), ...(note.imageUrls || [])]),
+          videoUrls: unique([...(existing.videoUrls || []), ...(note.videoUrls || [])])
         });
       }
     }
@@ -36,6 +37,9 @@
         tags: unique([...(note.tags || []), ...(detail.tags || [])]),
         mediaText: [note.mediaText, detail.mediaText].filter(Boolean).join(" ").slice(0, 6000),
         imageUrls: unique([...(note.imageUrls || []), ...(detail.imageUrls || [])]),
+        videoUrls: unique([...(note.videoUrls || []), ...(detail.videoUrls || [])]),
+        videoCount: detail.videoCount || note.videoCount || unique([...(note.videoUrls || []), ...(detail.videoUrls || [])]).length,
+        mediaType: detail.mediaType || note.mediaType || "image",
         keyword: note.keyword || detail.keyword || "",
         pageUrl: note.pageUrl || detail.pageUrl || ""
       };

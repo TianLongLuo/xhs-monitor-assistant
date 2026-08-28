@@ -1,8 +1,9 @@
 ﻿param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern('^[a-p]{32}$')]
-  [string]$ExtensionId,
-  [string]$SeedXlsx = '',
+  [string[]]$ExtensionId,
+  [Alias('SeedXlsx')]
+  [string]$SeedCsv = '',
   [int]$Port = 17881,
   [switch]$SkipSeed
 )
@@ -31,32 +32,32 @@ $dataDir = Join-Path $bridgeDir 'data'
 $exportDir = Join-Path $bridgeDir 'exports'
 New-Item -ItemType Directory -Path $dataDir,$exportDir -Force | Out-Null
 
-# 总表路径优先级：参数 > 已有配置 > 项目 data 目录默认值（首次拉取时自动创建）
-if (-not $SeedXlsx -and (Test-Path -LiteralPath $hostConfig)) {
+# 总表路径优先级：参数 > 已有 CSV 配置 > 待迁移 XLSX > 项目 data 目录默认值。
+$legacyXlsx = ''
+if (-not $SeedCsv -and (Test-Path -LiteralPath $hostConfig)) {
   try {
     $existing = Get-Content -LiteralPath $hostConfig -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($existing.seed_xlsx) { $SeedXlsx = [string]$existing.seed_xlsx }
+    if ($existing.seed_csv) { $SeedCsv = [string]$existing.seed_csv }
+    elseif ($existing.seed_xlsx) { $legacyXlsx = [string]$existing.seed_xlsx; $SeedCsv = $legacyXlsx }
   } catch {}
 }
-if (-not $SeedXlsx) {
-  $SeedXlsx = Join-Path (Split-Path -Parent $bridgeDir) 'data\小红书笔记评论总表.xlsx'
+if (-not $SeedCsv) {
+  $SeedCsv = Join-Path (Split-Path -Parent $bridgeDir) 'data\小红书_笔记总表.csv'
 }
-
+$commentsCsv = if ($SeedCsv -match '笔记总表') { $SeedCsv -replace '笔记总表[^\\]*$', '评论总表.csv' } else { [IO.Path]::Combine([IO.Path]::GetDirectoryName($SeedCsv), ([IO.Path]::GetFileNameWithoutExtension($SeedCsv) + '_评论总表.csv')) }
 $config = [ordered]@{
   host = '127.0.0.1'
   port = $Port
   db = (Join-Path $dataDir 'xhs_monitor.db')
   export_dir = $exportDir
-  seed_xlsx = $SeedXlsx
+  seed_csv = $(if ([IO.Path]::GetExtension($SeedCsv) -eq '.csv') { $SeedCsv } else { '' })
+  comments_csv = $(if ([IO.Path]::GetExtension($SeedCsv) -eq '.csv') { $commentsCsv } else { '' })
+  seed_xlsx = $(if ([IO.Path]::GetExtension($SeedCsv) -ne '.csv') { $SeedCsv } else { '' })
 }
 Write-Utf8NoBom -Path $hostConfig -Content ($config | ConvertTo-Json)
 
 if (-not $SkipSeed) {
-  if (Test-Path -LiteralPath $SeedXlsx) {
-    python (Join-Path $bridgeDir 'server.py') --seed-only --db (Join-Path $dataDir 'xhs_monitor.db') --export-dir $exportDir --seed-xlsx $SeedXlsx
-  } else {
-    Write-Output "总表尚不存在：$SeedXlsx（首次拉取时 Bridge 会自动创建，跳过初始化）"
-  }
+  python (Join-Path $bridgeDir 'server.py') --seed-only --db (Join-Path $dataDir 'xhs_monitor.db') --export-dir $exportDir --seed-csv $SeedCsv
 }
 
 $manifest = [ordered]@{
@@ -64,7 +65,7 @@ $manifest = [ordered]@{
   description = 'Starts the XHS-Monitor local monitoring bridge on demand.'
   path = $hostExe
   type = 'stdio'
-  allowed_origins = @("chrome-extension://$ExtensionId/")
+  allowed_origins = @($ExtensionId | Select-Object -Unique | ForEach-Object { "chrome-extension://$_/" })
 }
 Write-Utf8NoBom -Path $hostManifest -Content ($manifest | ConvertTo-Json)
 
@@ -73,6 +74,6 @@ New-Item -Path $registryPath -Force | Out-Null
 Set-ItemProperty -Path $registryPath -Name '(default)' -Value $hostManifest
 
 Write-Output "Native Host 已注册。"
-Write-Output "插件 ID：$ExtensionId"
+Write-Output "插件 ID：$($ExtensionId -join ', ')"
 Write-Output "Host：$hostExe"
 Write-Output "点击插件图标打开侧边栏时，Bridge 才会启动。"
