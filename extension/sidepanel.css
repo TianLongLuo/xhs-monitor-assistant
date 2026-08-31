@@ -2867,6 +2867,10 @@ body.apple-utility-ui:not(.is-ball) {
   background: rgba(255, 159, 10, .13);
   color: #9a6700;
 }
+.apple-utility-ui .current-detail-card__state[data-state="deleted"] {
+  background: rgba(255, 59, 48, .12);
+  color: var(--apple-red);
+}
 .apple-utility-ui .current-detail-card__meta,
 .apple-utility-ui .current-detail-card__hint {
   color: var(--apple-secondary);
@@ -2903,6 +2907,10 @@ body.apple-utility-ui:not(.is-ball) {
 .apple-utility-ui .current-detail-card__statuses span[data-state="irrelevant"] {
   background: rgba(118, 118, 128, .1);
   color: var(--apple-secondary);
+}
+.apple-utility-ui .current-detail-card__statuses span[data-state="deleted"] {
+  background: rgba(255, 59, 48, .12);
+  color: var(--apple-red);
 }
 .apple-utility-ui .current-detail-card__statuses button {
   color: var(--apple-blue);
@@ -3020,18 +3028,18 @@ body.apple-utility-ui:not(.is-ball) {
   line-height: 1.4;
 }
 .apple-utility-ui .unreachable-delete-button {
-  color: var(--apple-red);
+  color: var(--apple-blue);
   gap: 10px;
   grid-template-columns: 28px minmax(0, 1fr) auto;
 }
 .apple-utility-ui .unreachable-delete-button__glyph {
-  background: rgba(215, 0, 21, .08);
-  color: var(--apple-red);
+  background: rgba(0, 113, 227, .1);
+  color: var(--apple-blue);
 }
 .apple-utility-ui .unreachable-delete-button__copy small { color: var(--apple-secondary); }
 .apple-utility-ui .unreachable-delete-button__count {
-  background: rgba(215, 0, 21, .1);
-  color: var(--apple-red);
+  background: rgba(0, 113, 227, .1);
+  color: var(--apple-blue);
   font-size: 10px;
 }
 

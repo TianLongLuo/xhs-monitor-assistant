@@ -26,6 +26,11 @@
   outline-offset: 2px !important;
 }
 
+.xhs-monitor-card--deleted {
+  outline: 2px solid rgba(198, 57, 48, 0.72) !important;
+  outline-offset: 3px !important;
+}
+
 .xhs-monitor-toolbar {
   align-items: center;
   background: rgba(247, 250, 248, 0.94);
@@ -83,6 +88,11 @@
 
 .xhs-monitor-toolbar--ignored .xhs-monitor-badge {
   background: #66736d;
+}
+
+.xhs-monitor-toolbar--deleted .xhs-monitor-badge {
+  background: #c63930;
+  color: #fff;
 }
 
 .xhs-monitor-toolbar--error .xhs-monitor-badge {

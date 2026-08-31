@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.25.2";
+const CONTENT_SCRIPT_VERSION = "0.25.3";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -750,7 +750,9 @@ async function broadcastLocalNoteState(noteId, state = {}) {
 async function deletePulledNoteAndBroadcast(noteId) {
   const safeNoteId = String(noteId || "").trim();
   const result = await bridgeApi("/api/note/delete", {
-    method: "POST", body: JSON.stringify({ noteId: safeNoteId }), timeoutMs: 300000
+    method: "POST",
+    body: JSON.stringify({ noteId: safeNoteId, hardDeleteConfirmed: true, confirmation: safeNoteId }),
+    timeoutMs: 300000
   });
   if (result?.ok) {
     await broadcastLocalNoteState(safeNoteId, {
@@ -909,7 +911,8 @@ async function resolvePullUrl(note) {
 }
 
 async function getNoteStatus(noteId) {
-  if (!noteId) return { ok: true, found: false, inExcel: false, pullStatus: "not_started", relevanceStatus: "unknown" };
+  if (!noteId) return { ok: true, found: false, inExcel: false, pullStatus: "not_started",
+    relevanceStatus: "unknown", postStatus: "存在", isDeleted: false };
   return bridgeApi(`/api/note/status?noteId=${encodeURIComponent(noteId)}`);
 }
 
@@ -1017,15 +1020,17 @@ async function getUnreachableNotes() {
 }
 
 async function deleteUnreachableNotes() {
-  // Import manual changes to the CSV status column before selecting rows.
+  // Legacy action name retained for loaded v0.25.2 panels. The Bridge now
+  // marks post presence as deleted and keeps CSV, SQLite, comments and media.
   await bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
-  const result = await bridgeApi("/api/notes/unreachable/delete", {
+  const result = await bridgeApi("/api/notes/unreachable/mark-deleted", {
     method: "POST", body: "{}", timeoutMs: 300000
   });
-  for (const item of result?.deleted || []) {
+  for (const item of result?.marked || []) {
     await broadcastLocalNoteState(item.noteId, {
-      deleted: true, found: false, inExcel: false, status: "new",
-      pullStatus: "not_started", relevanceStatus: "unknown"
+      deleted: false, found: true, inExcel: true, status: "known",
+      postStatus: "已删除", isDeleted: true, accessStatus: "unreachable",
+      locallyReconciled: true
     });
   }
   return result;
@@ -1033,29 +1038,32 @@ async function deleteUnreachableNotes() {
 
 async function deleteReviewedFailures(noteIds = []) {
   const requested = [...new Set((Array.isArray(noteIds) ? noteIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
-  if (!requested.length) return { ok: false, error: "没有可删除的待复核帖子" };
+  if (!requested.length) return { ok: false, error: "没有可标记的待复核帖子" };
   await getBatchCommentSyncState();
-  const deleted = [];
-  const failures = [];
-  for (const noteId of requested) {
-    try {
-      const result = await deletePulledNoteAndBroadcast(noteId);
-      if (!result?.ok) throw new Error(result?.error || "删除失败");
-      deleted.push({ noteId, ...result });
-    } catch (error) {
-      failures.push({ noteId, error: error?.message || "删除失败" });
-    }
+  const result = await setNoteAccessStatuses(requested.map((noteId) => ({
+    noteId, status: "unreachable", result: "manual_confirmed_deleted",
+    error: "用户人工确认帖子已删除或下架"
+  })));
+  if (!result?.ok) return { ok: false, marked: [], failures: requested.map((noteId) => ({ noteId, error: result?.error || "标记失败" })),
+    markedDeletedCount: 0, error: result?.error || "标记失败" };
+  const marked = result.items || [];
+  for (const item of marked) {
+    await broadcastLocalNoteState(item.noteId, {
+      deleted: false, found: true, inExcel: true, status: "known",
+      postStatus: item.postStatus || "已删除", isDeleted: true,
+      accessStatus: "unreachable", locallyReconciled: true
+    });
   }
-  const deletedIds = new Set(deleted.map((item) => item.noteId));
-  const remaining = (batchCommentSyncState.failures || []).filter((item) => !deletedIds.has(String(item?.noteId || "")));
+  const markedIds = new Set(marked.map((item) => item.noteId));
+  const remaining = (batchCommentSyncState.failures || []).filter((item) => !markedIds.has(String(item?.noteId || "")));
   const state = await publishBatchCommentSync({
     failures: remaining,
     failedPosts: remaining.length,
     reviewPosts: remaining.filter((item) => !item?.markedUnreachable).length,
     unreachablePosts: remaining.filter((item) => item?.markedUnreachable).length
   });
-  return { ok: failures.length === 0, deleted, failures, deletedCount: deleted.length, state,
-    error: failures.length ? `${failures.length} 篇删除失败` : "" };
+  return { ok: true, marked, deleted: marked, failures: [], markedDeletedCount: marked.length,
+    deletedCount: marked.length, nonDestructive: true, state, error: "" };
 }
 
 async function ignoreBatchFailures(noteIds = []) {
@@ -1125,6 +1133,7 @@ async function syncCurrentNoteComments(payload) {
   if (result?.ok) {
     await broadcastLocalNoteState(noteId, {
       deleted: false, found: true, inExcel: true, status: "known",
+      postStatus: result.postStatus || "存在", isDeleted: false,
       pullStatus: "synced", locallyReconciled: true,
       consistencyVerified: Boolean(result.consistencyVerified)
     });
@@ -1455,7 +1464,9 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const seen = new Set();
   const notes = (source.notes || []).filter((note) => {
     const pulled = note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
-    return pulled && note.status !== "ignored" && note.noteId && (!selection || selection.has(note.noteId))
+    const selectedDeleted = Boolean(selection && selection.has(note.noteId));
+    return pulled && note.status !== "ignored" && (!note.isDeleted || selectedDeleted)
+      && note.noteId && (!selection || selection.has(note.noteId))
       && !seen.has(note.noteId) && seen.add(note.noteId);
   });
   const startedAt = new Date().toISOString();
@@ -1568,6 +1579,14 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           statusSyncFailures: accessUpdates.length,
           error: `评论已核对，但访问状态写入失败：${accessResult?.error || "请关闭 CSV 表格后重试"}`
         });
+      } else {
+        for (const item of accessResult.items || []) {
+          await broadcastLocalNoteState(item.noteId, {
+            deleted: false, found: true, inExcel: true, status: "known",
+            postStatus: item.postStatus || "存在", isDeleted: Boolean(item.isDeleted),
+            accessStatus: item.status || "", locallyReconciled: true
+          });
+        }
       }
     }
     releaseReaderTabSoon(350);
@@ -2016,7 +2035,11 @@ async function getNotes(status = "", limit = 100) {
       mediaError: note.media_error || "",
       accessStatus: note.access_status || "",
       accessError: note.access_error || "",
-      lastAccessCheckedAt: note.last_access_checked_at || ""
+      lastAccessCheckedAt: note.last_access_checked_at || "",
+      postStatus: note.post_status || "存在",
+      isDeleted: Boolean(note.is_deleted),
+      deletedAt: note.deleted_at || "",
+      lastPresenceCheckedAt: note.last_presence_checked_at || ""
     };
     });
     return { ok: true, notes };

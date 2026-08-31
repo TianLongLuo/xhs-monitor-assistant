@@ -609,20 +609,20 @@ function renderUnreachableNotes(result = {}) {
   const reviewCount = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable).length;
   if (elements.unreachableCount) elements.unreachableCount.textContent = String(count || reviewCount);
   if (elements.deleteUnreachableLabel) {
-    elements.deleteUnreachableLabel.textContent = count
-      ? `清理已确认失效帖子（${count}）`
-      : reviewCount ? `人工确认并删除无效帖子（${reviewCount}）` : "暂无已确认失效帖子";
+    elements.deleteUnreachableLabel.textContent = reviewCount
+      ? `人工确认并标记已删除（${reviewCount}）`
+      : count ? `已保留删除帖子记录（${count}）` : "暂无已确认删除帖子";
   }
   if (elements.unreachableHint) {
-    elements.unreachableHint.textContent = count
-      ? "同步删除笔记/评论 CSV、SQLite、分析记录与素材，并执行一致性校验"
-      : reviewCount ? "自动证据不足时，可由你人工确认后彻底删除；操作前会再次提示" : "仅删除经双重证据确认已删除或下架的帖子";
+    elements.unreachableHint.textContent = reviewCount
+      ? "人工确认后只把帖子状态改为“已删除”，不会删除帖子、评论、分析记录或素材"
+      : count ? "帖子行、评论、SQLite、语义分析和素材均已保留" : "仅双重证据或人工确认后才标记帖子已删除";
   }
   if (elements.deleteUnreachable) {
-    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || (count === 0 && reviewCount === 0);
-    elements.deleteUnreachable.title = count
-      ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n")
-      : reviewCount ? "点击后确认删除这些无效帖子，并同步清理 CSV、数据库和素材" : "当前没有经双重证据确认的失效帖子";
+    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || reviewCount === 0;
+    elements.deleteUnreachable.title = reviewCount
+      ? "点击后人工确认并标记为已删除；所有本地数据继续保留"
+      : count ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n") : "当前没有待确认帖子";
   }
 }
 
@@ -635,57 +635,36 @@ async function refreshUnreachableNotes() {
 
 async function deleteAllUnreachableNotes() {
   if (unreachableDeleteRunning || batchSyncViewState.running) return;
-  if (!unreachableNotes.length) {
-    const reviewFailures = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable && item?.noteId);
-    if (!reviewFailures.length) return;
-    const preview = reviewFailures.slice(0, 8).map((item) => `• ${item.title || item.noteId}（${item.diagnosis?.label || "待复核"}）`).join("\n");
-    const accepted = confirm(
-      `自动核验尚未达到“确认失效”标准。\n\n你是否人工确认以下 ${reviewFailures.length} 篇属于无效帖子并彻底删除？\n\n${preview}` +
-      `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
-      "将同步删除笔记/评论 CSV、SQLite 分析记录和素材目录。此操作不可撤销。"
-    );
-    if (!accepted) return;
-    unreachableDeleteRunning = true;
-    if (elements.deleteUnreachable) elements.deleteUnreachable.disabled = true;
-    if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在删除 ${reviewFailures.length} 篇…`;
-    setStatus(`正在按人工确认清理 ${reviewFailures.length} 篇无效帖子…`, "warning");
-    try {
-      const result = await sendRuntime({ type: "deleteReviewedFailures", noteIds: reviewFailures.map((item) => item.noteId) });
-      if (result?.state) renderBatchSync(result.state);
-      if (!result?.ok) throw new Error(result?.error || "部分帖子删除失败");
-      setStatus(`已彻底删除 ${result.deletedCount || reviewFailures.length} 篇人工确认的无效帖子`, "success");
-      showToast("无效帖子已从 CSV、数据库和素材目录清理");
-      await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
-      return result;
-    } finally {
-      unreachableDeleteRunning = false;
-      renderUnreachableNotes({ notes: unreachableNotes, count: unreachableNotes.length });
-    }
+  const reviewFailures = (batchSyncViewState.failures || [])
+    .filter((item) => !item?.markedUnreachable && item?.noteId);
+  if (!reviewFailures.length) {
+    if (unreachableNotes.length) showToast("已删除帖子均已保留在 CSV、SQLite 和素材目录中");
+    return;
   }
-  const count = unreachableNotes.length;
+  const preview = reviewFailures.slice(0, 8)
+    .map((item) => `• ${item.title || item.noteId}（${item.diagnosis?.label || "待复核"}）`).join("\n");
   const accepted = confirm(
-    `确定删除 ${count} 篇标记为“打不开”的帖子吗？\n\n` +
-    "将同时删除笔记 CSV 中的帖子行、评论 CSV 对应行、SQLite 记录和受管素材目录。"
+    `自动证据尚不充分。\n\n是否人工确认以下 ${reviewFailures.length} 篇帖子已删除或下架？\n\n${preview}` +
+    `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
+    "确认后只把“帖子状态”改为“已删除”；帖子行、评论、SQLite、分析结果和素材均完整保留。"
   );
   if (!accepted) return;
   unreachableDeleteRunning = true;
   if (elements.deleteUnreachable) elements.deleteUnreachable.disabled = true;
-  if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在删除 ${count} 篇…`;
-  setStatus(`正在删除 ${count} 篇打不开帖子及对应评论…`, "warning");
+  if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在标记 ${reviewFailures.length} 篇…`;
+  setStatus(`正在标记 ${reviewFailures.length} 篇帖子为已删除…`, "warning");
   try {
-    const result = await sendRuntime({ type: "deleteUnreachableNotes" });
-    const deleted = Number(result?.deletedCount) || 0;
-    const failed = Number(result?.failedCount) || 0;
-    if (!result?.ok && !deleted) throw new Error(result?.error || "批量删除失败");
-    const verified = Boolean(result?.excelVerified && result?.databaseVerified);
-    const linked = Number(result?.deletedLinkedDatabaseRecords) || 0;
-    const message = `已清理 ${deleted} 篇失效帖子、${Number(result?.deletedCommentRows) || 0} 条 CSV 评论及 ${linked} 条关联记录${verified ? "；CSV 与数据库校验通过" : ""}${failed ? `；${failed} 篇失败` : ""}`;
-    setStatus(message, failed ? "warning" : "success");
-    showToast(message, failed ? "error" : "success");
-    await Promise.all([refreshAll({ quiet: true }), refreshUnreachableNotes()]);
+    const result = await sendRuntime({ type: "deleteReviewedFailures", noteIds: reviewFailures.map((item) => item.noteId) });
+    if (result?.state) renderBatchSync(result.state);
+    if (!result?.ok) throw new Error(result?.error || "部分帖子标记失败");
+    const marked = Number(result.markedDeletedCount ?? result.deletedCount) || reviewFailures.length;
+    setStatus(`已标记 ${marked} 篇帖子为已删除；所有本地数据均已保留`, "success");
+    showToast("帖子状态已更新，CSV、数据库、评论和素材未删除");
+    await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
+    return result;
   } finally {
     unreachableDeleteRunning = false;
-    renderUnreachableNotes({ count: unreachableNotes.length, notes: unreachableNotes });
+    renderUnreachableNotes({ notes: unreachableNotes, count: unreachableNotes.length });
   }
 }
 
@@ -702,6 +681,7 @@ function renderCurrentDetail(note = null, loading = false) {
     Array.isArray(currentDetailNote.imageUrls) ? currentDetailNote.imageUrls[0] : "",
     currentDetailNote.inExcel, currentDetailNote.pullStatus,
     currentDetailNote.relevanceStatus, currentDetailNote.isRelevant,
+    currentDetailNote.postStatus, currentDetailNote.isDeleted,
     currentDetailNote.watched, currentDetailNote.watchPriority
   ]) : "empty";
   if (nextSignature === currentDetailRenderSignature) return;
@@ -711,8 +691,11 @@ function renderCurrentDetail(note = null, loading = false) {
 
   const contentLength = String(currentDetailNote.content || "").trim().length;
   const imageCount = Number(currentDetailNote.imageCount) || currentDetailNote.imageUrls?.length || 0;
+  const postDeleted = Boolean(currentDetailNote.isDeleted || currentDetailNote.postStatus === "已删除");
   const state = active
     ? { label: "处理中", value: "processing" }
+    : postDeleted
+      ? { label: "帖子已删除", value: "deleted" }
     : currentDetailNote.inExcel
       ? { label: "CSV 已有", value: "synced" }
       : loading || !contentLength
@@ -726,6 +709,8 @@ function renderCurrentDetail(note = null, loading = false) {
   ].filter(Boolean).join(" · ");
   const hint = active
     ? "Process 正在详情右侧运行：正文、素材图片、评论及 ID、CSV / SQLite。"
+    : postDeleted
+      ? "平台帖子已确认删除或下架；帖子行、评论、SQLite、语义分析和素材均完整保留。"
     : currentDetailNote.inExcel
       ? "本次已写入本地 CSV 与 SQLite；再次点击可补采正文、图片或评论。"
       : contentLength
@@ -756,8 +741,10 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailState.dataset.state = state.value;
   elements.currentDetailMeta.textContent = meta || "当前详情已识别，等待操作";
   const pulled = currentDetailNote.inExcel || ["synced", "partial"].includes(currentDetailNote.pullStatus);
-  elements.currentDetailPullStatus.textContent = pulled ? (currentDetailNote.pullStatus === "partial" ? "拉取：部分拉取" : "拉取：已拉取") : "拉取：未拉取";
-  elements.currentDetailPullStatus.dataset.state = pulled ? "pulled" : "missing";
+  elements.currentDetailPullStatus.textContent = postDeleted
+    ? "帖子状态：已删除（数据保留）"
+    : pulled ? (currentDetailNote.pullStatus === "partial" ? "拉取：部分拉取" : "拉取：已拉取") : "拉取：未拉取";
+  elements.currentDetailPullStatus.dataset.state = postDeleted ? "deleted" : pulled ? "pulled" : "missing";
   const relevance = currentDetailNote.relevanceStatus || (currentDetailNote.isRelevant ? "relevant" : "unknown");
   elements.currentDetailRelevance.textContent = `相关性：${relevance === "relevant" ? "相关" : relevance === "irrelevant" ? "不相关" : "未知"}`;
   elements.currentDetailRelevance.dataset.state = relevance;
@@ -767,7 +754,7 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailPull.disabled = active || !noteId;
   elements.currentDetailPull.textContent = active
     ? "处理中…"
-    : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 CSV";
+    : postDeleted ? "重新核验 / 恢复" : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 CSV";
   elements.currentDetailRefresh.disabled = active;
   elements.currentDetailSummary.disabled = active || !contentLength;
   elements.currentDetailComments.disabled = active || !contentLength;
@@ -779,7 +766,7 @@ function renderCurrentDetail(note = null, loading = false) {
       ? "点击移出重点帖子观察名单"
       : "同步变化会在运营工作台优先显示";
   }
-  elements.currentDetailDelete.hidden = !pulled;
+  elements.currentDetailDelete.hidden = !pulled || postDeleted;
   elements.currentDetailDelete.disabled = active;
 }
 
@@ -1304,7 +1291,7 @@ async function pullCurrentDetail() {  const note = currentDetailNote;
   renderCurrentDetail(note, false);
   try {
     await pullNoteToExcel(note, elements.currentDetailPull);
-    currentDetailNote = { ...currentDetailNote, inExcel: true };
+    currentDetailNote = { ...currentDetailNote, inExcel: true, postStatus: "存在", isDeleted: false, deletedAt: "" };
     renderCurrentDetail(currentDetailNote, false);
   } finally {
     currentDetailPullingId = "";
@@ -1483,6 +1470,7 @@ function renderNoteList(notes, options = {}) {
     const meta = document.createElement("span");
     meta.textContent = [
       note.author,
+      note.isDeleted || note.postStatus === "已删除" ? "帖子已删除·数据保留" : "",
       sourceLabel(note.source, options.sourceFallback),
       formatTime(note.firstSeenAt)
     ].filter(Boolean).join(" · ") || "本次发现";
@@ -1517,10 +1505,11 @@ function renderNoteList(notes, options = {}) {
       pullActions.removeAttribute?.("aria-hidden");
       pullActions.append(actionButton("补采评论", async (button) => pullNoteToExcel(note, button)));
     }
-    if (options.status === "known" || note.inExcel || ["synced", "partial"].includes(note.pullStatus)) {
+    if (!(note.isDeleted || note.postStatus === "已删除")
+        && (options.status === "known" || note.inExcel || ["synced", "partial"].includes(note.pullStatus))) {
       pullActions.hidden = false;
       pullActions.removeAttribute?.("aria-hidden");
-      pullActions.append(actionButton("删除", async (button) => deleteLocalNote({ ...note, noteId }, button)));
+      pullActions.append(actionButton("彻底清除", async (button) => deleteLocalNote({ ...note, noteId }, button)));
     }
     if ((note.target_type || "note") === "note") {
       actions.append(
@@ -2200,8 +2189,8 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "localNoteStateChanged") {
     if (message.noteId && currentDetailNote?.noteId === message.noteId) {
       currentDetailNote = message.deleted
-        ? { ...currentDetailNote, inExcel: false, pullStatus: "not_started", status: "new" }
-        : { ...currentDetailNote, inExcel: true, pullStatus: message.pullStatus || "synced", status: "known" };
+        ? { ...currentDetailNote, ...message, inExcel: false, pullStatus: "not_started", status: "new" }
+        : { ...currentDetailNote, ...message, inExcel: true, pullStatus: message.pullStatus || "synced", status: "known" };
       if (!ballMode) renderCurrentDetail(currentDetailNote, false);
     }
     if (!ballMode) Promise.all([refreshStats(), refreshPending(), loadPageInfo()]).catch(() => {});
@@ -2246,7 +2235,8 @@ chrome.runtime.onMessage.addListener((message) => {
         if (message.ok && message.mode === "relevance") {
           currentDetailNote = { ...currentDetailNote, relevanceStatus: message.relevanceStatus || "unknown",
             isRelevant: message.relevanceStatus === "relevant" };
-        } else if (message.ok) currentDetailNote = { ...currentDetailNote, inExcel: true, pullStatus: "synced" };
+        } else if (message.ok) currentDetailNote = { ...currentDetailNote, inExcel: true, pullStatus: "synced",
+          postStatus: "存在", isDeleted: false, deletedAt: "" };
         renderCurrentDetail(currentDetailNote, false);
       }
     }

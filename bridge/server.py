@@ -43,13 +43,13 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.25.2"
+VERSION = "0.25.3"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
     "图片数量", "发布日期", "来源词", "笔记ID", "博主ID", "对应帖子文件夹地址",
     "文件夹内清单", "AI情绪判断", "帖子好坏", "访问状态",
-    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型",
+    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "帖子状态",
 ]
 COMMENT_CSV_HEADERS = [
     "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
@@ -59,6 +59,8 @@ COMMENT_CSV_HEADERS = [
 ]
 COMMENT_STATUS_PRESENT = "存在"
 COMMENT_STATUS_DELETED = "已删除"
+POST_STATUS_PRESENT = "存在"
+POST_STATUS_DELETED = "已删除"
 CSV_ENCODING = "utf-8-sig"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
@@ -357,15 +359,23 @@ def nonnegative_int(value: Any) -> int:
         return 0
 
 
-def comment_status_label(value: Any, is_deleted: Any = None) -> str:
+def _presence_status_label(value: Any, is_deleted: Any, present_label: str, deleted_label: str) -> str:
     raw = text(value, 40).strip().casefold()
-    deleted_values = {"已删除", "删除", "不存在", "否", "deleted", "missing", "removed", "0", "false"}
+    deleted_values = {"已删除", "被删", "删除", "不存在", "否", "deleted", "missing", "removed", "0", "false"}
     present_values = {"存在", "仍存在", "是", "present", "exists", "active", "1", "true"}
     if raw in deleted_values or (not raw and bool_value(is_deleted)):
-        return COMMENT_STATUS_DELETED
+        return deleted_label
     if raw in present_values:
-        return COMMENT_STATUS_PRESENT
-    return COMMENT_STATUS_PRESENT
+        return present_label
+    return present_label
+
+
+def comment_status_label(value: Any, is_deleted: Any = None) -> str:
+    return _presence_status_label(value, is_deleted, COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED)
+
+
+def post_status_label(value: Any, is_deleted: Any = None) -> str:
+    return _presence_status_label(value, is_deleted, POST_STATUS_PRESENT, POST_STATUS_DELETED)
 
 
 def sentiment_label(value: Any) -> str:
@@ -748,7 +758,18 @@ class MonitorStore:
             if encoding == CSV_ENCODING and not missing_headers:
                 continue
             headers, rows = self._read_csv_table(path, defaults)
-            if path == comments_path:
+            if path == notes_path:
+                with self.lock, self._session() as db:
+                    stored_presence = {
+                        str(item["note_id"]): post_status_label(item["post_status"], item["is_deleted"])
+                        for item in db.execute("SELECT note_id,post_status,is_deleted FROM notes").fetchall()
+                    }
+                for row in rows:
+                    note_id = valid_note_id(row.get("笔记ID"))
+                    row["帖子状态"] = post_status_label(
+                        row.get("帖子状态") or stored_presence.get(note_id, POST_STATUS_PRESENT)
+                    )
+            elif path == comments_path:
                 for row in rows:
                     row["评论状态"] = comment_status_label(row.get("评论状态"))
             purpose = "normalize-schema" if missing_headers else "normalize-encoding"
@@ -948,6 +969,10 @@ class MonitorStore:
                 "analysis_is_negative": "TEXT NOT NULL DEFAULT ''",
                 "negative_type": "TEXT NOT NULL DEFAULT ''",
                 "negative_subtype": "TEXT NOT NULL DEFAULT ''",
+                "post_status": "TEXT NOT NULL DEFAULT '存在'",
+                "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+                "deleted_at": "TEXT NOT NULL DEFAULT ''",
+                "last_presence_checked_at": "TEXT NOT NULL DEFAULT ''",
             }
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(notes)").fetchall()}
             for column, definition in note_migrations.items():
@@ -961,6 +986,15 @@ class MonitorStore:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_review ON notes(review_status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_relevance ON notes(relevance_status, source)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_access_status ON notes(access_status)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_presence ON notes(is_deleted, pull_status)")
+            db.execute("""UPDATE notes SET is_deleted=1,post_status=?,
+                       deleted_at=CASE WHEN deleted_at='' THEN last_access_checked_at ELSE deleted_at END,
+                       last_presence_checked_at=CASE WHEN last_presence_checked_at='' THEN last_access_checked_at ELSE last_presence_checked_at END
+                       WHERE access_status='unreachable' AND access_check_result='confirmed_v2'""", (POST_STATUS_DELETED,))
+            db.execute("""UPDATE notes SET is_deleted=1
+                       WHERE post_status IN ('已删除','被删','删除','不存在','deleted','missing','removed')""")
+            db.execute("UPDATE notes SET post_status=CASE WHEN is_deleted=1 THEN ? ELSE ? END",
+                       (POST_STATUS_DELETED, POST_STATUS_PRESENT))
             db.execute("""UPDATE notes SET access_status='check_failed',
                        access_error='旧版打不开判定已降级，等待重新同步核验',
                        access_check_result='legacy_untrusted'
@@ -1502,6 +1536,7 @@ class MonitorStore:
         semantic_headers_present = all(name in actual_headers for name in (
             "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型"
         ))
+        presence_header_present = "帖子状态" in actual_headers
         inserted = 0
         timestamp = now_iso()
         with self.lock, self._session() as db:
@@ -1513,12 +1548,19 @@ class MonitorStore:
                 row_content = text(row.get("笔记内容"), 20000)
                 row_tags = text(row.get("笔记话题"), 6000)
                 row_access_label = text(row.get("访问状态"), 100).strip()
+                row_post_status = post_status_label(row.get("帖子状态"))
+                row_is_deleted = int(row_post_status == POST_STATUS_DELETED)
                 row_title_key, row_content_key, row_combined_key = identity_keys(row_title, row_content)
                 row_files = [line.strip() for line in text(row.get("文件夹内清单"), 50000).splitlines() if line.strip()]
                 row_media_dir = self._resolve_legacy_media_dir(row.get("对应帖子文件夹地址"), row_files, note_id)
                 existing = db.execute(
-                    "SELECT note_id,url,page_url,access_status,access_check_result FROM notes WHERE note_id=?", (note_id,)
+                    """SELECT note_id,url,page_url,access_status,access_check_result,
+                              post_status,is_deleted,deleted_at,last_presence_checked_at
+                       FROM notes WHERE note_id=?""", (note_id,)
                 ).fetchone()
+                if existing and not presence_header_present:
+                    row_post_status = post_status_label(existing["post_status"], existing["is_deleted"])
+                    row_is_deleted = int(row_post_status == POST_STATUS_DELETED)
                 confirmed_unreachable = bool(existing and existing["access_check_result"] == "confirmed_v2")
                 if row_access_label == "可打开":
                     access_status, access_error, access_result = "ok", "", "opened"
@@ -1547,24 +1589,37 @@ class MonitorStore:
                            content_key=CASE WHEN ?<>'' THEN ? ELSE content_key END,
                            title_content_key=CASE WHEN ?<>'' THEN ? ELSE title_content_key END,
                            last_seen_at=?,access_status=?,access_error=?,access_check_result=?,
+                           post_status=CASE WHEN ? THEN ? ELSE post_status END,
+                           is_deleted=CASE WHEN ? THEN ? ELSE is_deleted END,
+                           deleted_at=CASE WHEN ? AND ?=1 AND deleted_at='' THEN ?
+                                           WHEN ? AND ?=0 THEN '' ELSE deleted_at END,
+                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END,
                            pull_status='synced',pull_error='',excel_synced_at=?,excel_sync_path=? WHERE note_id=?""",
                         (preferred, preferred, row_title, row_title, text(row.get("用户昵称"), 500), text(row.get("用户昵称"), 500),
                          row_content, row_content, row_tags, row_tags, text(row.get("来源词"), 200), text(row.get("来源词"), 200),
                          preferred_page, preferred_page, text(row.get("帖子好坏"), 80), text(row.get("帖子好坏"), 80),
                          row_title_key, row_title_key, row_content_key, row_content_key, row_combined_key, row_combined_key,
-                         timestamp, access_status, access_error, access_result, timestamp, str(notes_path), note_id),
+                         timestamp, access_status, access_error, access_result,
+                         int(presence_header_present), row_post_status,
+                         int(presence_header_present), row_is_deleted,
+                         int(presence_header_present), row_is_deleted, timestamp,
+                         int(presence_header_present), row_is_deleted,
+                         int(presence_header_present), timestamp,
+                         timestamp, str(notes_path), note_id),
                     )
                 else:
                     db.execute(
                         """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
                            status,is_relevant,source,post_sentiment,title_key,content_key,title_content_key,payload_json,
-                           access_status,access_error,access_check_result,pull_status,excel_synced_at,excel_sync_path,relevance_status,relevance_source)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,'known',1,'existing_xlsx',?,?,?,?,?, ?,?,?,'synced',?,?, 'relevant','csv')""",
+                           access_status,access_error,access_check_result,post_status,is_deleted,deleted_at,
+                           last_presence_checked_at,pull_status,excel_synced_at,excel_sync_path,relevance_status,relevance_source)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,'known',1,'existing_xlsx',?,?,?,?,?, ?,?,?,?,?,?,?,'synced',?,?, 'relevant','csv')""",
                         (note_id, row_url, row_title, text(row.get("用户昵称"), 500), row_content, row_tags,
                          text(row.get("来源词"), 200), row_url, timestamp, timestamp, text(row.get("帖子好坏"), 80),
                          row_title_key, row_content_key, row_combined_key,
                          json.dumps({"seed": "csv", "tags": row_tags}, ensure_ascii=False), access_status, access_error,
-                         access_result, timestamp, str(notes_path)),
+                         access_result, row_post_status, row_is_deleted, timestamp if row_is_deleted else "",
+                         timestamp if presence_header_present else "", timestamp, str(notes_path)),
                     )
                     inserted += 1
                 if semantic_headers_present:
@@ -1847,6 +1902,10 @@ class MonitorStore:
                 "mediaDir": str(existing["media_dir"]) if existing is not None and "media_dir" in existing.keys() else "",
                 "mediaFileCount": int(existing["media_file_count"] or 0) if existing is not None and "media_file_count" in existing.keys() else 0,
                 "mediaError": str(existing["media_error"]) if existing is not None and "media_error" in existing.keys() else "",
+                "postStatus": post_status_label(existing["post_status"], existing["is_deleted"])
+                    if existing is not None and "post_status" in existing.keys() else POST_STATUS_PRESENT,
+                "isDeleted": bool(existing["is_deleted"])
+                    if existing is not None and "is_deleted" in existing.keys() else False,
             }
 
         with self.lock, self._session() as db:
@@ -2101,6 +2160,10 @@ class MonitorStore:
                     content_hash = CASE WHEN excluded.content_hash <> '' THEN excluded.content_hash ELSE notes.content_hash END,
                     pull_status = CASE WHEN notes.source='existing_xlsx' THEN 'synced' ELSE 'queued' END,
                     pull_error = '',
+                    post_status = '存在',
+                    is_deleted = 0,
+                    deleted_at = '',
+                    last_presence_checked_at = excluded.last_seen_at,
                     payload_json = excluded.payload_json
                 """,
                 (
@@ -2487,27 +2550,29 @@ class MonitorStore:
                 temporary_path.unlink(missing_ok=True)
 
     def _delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
+        """Compatibility helper: mark missing CSV comments deleted; never remove rows."""
         if not removed:
             return 0
         _notes_path, comments_path = self._csv_paths()
         headers, rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        if "评论状态" not in headers:
+            headers.append("评论状态")
         removed_ids = {text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)}
         removed_exact = {(text(item.get("author"), 500), text(item.get("content"), 8000),
                           text(item.get("publishedAt"), 100)) for item in removed}
-        kept: list[dict[str, Any]] = []
-        deleted = 0
+        marked = 0
         for row in rows:
             belongs = csv_comment_note_id(row) == note_id
             row_id = text(row.get("笔记评论ID"), 256)
             row_key = (text(row.get("用户昵称"), 500), text(row.get("评论内容"), 8000),
                        text(row.get("评论时间"), 100))
             if belongs and (row_id in removed_ids or row_key in removed_exact):
-                deleted += 1
-            else:
-                kept.append(row)
-        if deleted:
-            self._replace_csv_table(comments_path, headers, kept, "comment-prune")
-        return deleted
+                if comment_status_label(row.get("评论状态")) != COMMENT_STATUS_DELETED:
+                    marked += 1
+                row["评论状态"] = COMMENT_STATUS_DELETED
+        if marked:
+            self._replace_csv_table(comments_path, headers, rows, "comment-mark-deleted")
+        return marked
 
     def sync_comment_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Apply a reviewed comment delta to SQLite, Excel and comments.json."""
@@ -2598,6 +2663,7 @@ class MonitorStore:
                 db.execute(
                     """UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=?,
                        access_status='ok',access_error='',last_access_checked_at=?,access_check_result='opened',
+                       post_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?,
                        title=CASE WHEN ?<>'' THEN ? ELSE title END,
                        content=CASE WHEN ?<>'' THEN ? ELSE content END,
                        author=CASE WHEN ?<>'' THEN ? ELSE author END,
@@ -2605,7 +2671,7 @@ class MonitorStore:
                        payload_json=?,last_seen_at=?
                        WHERE note_id=?""",
                     (count, "likely_complete" if comparison["canPrune"] else text(payload.get("status"), 30) or "partial",
-                     checked_at, checked_at,
+                     checked_at, checked_at, POST_STATUS_PRESENT, checked_at,
                      text(note.get("title"), 1000), text(note.get("title"), 1000),
                      text(note.get("content"), 20000), text(note.get("content"), 20000),
                      text(note.get("author"), 500), text(note.get("author"), 500),
@@ -2630,6 +2696,7 @@ class MonitorStore:
             )
             return {
                 "ok": True, "noteId": note_id, "status": "latest",
+                "postStatus": POST_STATUS_PRESENT, "isDeleted": False,
                 "newCount": comparison["newCount"], "removedCount": len(removed),
                 "changedCount": comparison["changedCount"], "collectedCount": count,
                 "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
@@ -2850,6 +2917,10 @@ class MonitorStore:
             "postSentiment": sentiment_label(item.get("post_sentiment")) if item.get("post_sentiment") else "",
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
+            "postStatus": post_status_label(item.get("post_status"), item.get("is_deleted")),
+            "isDeleted": bool(item.get("is_deleted")),
+            "deletedAt": item.get("deleted_at") or "",
+            "lastPresenceCheckedAt": item.get("last_presence_checked_at") or "",
             "semanticAnalysisCount": int(item.get("semantic_analysis_count") or 0),
             "analysisIsNegative": item.get("analysis_is_negative") or "",
             "negativeType": item.get("negative_type") or "",
@@ -2890,6 +2961,10 @@ class MonitorStore:
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
             "lastAccessCheckedAt": item.get("last_access_checked_at") or "",
+            "postStatus": post_status_label(item.get("post_status"), item.get("is_deleted")),
+            "isDeleted": bool(item.get("is_deleted")),
+            "deletedAt": item.get("deleted_at") or "",
+            "lastPresenceCheckedAt": item.get("last_presence_checked_at") or "",
             "watched": bool(watch_row),
             "watchPriority": watch_row["priority"] if watch_row else "",
             "watchReason": watch_row["reason"] if watch_row else "",
@@ -3692,6 +3767,7 @@ class MonitorStore:
             pull_rows = db.execute(
                 "SELECT pull_status, COUNT(*) AS count FROM notes WHERE source<>'existing_xlsx' GROUP BY pull_status"
             ).fetchall()
+            deleted_posts = int(db.execute("SELECT COUNT(*) FROM notes WHERE is_deleted=1").fetchone()[0])
         by_status = {str(row["status"]): int(row["count"]) for row in rows}
         inbox = by_status.get("new", 0)
         archive = by_status.get("known", 0)
@@ -3715,6 +3791,8 @@ class MonitorStore:
                 "libraryTotal": archive + monitored,
                 "discoveryTotal": inbox + ignored,
                 "recordTotal": total,
+                "activePosts": total - deleted_posts,
+                "deletedPosts": deleted_posts,
                 "excelExisting": excel_existing,
                 "excelMissing": excel_missing,
                 "pullByStatus": pull_by_status,
@@ -3723,13 +3801,20 @@ class MonitorStore:
             "db": str(self.db_path),
         }
 
-    def list_notes(self, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def list_notes(self, status: str = "", limit: int = 100, include_deleted: bool = True) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit or 100), 1000))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if not include_deleted:
+            clauses.append("is_deleted=0")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.lock, self._session() as db:
-            if status:
-                rows = db.execute("SELECT * FROM notes WHERE status = ? ORDER BY first_seen_at DESC LIMIT ?", (status, limit)).fetchall()
-            else:
-                rows = db.execute("SELECT * FROM notes ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = db.execute(
+                f"SELECT * FROM notes{where} ORDER BY first_seen_at DESC LIMIT ?", (*params, limit)
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -3984,9 +4069,19 @@ class MonitorStore:
             note_rows = [dict(row) for row in db.execute(
                 """SELECT note_id,title,url,source,pull_status,media_status,media_dir,media_file_count,
                    comment_count_collected,access_status,payload_json,semantic_analysis_count,
-                   analysis_is_negative,negative_type,negative_subtype FROM notes"""
+                   analysis_is_negative,negative_type,negative_subtype,
+                   post_status,is_deleted,deleted_at,last_presence_checked_at FROM notes"""
             ).fetchall()]
             db_note_ids = {row["note_id"] for row in note_rows}
+            db_note_status = {
+                row["note_id"]: post_status_label(row.get("post_status"), row.get("is_deleted"))
+                for row in note_rows
+            }
+            db_deleted_note_count = sum(bool(row.get("is_deleted")) for row in note_rows)
+            db_note_flag_mismatches = [
+                row["note_id"] for row in note_rows
+                if bool(row.get("is_deleted")) != (post_status_label(row.get("post_status"), row.get("is_deleted")) == POST_STATUS_DELETED)
+            ]
             pulled_ids = {
                 row["note_id"] for row in note_rows
                 if row["source"] == "existing_xlsx" or row["pull_status"] in {"synced", "partial"}
@@ -4032,6 +4127,7 @@ class MonitorStore:
         ]
         missing_media = []
         pending_media = []
+        material_post_status_mismatches: list[str] = []
         for row in note_rows:
             if int(row.get("media_file_count") or 0) <= 0:
                 continue
@@ -4042,6 +4138,19 @@ class MonitorStore:
                 exists = False
             if not exists:
                 (pending_media if row.get("media_status") == "partial" else missing_media).append(row["note_id"])
+                continue
+            note_snapshot = Path(folder) / "note.json"
+            if note_snapshot.is_file():
+                try:
+                    snapshot = json.loads(note_snapshot.read_text(encoding="utf-8-sig"))
+                    snapshot_status = post_status_label(
+                        snapshot.get("postStatus") if isinstance(snapshot, dict) else "",
+                        snapshot.get("isDeleted") if isinstance(snapshot, dict) else None,
+                    )
+                    if snapshot_status != db_note_status.get(row["note_id"]):
+                        material_post_status_mismatches.append(row["note_id"])
+                except (OSError, ValueError):
+                    material_post_status_mismatches.append(row["note_id"])
         review_access = [row["note_id"] for row in note_rows if row.get("access_status") == "check_failed"]
         payload_cross_ids: list[str] = []
         payload_invalid_ids: list[str] = []
@@ -4085,6 +4194,9 @@ class MonitorStore:
         add_issue("shared_media_directory", "critical", "多个帖子共用同一素材目录",
                   "comments.json 会互相覆盖，必须拆分为带笔记ID的独立目录。",
                   len(shared_media_ids), False, shared_media_ids)
+        add_issue("material_post_status_mismatch", "critical", "素材快照与 SQLite 帖子状态不一致",
+                  "note.json 的存在/已删除状态必须与 SQLite 一致。",
+                  len(material_post_status_mismatches), False, material_post_status_mismatches)
         add_issue("access_review", "info", "帖子等待访问复核", "这些帖子上次未完成访问核验，不等于打不开。",
                   len(review_access), False, review_access)
         add_issue("sqlite_payload_cross_note_id", "critical", "SQLite 帖子快照发生串帖",
@@ -4118,6 +4230,8 @@ class MonitorStore:
         csv_comment_status_by_id: dict[str, str] = {}
         csv_comment_semantic_by_id: dict[str, tuple[int, str, str, str]] = {}
         note_semantic_mismatches: list[str] = []
+        invalid_post_status_ids: list[str] = []
+        csv_post_status_by_id: dict[str, str] = {}
         if not notes_path or not comments_path or not notes_path.exists() or not comments_path.exists():
             add_issue("csv_missing", "critical", "CSV 总表不存在", "当前配置路径下缺少笔记总表或评论总表。", 1, False)
         else:
@@ -4125,9 +4239,10 @@ class MonitorStore:
                 note_headers, csv_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
                 comment_headers, csv_comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
                 if ("笔记ID" not in note_headers or "笔记ID" not in comment_headers
-                        or "笔记评论ID" not in comment_headers or "评论状态" not in comment_headers):
+                        or "笔记评论ID" not in comment_headers or "评论状态" not in comment_headers
+                        or "帖子状态" not in note_headers):
                     add_issue("csv_schema", "critical", "CSV 表头结构不完整",
-                              "笔记或评论表缺少笔记ID、评论ID或评论状态列。", 1, False)
+                              "笔记或评论表缺少笔记ID、评论ID、帖子状态或评论状态列。", 1, False)
                 excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
                 invalid_note_rows = [str(index) for index, note_id in enumerate(excel_note_ids, 2) if not note_id]
                 excel_note_ids = [value for value in excel_note_ids if value]
@@ -4159,6 +4274,11 @@ class MonitorStore:
                     )
                     if note_id and stored_note and csv_semantic != db_semantic:
                         note_semantic_mismatches.append(note_id)
+                    raw_post_status = text(row.get("帖子状态"), 40)
+                    if note_id:
+                        if raw_post_status not in {POST_STATUS_PRESENT, POST_STATUS_DELETED}:
+                            invalid_post_status_ids.append(note_id)
+                        csv_post_status_by_id[note_id] = post_status_label(raw_post_status)
                 for index, row in enumerate(csv_comment_rows, 2):
                     explicit_note_id = valid_note_id(row.get("笔记ID"))
                     url_id = note_url_identity(row.get("原笔记url"))
@@ -4210,6 +4330,10 @@ class MonitorStore:
                     missing_parent_ids.append(comment_id or parent_id)
         csv_missing_db = sorted(csv_comment_id_set - db_comment_ids)
         db_missing_csv = sorted(db_comment_ids - csv_comment_id_set)
+        post_presence_status_mismatches = sorted(
+            note_id for note_id in excel_note_set.intersection(db_note_ids)
+            if csv_post_status_by_id.get(note_id) != db_note_status.get(note_id)
+        )
         presence_status_mismatches = sorted(
             comment_id for comment_id in csv_comment_id_set.intersection(db_comment_ids)
             if csv_comment_status_by_id.get(comment_id) != db_comment_status.get(comment_id)
@@ -4227,6 +4351,15 @@ class MonitorStore:
                   "同一帖子必须指向同一个受管素材目录。", len(media_path_mismatches), False, media_path_mismatches)
         add_issue("csv_duplicate_notes", "critical", "CSV 存在重复帖子行", "同一笔记 ID 在笔记总表重复出现。",
                   duplicate_excel, False)
+        add_issue("sqlite_post_status_flag_mismatch", "critical", "SQLite 帖子状态标记不一致",
+                  "post_status 与 is_deleted 必须表达同一存续状态。", len(db_note_flag_mismatches), False,
+                  db_note_flag_mismatches)
+        add_issue("csv_post_status_invalid", "critical", "帖子状态字段存在空值或非法值",
+                  "帖子状态只能是“存在”或“已删除”。", len(invalid_post_status_ids), False,
+                  invalid_post_status_ids)
+        add_issue("csv_sqlite_post_status_mismatch", "critical", "CSV 与 SQLite 帖子状态不一致",
+                  "同一帖子在两个数据源中的存在/已删除状态不同。", len(post_presence_status_mismatches), False,
+                  post_presence_status_mismatches)
         add_issue("csv_comment_missing_note_id", "critical", "评论缺少明确笔记ID",
                   "评论不能只依赖 URL 推断所属帖子。", len(missing_comment_note_ids), False, missing_comment_note_ids)
         add_issue("csv_abnormal_comment_rows", "critical", "评论 CSV 存在拆行或异常行",
@@ -4273,6 +4406,8 @@ class MonitorStore:
             "ok": True, "status": status, "score": score, "checkedAt": now_iso(), "issues": issues,
             "summary": {
                 "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
+                "activePosts": len(note_rows) - db_deleted_note_count,
+                "deletedPosts": db_deleted_note_count,
                 "activeComments": db_comment_count - db_deleted_comment_count,
                 "deletedComments": db_deleted_comment_count,
                 "csvNotes": len(excel_note_ids), "csvComments": excel_comment_rows,
@@ -4284,10 +4419,11 @@ class MonitorStore:
                 "relationshipsConsistent": not any(item["id"] in {
                     "csv_invalid_note_rows", "csv_note_url_mismatch", "csv_sqlite_media_path_mismatch", "csv_comment_missing_note_id",
                     "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_status_invalid",
+                    "sqlite_post_status_flag_mismatch", "csv_post_status_invalid", "csv_sqlite_post_status_mismatch",
                     "csv_sqlite_comment_status_mismatch", "csv_sqlite_note_semantic_mismatch",
                     "csv_sqlite_comment_semantic_mismatch", "csv_comment_url_mismatch",
                     "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory",
-                    "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
+                    "material_post_status_mismatch", "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
                 } for item in issues),
                 "issueCount": len(issues),
                 "repairableCount": sum(1 for item in issues if item["repairable"]),
@@ -5494,6 +5630,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "title": canonical_note_title(note.get("title"), note.get("content"), 80),
             "content": text(note.get("content"), 12000),
             "tags": note.get("tags") or previous.get("tags") or [],
+            "postStatus": POST_STATUS_PRESENT,
+            "isDeleted": False,
+            "deletedAt": "",
+            "lastPresenceCheckedAt": now_iso(),
             "syncedAt": now_iso(),
         }
         self._write_json_atomic(metadata_path, metadata)
@@ -5508,11 +5648,38 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _write_material_note_presence(
+        self, note_id: str, media_dir: str, status: str, checked_at: str, deleted_at: str = ""
+    ) -> bool:
+        folder = Path(text(media_dir, 4000)) if text(media_dir, 4000) else None
+        if not folder or not folder.is_dir():
+            return False
+        path = folder / "note.json"
+        previous: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except (OSError, ValueError):
+                previous = {}
+        previous.update({
+            "noteId": note_id,
+            "postStatus": post_status_label(status),
+            "isDeleted": post_status_label(status) == POST_STATUS_DELETED,
+            "deletedAt": deleted_at if post_status_label(status) == POST_STATUS_DELETED else "",
+            "lastPresenceCheckedAt": checked_at,
+        })
+        self._write_json_atomic(path, previous)
+        return True
+
     def _verify_note_store_consistency(self, note_id: str, media_dir: str = "") -> dict[str, Any]:
         notes_path, comments_path = self._csv_paths()
         _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
         _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-        note_matches = sum(valid_note_id(row.get("笔记ID")) == note_id for row in note_rows)
+        matching_note_rows = [row for row in note_rows if valid_note_id(row.get("笔记ID")) == note_id]
+        note_matches = len(matching_note_rows)
+        csv_post_status = post_status_label(matching_note_rows[0].get("帖子状态")) if note_matches == 1 else ""
         csv_status = {
             text(row.get("笔记评论ID"), 256): comment_status_label(row.get("评论状态"))
             for row in comment_rows
@@ -5525,9 +5692,15 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     "SELECT comment_id,comment_status,is_deleted FROM comments WHERE note_id=?", (note_id,)
                 ).fetchall()
             }
+            db_note_presence = db.execute(
+                "SELECT post_status,is_deleted FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+            db_post_status = post_status_label(db_note_presence[0], db_note_presence[1]) if db_note_presence else ""
         db_ids = set(db_status)
         if note_matches != 1:
             raise ValueError(f"本地一致性校验失败：笔记 CSV 中该帖子有 {note_matches} 行")
+        if csv_post_status != db_post_status:
+            raise ValueError("本地一致性校验失败：笔记 CSV 与 SQLite 的存在/已删除状态不一致")
         if csv_ids != db_ids:
             raise ValueError(
                 f"本地一致性校验失败：评论 CSV={len(csv_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
@@ -5536,6 +5709,15 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             raise ValueError("本地一致性校验失败：评论 CSV 与 SQLite 的存在/已删除状态不一致")
         material_ids: set[str] | None = None
         if media_dir and Path(media_dir).is_dir():
+            note_snapshot_path = Path(media_dir) / "note.json"
+            if note_snapshot_path.is_file():
+                note_snapshot = json.loads(note_snapshot_path.read_text(encoding="utf-8-sig"))
+                material_post_status = post_status_label(
+                    note_snapshot.get("postStatus") if isinstance(note_snapshot, dict) else "",
+                    note_snapshot.get("isDeleted") if isinstance(note_snapshot, dict) else None,
+                )
+                if material_post_status != db_post_status:
+                    raise ValueError("本地一致性校验失败：素材快照与 SQLite 的帖子状态不一致")
             material_path = Path(media_dir) / "comments.json"
             if not material_path.is_file():
                 raise ValueError("本地一致性校验失败：素材目录缺少 comments.json")
@@ -5556,6 +5738,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         deleted_count = sum(status == COMMENT_STATUS_DELETED for status in db_status.values())
         return {
             "ok": True, "noteId": note_id, "noteRows": note_matches,
+            "postStatus": db_post_status,
             "commentIds": len(db_ids), "activeComments": len(db_ids) - deleted_count,
             "deletedComments": deleted_count,
             "materialIds": len(material_ids) if material_ids is not None else None,
@@ -5833,6 +6016,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
             "AI情绪判断": text(note.get("postSentiment"), 80), "帖子好坏": text(note.get("postSentiment"), 80),
             "访问状态": "可打开",
+            "帖子状态": POST_STATUS_PRESENT,
         }
         for name, value in note_fields.items():
             set_note_value(name, value)
@@ -5937,7 +6121,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
             "图片数量", "发布日期", "来源词", "笔记ID", "博主ID",
             "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "帖子好坏",
-            "访问状态", "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型",
+            "访问状态", "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "帖子状态",
         ]
         comment_headers = [
             "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
@@ -6087,7 +6271,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "byStatus": by_status, "items": normalized}
 
     def set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Persist one sync run's reachability results in one CSV transaction."""
+        """Persist reachability and post-presence results without deleting history."""
         raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
         labels = {"ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""}
         deduplicated: dict[str, dict[str, Any]] = {}
@@ -6114,10 +6298,11 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             })
         notes_path, _comments_path = self._csv_paths()
         headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
-        if "访问状态" not in headers:
-            headers.append("访问状态")
-            for row in rows:
-                row["访问状态"] = ""
+        for required, default in (("访问状态", ""), ("帖子状态", POST_STATUS_PRESENT)):
+            if required not in headers:
+                headers.append(required)
+                for row in rows:
+                    row[required] = default
         rows_by_id: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             row_id = valid_note_id(row.get("笔记ID"))
@@ -6126,37 +6311,71 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         with self.pull_lock:
             with self.lock, self._session() as db:
                 for item in normalized:
-                    stored = db.execute("SELECT title,access_status FROM notes WHERE note_id=?", (item["noteId"],)).fetchone()
+                    stored = db.execute(
+                        """SELECT title,access_status,post_status,is_deleted,deleted_at,media_dir
+                           FROM notes WHERE note_id=?""",
+                        (item["noteId"],),
+                    ).fetchone()
                     if not stored:
                         raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
                     item["previousStatus"] = text(stored["access_status"], 40)
+                    item["previousPostStatus"] = post_status_label(stored["post_status"], stored["is_deleted"])
+                    item["postStatus"] = (
+                        POST_STATUS_DELETED if item["status"] == "unreachable"
+                        else POST_STATUS_PRESENT if item["status"] == "ok"
+                        else item["previousPostStatus"]
+                    )
+                    item["isDeleted"] = item["postStatus"] == POST_STATUS_DELETED
+                    item["deletedAt"] = (
+                        text(stored["deleted_at"], 80) or item["checkedAt"] if item["isDeleted"] else ""
+                    )
+                    item["mediaDir"] = text(stored["media_dir"], 4000)
                     item["title"] = text(stored["title"], 1000)
                     matched = rows_by_id.get(item["noteId"], [])
                     for row in matched:
                         row["访问状态"] = item["excelStatus"]
+                        row["帖子状态"] = item["postStatus"]
                     item["excelRows"] = len(matched)
-            self._replace_csv_table(notes_path, headers, rows, "access")
+            self._replace_csv_table(notes_path, headers, rows, "access-presence")
             with self.lock, self._session() as db:
                 for item in normalized:
+                    presence_confirmed = item["status"] in {"ok", "unreachable"}
                     db.execute(
-                        """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?
+                        """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?,
+                           post_status=?,is_deleted=?,
+                           deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ? WHEN ?=0 THEN '' ELSE deleted_at END,
+                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
                            WHERE note_id=?""",
-                        (item["status"], item["error"], item["checkedAt"], item["result"], item["noteId"]),
+                        (item["status"], item["error"], item["checkedAt"], item["result"],
+                         item["postStatus"], int(item["isDeleted"]), int(item["isDeleted"]), item["checkedAt"],
+                         int(item["isDeleted"]), int(presence_confirmed), item["checkedAt"], item["noteId"]),
                     )
                     previous, current = item.get("previousStatus") or "", item["status"]
-                    if previous != current and bool(previous or current in {"check_failed", "unreachable"}):
+                    previous_post, current_post = item["previousPostStatus"], item["postStatus"]
+                    if previous != current or previous_post != current_post:
                         human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
+                        summary = f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}"
+                        if previous_post != current_post:
+                            summary += f"；帖子状态：{previous_post} → {current_post}（本地记录保留）"
                         db.execute(
                             """INSERT INTO change_events
                                (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
                                VALUES (?,?,?,?,?,?,?,?)""",
                             (max(0, int(payload.get("runId") or 0)), item["noteId"], "access_status_changed",
-                             item.get("title") or "", f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}",
-                             json.dumps({"status": previous}, ensure_ascii=False),
-                             json.dumps({"status": current, "error": item["error"]}, ensure_ascii=False), item["checkedAt"]),
+                             item.get("title") or "", summary,
+                             json.dumps({"status": previous, "postStatus": previous_post}, ensure_ascii=False),
+                             json.dumps({"status": current, "postStatus": current_post,
+                                         "error": item["error"]}, ensure_ascii=False), item["checkedAt"]),
                         )
+            for item in normalized:
+                if item["status"] in {"ok", "unreachable"}:
+                    self._write_material_note_presence(
+                        item["noteId"], item.get("mediaDir") or "", item["postStatus"],
+                        item["checkedAt"], item.get("deletedAt") or "",
+                    )
         by_status = dict(Counter(item["status"] for item in normalized))
         return {"ok": True, "updated": len(normalized), "excelRows": sum(item["excelRows"] for item in normalized),
+                "markedDeleted": sum(bool(item["isDeleted"]) for item in normalized),
                 "byStatus": by_status, "items": normalized, "path": str(notes_path)}
 
     def set_note_access_status(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -6164,6 +6383,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         item = result["items"][0]
         return {"ok": True, "noteId": item["noteId"], "accessStatus": item["status"],
                 "excelStatus": item["excelStatus"], "excelRows": item["excelRows"],
+                "postStatus": item["postStatus"], "isDeleted": item["isDeleted"],
                 "checkedAt": item["checkedAt"]}
 
     def reconcile_legacy_access_statuses(self) -> dict[str, Any]:
@@ -6185,40 +6405,38 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
     def list_unreachable_notes(self) -> list[dict[str, Any]]:
         with self.lock, self._session() as db:
             rows = db.execute(
-                """SELECT note_id,title,url,access_error,last_access_checked_at
+                """SELECT note_id,title,url,access_error,last_access_checked_at,
+                          post_status,is_deleted,deleted_at,last_presence_checked_at
                    FROM notes WHERE access_status='unreachable' AND status<>'ignored'
                    ORDER BY last_access_checked_at DESC, first_seen_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
 
     def delete_unreachable_notes(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Delete every note marked unreachable, including comments and managed media."""
+        """Legacy endpoint: retain unreachable posts and mark them deleted instead of purging rows."""
         targets = self.list_unreachable_notes()
-        deleted: list[dict[str, Any]] = []
-        failures: list[dict[str, Any]] = []
-        for item in targets:
-            try:
-                result = self.delete_pulled_note({"noteId": item["note_id"]})
-                deleted.append({"noteId": item["note_id"], "title": item.get("title") or "", **result})
-            except Exception as exc:
-                failures.append({
-                    "noteId": item["note_id"],
-                    "title": item.get("title") or "",
-                    "error": text(exc, 1000),
-                })
+        if not targets:
+            return {"ok": True, "targetCount": 0, "markedDeletedCount": 0, "deletedCount": 0,
+                    "failedCount": 0, "marked": [], "deleted": [], "failures": [],
+                    "excelVerified": True, "databaseVerified": True}
+        result = self.set_note_access_statuses({"items": [
+            {"noteId": item["note_id"], "status": "unreachable", "result": "confirmed_v2",
+             "error": item.get("access_error") or "双重证据确认帖子已删除或下架"}
+            for item in targets
+        ]})
+        marked = [{"noteId": item["noteId"], "title": item.get("title") or "",
+                   "postStatus": item["postStatus"], "isDeleted": item["isDeleted"]}
+                  for item in result.get("items", [])]
         return {
-            "ok": not failures,
-            "targetCount": len(targets),
-            "deletedCount": len(deleted),
-            "failedCount": len(failures),
-            "deletedCommentRows": sum(int(item.get("deletedCommentRows", 0) or 0) for item in deleted),
-            "deletedDatabaseComments": sum(int(item.get("deletedDatabaseComments", 0) or 0) for item in deleted),
-            "deletedLinkedDatabaseRecords": sum(int(item.get("deletedLinkedDatabaseRecords", 0) or 0) for item in deleted),
-            "excelVerified": all(bool(item.get("excelVerified")) for item in deleted),
-            "databaseVerified": all(bool(item.get("databaseVerified")) for item in deleted),
-            "deleted": deleted,
-            "failures": failures,
-            "error": "；".join(item["error"] for item in failures[:3]),
+            "ok": True, "targetCount": len(targets), "markedDeletedCount": len(marked),
+            # Keep the legacy counter populated so an older loaded extension
+            # treats this non-destructive operation as successful.
+            "deletedCount": len(marked), "failedCount": 0,
+            "deletedCommentRows": 0, "deletedDatabaseComments": 0,
+            "deletedLinkedDatabaseRecords": 0,
+            "excelVerified": True, "databaseVerified": True,
+            "marked": marked, "deleted": marked, "failures": [],
+            "nonDestructive": True,
         }
 
     def _legacy_delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -6706,12 +6924,14 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 """UPDATE notes SET status='known', is_relevant=1, source='existing_xlsx', relevance_status='relevant', relevance_source='pull',
                    pull_status=?, pull_error=?, last_pull_at=?, excel_synced_at=?,
                    excel_sync_path=?, media_status=?, media_dir=?, media_file_count=?, media_error=?,
-                   access_status='ok', access_error='', last_access_checked_at=?, access_check_result='opened'
+                   access_status='ok', access_error='', last_access_checked_at=?, access_check_result='opened',
+                   post_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?
                    WHERE note_id=?""",
                 (
                     final_status, final_error, timestamp, timestamp, xlsx_result["path"],
                     media_result.get("status", "failed"), media_result.get("folder", ""),
-                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp, note_id,
+                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp,
+                    POST_STATUS_PRESENT, timestamp, note_id,
                 ),
             )
         all_local_comments = self._comments_as_api(note_id)
@@ -6723,6 +6943,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "noteId": note_id,
             "incomingNoteId": incoming_note_id,
             "status": "known",
+            "postStatus": POST_STATUS_PRESENT,
+            "isDeleted": False,
             "pullStatus": final_status,
             "commentStatus": comment_status,
             "commentError": comment_error,
@@ -6962,7 +7184,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 status = text(query.get("status", [""])[0], 30)
                 limit = int(query.get("limit", [100])[0])
-                self._send_json(200, {"ok": True, "notes": self.store.list_notes(status, limit)})
+                include_deleted = text(query.get("includeDeleted", ["true"])[0], 10).lower() not in {"0", "false", "no"}
+                self._send_json(200, {"ok": True, "includeDeleted": include_deleted,
+                                      "notes": self.store.list_notes(status, limit, include_deleted)})
             elif parsed.path == "/api/notes/unreachable":
                 notes = self.store.list_unreachable_notes()
                 self._send_json(200, {"ok": True, "count": len(notes), "notes": notes})
@@ -7033,12 +7257,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/pull":
                 result = self.store.pull_to_excel(payload)
             elif self.path == "/api/note/delete":
-                result = self.store.delete_pulled_note(payload)
+                note_id = valid_note_id(payload.get("noteId"))
+                hard_confirmed = bool(payload.get("hardDeleteConfirmed")) and text(
+                    payload.get("confirmation"), 128
+                ) == note_id
+                if hard_confirmed:
+                    result = self.store.delete_pulled_note(payload)
+                else:
+                    marked = self.store.set_note_access_status({
+                        "noteId": note_id, "status": "unreachable",
+                        "result": "manual_confirmed_deleted",
+                        "error": "用户确认帖子已删除或下架；本地记录保留",
+                    })
+                    result = {**marked, "nonDestructive": True, "markedDeletedCount": 1}
             elif self.path == "/api/note/access-status":
                 result = self.store.set_note_access_status(payload)
             elif self.path == "/api/notes/access-status/batch":
                 result = self.store.set_note_access_statuses(payload)
-            elif self.path == "/api/notes/unreachable/delete":
+            elif self.path in {"/api/notes/unreachable/delete", "/api/notes/unreachable/mark-deleted"}:
                 result = self.store.delete_unreachable_notes(payload)
             elif self.path == "/api/data-health/repair":
                 result = self.store.repair_data_health(payload)

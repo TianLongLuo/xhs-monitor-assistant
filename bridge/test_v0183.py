@@ -532,9 +532,12 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(str(folder.resolve()), result["target"])
         startfile.assert_called_once_with(str(folder.resolve()))
 
-    def test_unreachable_status_round_trip_and_bulk_delete(self):
+    def test_unreachable_status_round_trip_and_bulk_mark_keeps_all_history(self):
         note_id = "unreachable123456"
         notes_path, comments_path = self._configure_csv("unreachable")
+        media_dir = Path(self.tmp.name) / "posts_materials" / note_id
+        media_dir.mkdir(parents=True)
+        (media_dir / "image-01.jpg").write_bytes(b"image")
         note = {
             "noteId": note_id,
             "url": f"https://www.xiaohongshu.com/explore/{note_id}",
@@ -546,50 +549,66 @@ class V0183Tests(unittest.TestCase):
         comment = {
             "commentId": "comment-unreachable-1",
             "author": "评论用户",
-            "content": "即将随帖子删除",
+            "content": "需要保留的历史评论",
             "publishedAt": "08-25",
         }
         self.store.confirm(note)
         self.store.upsert_comments({
-            "noteId": note_id,
-            "comments": [comment],
-            "expectedCount": 1,
-            "status": "likely_complete",
+            "noteId": note_id, "comments": [comment], "expectedCount": 1, "status": "likely_complete",
         })
-        self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+        with self.store._session() as db:
+            db.execute("""UPDATE notes SET media_dir=?,media_status='complete',media_file_count=1
+                       WHERE note_id=?""", (str(media_dir), note_id))
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(media_dir), "files": ["image-01.jpg"]})
+        self.store._write_media_snapshot(
+            {"folder": str(media_dir), "files": ["image-01.jpg"]}, note,
+            self.store._comments_as_api(note_id),
+        )
+        note_headers, note_rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        before_row = next(row for row in note_rows if row["笔记ID"] == note_id)
+        before_row.update({"语义分析次数": "3", "分析结论是否差评": "是",
+                           "差评类型": "Price discrepancy", "差评子类型": "Felt overcharged"})
+        self.store._replace_csv_table(notes_path, note_headers, note_rows, "semantic-post")
+        with self.store._session() as db:
+            db.execute("""UPDATE notes SET semantic_analysis_count=3,analysis_is_negative='是',
+                       negative_type='Price discrepancy',negative_subtype='Felt overcharged' WHERE note_id=?""", (note_id,))
 
         marked = self.store.set_note_access_status({
-            "noteId": note_id,
-            "status": "unreachable",
-            "error": "详情页无法加载",
+            "noteId": note_id, "status": "unreachable", "error": "详情页无法加载",
         })
-        self.assertEqual("unreachable", marked["accessStatus"])
+        self.assertEqual(("unreachable", "已删除", True),
+                         (marked["accessStatus"], marked["postStatus"], marked["isDeleted"]))
         note_rows = self._csv_rows(notes_path, NOTE_CSV_HEADERS)
         matching_row = next(row for row in note_rows if row["笔记ID"] == note_id)
-        self.assertEqual("打不开", matching_row["访问状态"])
+        self.assertEqual(("打不开", "已删除"), (matching_row["访问状态"], matching_row["帖子状态"]))
+        self.assertEqual(("3", "是", "Price discrepancy", "Felt overcharged"),
+                         tuple(matching_row[name] for name in
+                               ("语义分析次数", "分析结论是否差评", "差评类型", "差评子类型")))
         self.assertEqual(note_id, self.store.list_unreachable_notes()[0]["note_id"])
+        material_note = json.loads((media_dir / "note.json").read_text(encoding="utf-8"))
+        self.assertTrue(material_note["isDeleted"])
+        self.assertEqual("已删除", material_note["postStatus"])
 
         cleared = self.store.set_note_access_status({"noteId": note_id, "status": "ok"})
-        self.assertEqual("ok", cleared["accessStatus"])
+        self.assertEqual(("ok", "存在", False),
+                         (cleared["accessStatus"], cleared["postStatus"], cleared["isDeleted"]))
         self.assertEqual([], self.store.list_unreachable_notes())
         headers, note_rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
-        next(row for row in note_rows if row["笔记ID"] == note_id)["访问状态"] = "打不开"
+        row = next(row for row in note_rows if row["笔记ID"] == note_id)
+        row["访问状态"] = "打不开"
+        row["帖子状态"] = "存在"
         self.store._replace_csv_table(notes_path, headers, note_rows, "manual")
         self.store.seed_from_xlsx(notes_path)
         self.assertEqual([], self.store.list_unreachable_notes())
         with self.store._session() as db:
-            self.assertEqual("check_failed", db.execute(
-                "SELECT access_status FROM notes WHERE note_id=?", (note_id,)
-            ).fetchone()[0])
+            self.assertEqual(("check_failed", "存在", 0), tuple(db.execute(
+                "SELECT access_status,post_status,is_deleted FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()))
         migrated = self.store.reconcile_legacy_access_statuses()
         self.assertEqual(1, migrated["updated"])
-        note_rows = self._csv_rows(notes_path, NOTE_CSV_HEADERS)
-        self.assertEqual("待复核", next(row for row in note_rows if row["笔记ID"] == note_id)["访问状态"])
 
         self.store.set_note_access_status({
-            "noteId": note_id,
-            "status": "unreachable",
-            "error": "两条独立证据确认内容已删除",
+            "noteId": note_id, "status": "unreachable", "error": "两条独立证据确认内容已删除",
         })
         with self.store._session() as db:
             db.execute(
@@ -605,32 +624,34 @@ class V0183Tests(unittest.TestCase):
                 (note_id, "2026-08-26T16:00:00+08:00"),
             )
             db.execute(
-                "INSERT INTO change_events(note_id,event_type,created_at) VALUES(?,'access_status',?)",
-                (note_id, "2026-08-26T16:00:00+08:00"),
-            )
-            db.execute(
                 "INSERT INTO watchlist(note_id,created_at,updated_at) VALUES(?,?,?)",
                 (note_id, "2026-08-26T16:00:00+08:00", "2026-08-26T16:00:00+08:00"),
             )
 
-        deleted = self.store.delete_unreachable_notes({})
-        self.assertTrue(deleted["ok"])
-        self.assertEqual(1, deleted["deletedCount"])
-        self.assertEqual(1, deleted["deletedDatabaseComments"])
-        self.assertTrue(deleted["excelVerified"])
-        self.assertTrue(deleted["databaseVerified"])
-        self.assertGreaterEqual(deleted["deletedLinkedDatabaseRecords"], 5)
+        result = self.store.delete_unreachable_notes({})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["nonDestructive"])
+        self.assertEqual((1, 0), (result["markedDeletedCount"], result["deletedDatabaseComments"]))
         with self.store._session() as db:
-            self.assertIsNone(db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone())
-            for table in ("comments", "note_summaries", "reply_generation_history", "comment_collection_jobs", "change_events", "watchlist"):
-                self.assertEqual(0, db.execute(f"SELECT COUNT(*) FROM {table} WHERE note_id=?", (note_id,)).fetchone()[0])
-            self.assertEqual(0, db.execute(
+            self.assertEqual(("已删除", 1), tuple(db.execute(
+                "SELECT post_status,is_deleted FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()))
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)
+            ).fetchone()[0])
+            for table in ("note_summaries", "reply_generation_history", "watchlist"):
+                self.assertEqual(1, db.execute(f"SELECT COUNT(*) FROM {table} WHERE note_id=?", (note_id,)).fetchone()[0])
+            self.assertEqual(1, db.execute(
                 "SELECT COUNT(*) FROM ai_analysis_records WHERE target_id=?", (note_id,)
             ).fetchone()[0])
         note_ids = {row["笔记ID"] for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)}
         comment_ids = {row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
-        self.assertNotIn(note_id, note_ids)
-        self.assertNotIn(comment["commentId"], comment_ids)
+        self.assertIn(note_id, note_ids)
+        self.assertIn(comment["commentId"], comment_ids)
+        self.assertTrue(media_dir.is_dir())
+        health = self.store.data_health()
+        self.assertTrue(health["summary"]["relationshipsConsistent"])
+        self.assertEqual(1, health["summary"]["deletedPosts"])
 
     def test_relationship_repair_rebuilds_fragments_and_marks_orphans(self):
         known_id = "knownnote123"

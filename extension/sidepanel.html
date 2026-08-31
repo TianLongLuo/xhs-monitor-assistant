@@ -135,10 +135,10 @@
           <button id="retryBatchFailures" class="batch-sync-progress__retry" type="button" hidden>重新核验失败项</button>
         </section>
         <button id="deleteUnreachable" class="unreachable-delete-button" type="button" disabled>
-          <span class="unreachable-delete-button__glyph" aria-hidden="true">×</span>
+          <span class="unreachable-delete-button__glyph" aria-hidden="true">✓</span>
           <span class="unreachable-delete-button__copy">
-            <strong id="deleteUnreachableLabel">删除打不开帖子</strong>
-            <small id="unreachableHint">仅删除经双重证据确认失效的帖子及关联数据</small>
+            <strong id="deleteUnreachableLabel">标记已删除帖子</strong>
+            <small id="unreachableHint">只更新帖子状态，保留 CSV、SQLite、评论和素材</small>
           </span>
           <span id="unreachableCount" class="unreachable-delete-button__count">0</span>
         </button>

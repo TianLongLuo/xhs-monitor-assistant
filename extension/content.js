@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.25.2";
+  const CONTENT_VERSION = "0.25.3";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -1825,6 +1825,7 @@
       const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
       const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
       const pulled = result.inExcel || ["synced", "partial"].includes(result.pullStatus);
+      const postDeleted = Boolean(result.isDeleted || result.postStatus === "已删除");
       if (pulled) {
         const storedNote = { ...note, ...(result.note || {}), noteId: note.noteId,
           mediaDir: result.mediaDir || result.note?.mediaDir || "",
@@ -1846,13 +1847,13 @@
         panel._processNote = storedNote;
         panel.dataset.mode = "done";
         panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
-        if (document.visibilityState === "visible" && !isBatchAutomationSurface()) {
+        if (!postDeleted && document.visibilityState === "visible" && !isBatchAutomationSurface()) {
           auditPulledComments(panel, storedNote).catch(() => {});
         }
       }
-      const pullLabel = pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
-      if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
-      if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = pulled ? "pulled" : "missing"; }
+      const pullLabel = postDeleted ? "帖子已删除·数据保留" : pulled ? (result.pullStatus === "partial" ? "部分拉取" : "已拉取") : "未拉取";
+      if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = postDeleted ? "deleted" : pulled ? "pulled" : "missing"; }
+      if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = postDeleted ? "deleted" : pulled ? "pulled" : "missing"; }
       const rel = result.relevanceStatus || "unknown";
       const relevanceLabel = rel === "relevant" ? "相关" : rel === "irrelevant" ? "不相关" : "相关性未知";
       if (relevance) { relevance.textContent = `相关性：${relevanceLabel.replace("相关性", "")}`; relevance.dataset.state = rel; }
@@ -2467,7 +2468,7 @@
       "xhs-monitor-card--new", "xhs-monitor-card--known",
       "xhs-monitor-card--confirmed", "xhs-monitor-card--ignored",
       "xhs-monitor-card--unrelated", "xhs-monitor-card--unloaded",
-      "xhs-monitor-card--partial",
+      "xhs-monitor-card--partial", "xhs-monitor-card--deleted",
       "xhs-monitor-card--pulling",
       "xhs-monitor-card--relevance-relevant", "xhs-monitor-card--relevance-irrelevant",
       "xhs-monitor-card--relevance-unknown",
@@ -2483,6 +2484,7 @@
     known: { label: "CSV 已有", hint: "已存在于本地笔记 CSV 总表" },
     confirmed: { label: "已加入拉取", hint: "已加入本地拉取队列，当前仍未写入 CSV" },
     partial: { label: "部分拉取", hint: "正文已保存，但图片或评论仍可重试" },
+    deleted: { label: "帖子已删除", hint: "平台帖子已确认删除或下架；CSV、SQLite、评论和素材仍完整保留" },
     pulling: { label: "拉取中…", hint: "正在当前小红书页面读取正文、图片和评论" },
     ignored: { label: "已忽略", hint: "已从新相关帖子列表移除" }
   };
@@ -2510,11 +2512,12 @@
     if (["partial", "failed"].includes(pullStatus)) state = "partial";
     if (pullStatus === "pulling" || pullingNoteIds.has(note.noteId)) state = "pulling";
     if (status?.inExcel) state = "known";
+    if (status?.isDeleted || status?.postStatus === "已删除") state = "deleted";
     const relevanceStatus = status?.relevanceStatus || (status?.inExcel || status?.isRelevant ? "relevant" : "unknown");
     const relevanceAnalyzing = relevanceAnalyzingNoteIds.has(note.noteId);
     const meta = STATE_META[state];
     const matchLabel = status?.matchLabel || "";
-    const expectedKey = `${note.noteId}|${state}|${matchLabel}|${pullStatus}|${relevanceStatus}|${relevanceAnalyzing}`;
+    const expectedKey = `${note.noteId}|${state}|${matchLabel}|${pullStatus}|${relevanceStatus}|${relevanceAnalyzing}|${status?.postStatus || ""}`;
     const existing = card.querySelector(`:scope > .${TOOLBAR_CLASS}`);
     if (existing?.dataset.renderKey === expectedKey) return;
 
@@ -2559,7 +2562,7 @@
     }
 
     if (state !== "known" && state !== "ignored") {
-      toolbar.append(makeAction(state === "partial" ? "重试拉取" : "拉取", "xhs-monitor-action--pull", async (event) => {
+      toolbar.append(makeAction(state === "partial" ? "重试拉取" : state === "deleted" ? "重新核验" : "拉取", "xhs-monitor-action--pull", async (event) => {
         event.preventDefault(); event.stopPropagation();
         toolbar.querySelectorAll("button").forEach((button) => { button.disabled = true; });
         pullingNoteIds.add(note.noteId);
@@ -2602,6 +2605,8 @@
       mediaStatus: "not_started",
       mediaDir: "",
       mediaFileCount: 0,
+      postStatus: "存在",
+      isDeleted: false,
       identityConflictBlocked: true
     };
   }
@@ -2796,8 +2801,10 @@
         if (pull) { pull.textContent = `拉取状态：${pullLabel}`; pull.dataset.state = pulled ? "pulled" : "missing"; }
         if (headPull) { headPull.textContent = pullLabel; headPull.dataset.state = pulled ? "pulled" : "missing"; }
         if (status) status.textContent = message.deleted
-          ? "本地帖子已删除，可重新拉取"
-          : "CSV、SQLite 与素材快照已同步";
+          ? "本地帖子已彻底清除，可重新拉取"
+          : freshStatus.isDeleted || freshStatus.postStatus === "已删除"
+            ? "帖子已删除或下架；CSV、SQLite、评论和素材均已保留"
+            : "CSV、SQLite 与素材快照已同步";
         refreshProcessPanelStatus(processPanel, note).catch(() => {});
       }
       scheduleScan(60);
@@ -2813,6 +2820,7 @@
       panel._autoDock = true;
       panel._detailOpened = true;
       const pulled = statusResult.inExcel || ["synced", "partial"].includes(statusResult.pullStatus);
+      const postDeleted = Boolean(statusResult.isDeleted || statusResult.postStatus === "已删除");
       if (pulled) {
         renderProcessPanel({
           process: true, noteId: note.noteId, note,
@@ -2828,8 +2836,12 @@
         const headPull = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
         const headRelevance = panel.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--relevance`);
         if (headPull) {
-          headPull.textContent = statusResult.pullStatus === "partial" ? "部分拉取" : "已拉取";
-          headPull.dataset.state = "pulled";
+          headPull.textContent = postDeleted ? "帖子已删除·数据保留" : statusResult.pullStatus === "partial" ? "部分拉取" : "已拉取";
+          headPull.dataset.state = postDeleted ? "deleted" : "pulled";
+        }
+        const panelStatus = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+        if (panelStatus && postDeleted) {
+          panelStatus.textContent = "帖子已删除或下架；CSV、SQLite、评论和素材均已保留";
         }
         const relevance = statusResult.relevanceStatus || "unknown";
         if (headRelevance) {
