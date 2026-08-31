@@ -2096,7 +2096,7 @@ elements.generateWeeklyReport?.addEventListener("click", async () => {
     if (!generated?.ok) throw new Error(generated?.error || "周报生成失败");
     await refreshWeeklyReport();
     setStatus("周报已生成，可打开网页版或 Excel", "success");
-    showToast("ORIGANI 舆情周报生成完成");
+    showToast("小红书舆情周报生成完成");
   } catch (error) { setStatus(error.message || "周报生成失败", "error"); }
   finally { elements.generateWeeklyReport.disabled = false; elements.generateWeeklyReport.textContent = "生成周报"; }
 });
