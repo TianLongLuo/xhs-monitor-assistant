@@ -242,6 +242,26 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(1, result["removedCount"])
         self.assertEqual("comment-old", result["removedComments"][0]["commentId"])
 
+    def test_different_comment_ids_never_merge_even_when_text_matches(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        _notes_path, comments_path = self._configure_csv("strict-comment-id")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        replacement = {**old, "commentId": "comment-new-identity"}
+        compared = self.store.compare_comments({
+            "noteId": note["noteId"], "comments": [replacement, kept],
+            "expectedCount": 2, "status": "likely_complete",
+        })
+        self.assertEqual((1, 1), (compared["newCount"], compared["removedCount"]))
+        self.assertEqual("comment-old", compared["removedComments"][0]["commentId"])
+        self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [replacement, kept],
+            "expectedCount": 2, "status": "likely_complete",
+        })
+        rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual({"comment-old", "comment-kept", "comment-new-identity"}, set(rows))
+        self.assertEqual("已删除", rows["comment-old"]["评论状态"])
+        self.assertEqual("存在", rows["comment-new-identity"]["评论状态"])
+
     def test_partial_comment_compare_never_confirms_deletion(self):
         note, _old, kept = self._seed_pulled_note_with_comments()
         result = self.store.compare_comments({

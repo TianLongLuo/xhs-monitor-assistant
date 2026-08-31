@@ -2456,10 +2456,14 @@ class MonitorStore:
         new_comments: list[dict[str, Any]] = []
         changed_comments: list[dict[str, Any]] = []
         for row in current:
-            index = by_id.get(row["commentId"]) if row["commentId"] else None
-            if index is None:
+            supplied_id = row["commentId"]
+            index = by_id.get(supplied_id) if supplied_id else None
+            # A supplied comment ID is an opaque stable primary key. Never
+            # merge two different IDs merely because author/text/time match.
+            # Text fallbacks are reserved for legacy snapshots with no ID.
+            if index is None and not supplied_id:
                 index = by_exact.get((row["author"], row["content"], row["publishedAt"]))
-            if index is None:
+            if index is None and not supplied_id:
                 index = by_loose.get((row["author"], row["content"]))
             if index is None:
                 new_comments.append(row)
@@ -6054,13 +6058,14 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         for item in comments:
             if not isinstance(item, dict) or not text(item.get("content"), 8000):
                 continue
+            supplied_id = text(item.get("commentId"), 256)
             generated_id = self._excel_comment_id(note_id, item)
             key = (note_url_identity(note_url) or note_id, text(item.get("author"), 500),
                    text(item.get("content"), 8000), text(item.get("publishedAt"), 100))
             row_index = by_id.get(generated_id)
-            if row_index is None:
+            if row_index is None and not supplied_id:
                 row_index = by_key.get(key)
-            if row_index is None:
+            if row_index is None and not supplied_id:
                 row_index = by_loose.get(key[:3])
             is_new_comment = row_index is None
             if is_new_comment:
