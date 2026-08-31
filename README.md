@@ -2,7 +2,7 @@
 
 Chrome Manifest V3 扩展 + 本地 Native Messaging Bridge。扩展读取当前页面已经加载的 DOM，将帖子、评论和图片写入本地 UTF-8 CSV / SQLite，并可调用 AI 进行分析。
 
-当前版本：`0.25.1`
+当前版本：`0.25.2`
 
 当前状态与完整需求见 [小红书舆情监控助手_PRD.md](小红书舆情监控助手_PRD.md)。
 
@@ -224,3 +224,11 @@ powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 - 扫描、拉取、CSV 写入三层均只按小红书笔记 ID 判断身份；前端同时拦截 `matchedNoteId` 不一致的旧返回。
 - 已拉取帖的轻量卡片扫描不再覆盖完整 `payload_json`；历史 `undefined` 或串帖快照会按 SQLite 主键安全归一并归档。
 - 数据体检增加 SQLite 帖子快照 ID/URL 串帖检查。
+
+## v0.25.2：语义分析字段与评论存续状态
+
+- 接纳笔记/评论 CSV 新增的 `语义分析次数`、`分析结论是否差评`、`差评类型`、`差评子类型`，并与 SQLite 双向保持一致。
+- 评论 CSV 新增 `评论状态`，值固定为 `存在` 或 `已删除`；现有历史评论默认初始化为 `存在`。
+- 完整评论同步不再物理删除消失评论，而是保留正文和语义分析字段并标记 `已删除`；评论重新出现时自动恢复为 `存在`。
+- 部分加载、扫码、风控或评论未展开完整时不会误标删除；只有 `likely_complete` 快照才允许更新删除状态。
+- SQLite 和素材 `comments.json` 同步保存评论状态、删除时间、最近核验时间及语义分类，数据体检核对 ID、状态和语义字段。

@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.25.1";
+  const CONTENT_VERSION = "0.25.2";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -1630,7 +1630,7 @@
     card.dataset.kind = kind;
     const label = document.createElement("span");
     label.className = `${PROCESS_PANEL_CLASS}__change-kind`;
-    label.textContent = kind === "new" ? "新增" : kind === "removed" ? "已消失" : "内容变化";
+    label.textContent = kind === "new" ? "新增" : kind === "removed" ? "标记已删除" : "内容变化";
     const author = document.createElement("strong");
     author.textContent = clean(row.author, 120) || "未知用户";
     const content = document.createElement("p");
@@ -1669,14 +1669,14 @@
     title.textContent = "评论区有变化";
     const count = document.createElement("span");
     count.className = `${PROCESS_PANEL_CLASS}__change-count`;
-    count.textContent = `新增 ${result.newCount || 0} · 消失 ${result.removedCount || 0} · 修改 ${result.changedCount || 0}`;
+    count.textContent = `新增 ${result.newCount || 0} · 标记删除 ${result.removedCount || 0} · 修改 ${result.changedCount || 0}`;
     head.append(title, count);
 
     const intro = document.createElement("p");
     intro.className = `${PROCESS_PANEL_CLASS}__change-intro`;
     intro.textContent = result.canPrune
       ? "已展开全部可见评论并与本地 CSV / 数据库完成对比。"
-      : "已发现新内容；部分回复仍未完整加载，暂不删除本地疑似消失评论。";
+      : "已发现新内容；部分回复仍未完整加载，暂不把疑似消失评论标记为已删除。";
 
     const list = document.createElement("div");
     list.className = `${PROCESS_PANEL_CLASS}__change-list`;
@@ -1710,11 +1710,11 @@
           section.dataset.state = "updated";
           setProcessLatest(panel);
           const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
-          if (status) status.textContent = `评论同步成功：新增 ${response.newCount || 0}，移除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}`;
+          if (status) status.textContent = `评论同步成功：新增 ${response.newCount || 0}，标记已删除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}`;
           panel._commentAuditDone = true;
           panel._commentAudit = { ...result, synced: response };
           panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
-          showPageToast(`评论同步成功 · 新增 ${response.newCount || 0} · 移除 ${response.removedCount || 0} · 修改 ${response.changedCount || 0}`);
+          showPageToast(`评论同步成功 · 新增 ${response.newCount || 0} · 标记已删除 ${response.removedCount || 0} · 修改 ${response.changedCount || 0}`);
           return response;
         } catch (error) {
           button.disabled = false;

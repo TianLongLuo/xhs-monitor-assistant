@@ -124,7 +124,8 @@ def repair_relationship_rows(
     """
     note_headers = list(dict.fromkeys([*note_headers, "笔记ID"]))
     comment_headers = list(dict.fromkeys([
-        "笔记ID", *[name for name in comment_headers if name != "笔记ID"], "映射状态", "映射备注",
+        "笔记ID", *[name for name in comment_headers if name != "笔记ID"],
+        "映射状态", "映射备注", "评论状态",
     ]))
     notes = [{name: "" if row.get(name) is None else str(row.get(name)) for name in note_headers}
              for row in note_rows]
@@ -203,6 +204,8 @@ def repair_relationship_rows(
             fixed_comment_urls += 1
             note_id = explicit_id
         row["笔记ID"] = note_id
+        if not value(row.get("评论状态")):
+            row["评论状态"] = "存在"
         note_row = note_by_id.get(note_id)
         if note_row:
             note_url = value(note_row.get("笔记url"))

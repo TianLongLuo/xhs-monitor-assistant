@@ -507,7 +507,7 @@ function renderBatchSync(state = {}, notify = false) {
       || (view.done ? "已完成所有可访问帖子的评论核对" : "正在读取已拉取帖子列表…");
   }
   if (elements.batchSyncStats) {
-    elements.batchSyncStats.textContent = `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`;
+    elements.batchSyncStats.textContent = `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 标记删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`;
   }
   renderBatchFailures(view.failures);
   if (elements.cancelBatchSync) {
@@ -861,12 +861,12 @@ function renderChangeEvents(result) {
   const byType = result?.byType || {};
   renderOperationsMetrics(elements.changeMetrics, [
     ["新增评论", byType.comment_added || 0],
-    ["删除评论", byType.comment_removed || 0],
+    ["标记删除评论", byType.comment_removed || 0],
     ["帖子/状态变化", (byType.note_fields_changed || 0) + (byType.access_status_changed || 0)]
   ]);
   elements.changeList.replaceChildren();
   const labels = {
-    comment_added: "新增", comment_removed: "删除", comment_changed: "修改",
+    comment_added: "新增", comment_removed: "标记删除", comment_changed: "修改",
     note_fields_changed: "帖子", access_status_changed: "状态"
   };
   const events = Array.isArray(result?.events) ? result.events : [];

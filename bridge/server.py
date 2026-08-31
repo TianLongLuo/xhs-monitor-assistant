@@ -43,18 +43,22 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.25.1"
+VERSION = "0.25.2"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
     "图片数量", "发布日期", "来源词", "笔记ID", "博主ID", "对应帖子文件夹地址",
     "文件夹内清单", "AI情绪判断", "帖子好坏", "访问状态",
+    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型",
 ]
 COMMENT_CSV_HEADERS = [
     "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
     "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
     "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "映射状态", "映射备注",
+    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "评论状态",
 ]
+COMMENT_STATUS_PRESENT = "存在"
+COMMENT_STATUS_DELETED = "已删除"
 CSV_ENCODING = "utf-8-sig"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
@@ -344,6 +348,24 @@ def bool_value(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return text(value, 20).casefold() in {"1", "true", "yes", "y", "是"}
+
+
+def nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(float(text(value, 40) or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def comment_status_label(value: Any, is_deleted: Any = None) -> str:
+    raw = text(value, 40).strip().casefold()
+    deleted_values = {"已删除", "删除", "不存在", "否", "deleted", "missing", "removed", "0", "false"}
+    present_values = {"存在", "仍存在", "是", "present", "exists", "active", "1", "true"}
+    if raw in deleted_values or (not raw and bool_value(is_deleted)):
+        return COMMENT_STATUS_DELETED
+    if raw in present_values:
+        return COMMENT_STATUS_PRESENT
+    return COMMENT_STATUS_PRESENT
 
 
 def sentiment_label(value: Any) -> str:
@@ -720,15 +742,22 @@ class MonitorStore:
                 self._replace_csv_table(path, defaults, [], "initialize")
                 continue
             encoding = self._csv_source_encoding(path)
-            if encoding == CSV_ENCODING:
+            with path.open("r", encoding=encoding, newline="") as stream:
+                actual_headers = [str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()]
+            missing_headers = [name for name in defaults if name not in actual_headers]
+            if encoding == CSV_ENCODING and not missing_headers:
                 continue
             headers, rows = self._read_csv_table(path, defaults)
+            if path == comments_path:
+                for row in rows:
+                    row["评论状态"] = comment_status_label(row.get("评论状态"))
+            purpose = "normalize-schema" if missing_headers else "normalize-encoding"
             try:
-                self._replace_csv_table(path, headers, rows, "normalize-encoding")
+                self._replace_csv_table(path, headers, rows, purpose)
             except ValueError as exc:
                 # Keep the Bridge usable when WPS is still editing the file;
-                # reads continue with the detected encoding and the next write/restart retries.
-                print(f"[bridge] CSV 编码等待规范化：{path} ({exc})", flush=True)
+                # reads continue and the next write/restart retries the schema/encoding normalization.
+                print(f"[bridge] CSV 结构或编码等待规范化：{path} ({exc})", flush=True)
 
     def migrate_legacy_workbook(self, xlsx_path: Path) -> dict[str, Any]:
         """Losslessly split the legacy workbook into notes/comments UTF-8 CSV files."""
@@ -915,6 +944,10 @@ class MonitorStore:
                 "access_error": "TEXT NOT NULL DEFAULT ''",
                 "last_access_checked_at": "TEXT NOT NULL DEFAULT ''",
                 "access_check_result": "TEXT NOT NULL DEFAULT ''",
+                "semantic_analysis_count": "INTEGER NOT NULL DEFAULT 0",
+                "analysis_is_negative": "TEXT NOT NULL DEFAULT ''",
+                "negative_type": "TEXT NOT NULL DEFAULT ''",
+                "negative_subtype": "TEXT NOT NULL DEFAULT ''",
             }
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(notes)").fetchall()}
             for column, definition in note_migrations.items():
@@ -969,6 +1002,14 @@ class MonitorStore:
                     review_note TEXT NOT NULL DEFAULT '',
                     manual_negative INTEGER NOT NULL DEFAULT 0,
                     last_ai_analyzed_at TEXT NOT NULL DEFAULT '',
+                    semantic_analysis_count INTEGER NOT NULL DEFAULT 0,
+                    analysis_is_negative TEXT NOT NULL DEFAULT '',
+                    negative_type TEXT NOT NULL DEFAULT '',
+                    negative_subtype TEXT NOT NULL DEFAULT '',
+                    comment_status TEXT NOT NULL DEFAULT '存在',
+                    is_deleted INTEGER NOT NULL DEFAULT 0,
+                    deleted_at TEXT NOT NULL DEFAULT '',
+                    last_presence_checked_at TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(note_id) REFERENCES notes(note_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_comments_identity_full
@@ -1136,6 +1177,27 @@ class MonitorStore:
             # distinct comments that happened to share author/text/time.
             db.execute("DROP INDEX IF EXISTS idx_comments_identity_full")
             db.execute("CREATE INDEX idx_comments_identity_full ON comments(note_id,author,content,published_at,parent_comment_id)")
+            comment_migrations = {
+                "semantic_analysis_count": "INTEGER NOT NULL DEFAULT 0",
+                "analysis_is_negative": "TEXT NOT NULL DEFAULT ''",
+                "negative_type": "TEXT NOT NULL DEFAULT ''",
+                "negative_subtype": "TEXT NOT NULL DEFAULT ''",
+                "comment_status": "TEXT NOT NULL DEFAULT '存在'",
+                "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+                "deleted_at": "TEXT NOT NULL DEFAULT ''",
+                "last_presence_checked_at": "TEXT NOT NULL DEFAULT ''",
+            }
+            comment_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(comments)").fetchall()}
+            for column, definition in comment_migrations.items():
+                if column not in comment_columns:
+                    db.execute(f"ALTER TABLE comments ADD COLUMN {column} {definition}")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_comments_semantic_negative ON comments(analysis_is_negative, negative_type)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_comments_presence ON comments(is_deleted, note_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_semantic_negative ON notes(analysis_is_negative, negative_type)")
+            db.execute("""UPDATE comments SET is_deleted=1
+                WHERE comment_status IN ('已删除','删除','不存在','deleted','missing','removed')""")
+            db.execute("UPDATE comments SET comment_status=CASE WHEN is_deleted=1 THEN ? ELSE ? END",
+                       (COMMENT_STATUS_DELETED, COMMENT_STATUS_PRESENT))
 
             # Backfill identity keys for databases created before content-based
             # matching was introduced.
@@ -1434,6 +1496,12 @@ class MonitorStore:
         headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
         if "笔记ID" not in headers:
             raise ValueError("笔记 CSV 缺少笔记ID列")
+        source_encoding = self._csv_source_encoding(notes_path)
+        with notes_path.open("r", encoding=source_encoding, newline="") as stream:
+            actual_headers = {str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()}
+        semantic_headers_present = all(name in actual_headers for name in (
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型"
+        ))
         inserted = 0
         timestamp = now_iso()
         with self.lock, self._session() as db:
@@ -1499,12 +1567,116 @@ class MonitorStore:
                          access_result, timestamp, str(notes_path)),
                     )
                     inserted += 1
+                if semantic_headers_present:
+                    db.execute(
+                        """UPDATE notes SET semantic_analysis_count=?,analysis_is_negative=?,
+                           negative_type=?,negative_subtype=? WHERE note_id=?""",
+                        (nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                         text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000), note_id),
+                    )
                 if row_media_dir:
                     db.execute(
                         "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
                         (row_media_dir, len(row_files), note_id),
                     )
         return inserted
+
+    def _seed_comments_from_csv(self, comments_path: Path) -> dict[str, int]:
+        """Import user-maintained comment metadata without deleting SQLite-only rows."""
+        headers, rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        source_encoding = self._csv_source_encoding(comments_path)
+        with comments_path.open("r", encoding=source_encoding, newline="") as stream:
+            actual_headers = {str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()}
+        semantic_headers_present = all(name in actual_headers for name in (
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型"
+        ))
+        presence_header_present = "评论状态" in actual_headers
+        timestamp = now_iso()
+        inserted = 0
+        updated = 0
+        with self.lock, self._session() as db:
+            note_ids = {str(row[0]) for row in db.execute("SELECT note_id FROM notes").fetchall()}
+            for row in rows:
+                note_id = csv_comment_note_id(row)
+                comment_id = text(row.get("笔记评论ID"), 256)
+                content_value = text(row.get("评论内容"), 8000)
+                if not note_id or note_id not in note_ids or not comment_id or not content_value:
+                    continue
+                api = self._csv_comment_to_api(row)
+                status_label = comment_status_label(row.get("评论状态"))
+                is_deleted = int(status_label == COMMENT_STATUS_DELETED)
+                existing = db.execute(
+                    "SELECT payload_json FROM comments WHERE comment_id=?", (comment_id,)
+                ).fetchone()
+                try:
+                    payload = json.loads(existing["payload_json"] or "{}") if existing else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except (TypeError, ValueError):
+                    payload = {}
+                payload.update(api)
+                payload.update({"commentStatus": status_label, "isDeleted": bool(is_deleted)})
+                if semantic_headers_present:
+                    payload.update({
+                        "semanticAnalysisCount": nonnegative_int(row.get("语义分析次数")),
+                        "analysisIsNegative": text(row.get("分析结论是否差评"), 40),
+                        "negativeType": text(row.get("差评类型"), 1000),
+                        "negativeSubtype": text(row.get("差评子类型"), 2000),
+                    })
+                if existing:
+                    db.execute(
+                        """UPDATE comments SET note_id=?,parent_comment_id=?,content=?,author=?,author_url=?,
+                           published_at=?,like_count=?,comment_level=?,payload_json=?,content_hash=?,
+                           sentiment=CASE WHEN ?<>'' THEN ? ELSE sentiment END,
+                           semantic_analysis_count=CASE WHEN ? THEN ? ELSE semantic_analysis_count END,
+                           analysis_is_negative=CASE WHEN ? THEN ? ELSE analysis_is_negative END,
+                           negative_type=CASE WHEN ? THEN ? ELSE negative_type END,
+                           negative_subtype=CASE WHEN ? THEN ? ELSE negative_subtype END,
+                           comment_status=CASE WHEN ? THEN ? ELSE comment_status END,
+                           is_deleted=CASE WHEN ? THEN ? ELSE is_deleted END,
+                           deleted_at=CASE WHEN ? AND ?=1 AND deleted_at='' THEN ?
+                                           WHEN ? AND ?=0 THEN '' ELSE deleted_at END,
+                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
+                           WHERE comment_id=?""",
+                        (note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                         api["publishedAt"], api["likeCount"], api["commentLevel"],
+                         json.dumps(payload, ensure_ascii=False), self._content_hash(content_value),
+                         sentiment_code(row.get("AI情绪判断")), sentiment_code(row.get("AI情绪判断")),
+                         int(semantic_headers_present), nonnegative_int(row.get("语义分析次数")),
+                         int(semantic_headers_present), text(row.get("分析结论是否差评"), 40),
+                         int(semantic_headers_present), text(row.get("差评类型"), 1000),
+                         int(semantic_headers_present), text(row.get("差评子类型"), 2000),
+                         int(presence_header_present), status_label,
+                         int(presence_header_present), is_deleted,
+                         int(presence_header_present), is_deleted, timestamp,
+                         int(presence_header_present), is_deleted,
+                         int(presence_header_present), timestamp, comment_id),
+                    )
+                    updated += 1
+                else:
+                    db.execute(
+                        """INSERT INTO comments(comment_id,note_id,parent_comment_id,content,author,author_url,
+                           published_at,like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
+                           payload_json,content_hash,sentiment,semantic_analysis_count,analysis_is_negative,
+                           negative_type,negative_subtype,comment_status,is_deleted,deleted_at,last_presence_checked_at)
+                           VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (comment_id, note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                         api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, timestamp,
+                         json.dumps(payload, ensure_ascii=False), self._content_hash(content_value),
+                         sentiment_code(row.get("AI情绪判断")),
+                         nonnegative_int(row.get("语义分析次数")) if semantic_headers_present else 0,
+                         text(row.get("分析结论是否差评"), 40) if semantic_headers_present else "",
+                         text(row.get("差评类型"), 1000) if semantic_headers_present else "",
+                         text(row.get("差评子类型"), 2000) if semantic_headers_present else "",
+                         status_label, is_deleted, timestamp if is_deleted else "",
+                         timestamp if presence_header_present else ""),
+                    )
+                    inserted += 1
+            db.execute(
+                """UPDATE notes SET comment_count_collected=(
+                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
+            )
+        return {"inserted": inserted, "updated": updated}
 
     def seed_from_xlsx(self, master_path: Path) -> int:
         """Compatibility entry point: migrate XLSX once, then use two CSV files."""
@@ -1530,11 +1702,14 @@ class MonitorStore:
                 print(f"[bridge] CSV 迁移已完成；旧 XLSX 尚有未保存内容或仍被占用，暂不强制删除：{source}", flush=True)
             self._seed_from_csv(notes_path)
             self.repair_csv_relationships({"source": "legacy_xlsx_migration"})
+            self._seed_comments_from_csv(self.comments_csv_path)
             return inserted
         notes_path, comments_path = self.configure_data_files(source)
         self._ensure_seed_workbook(notes_path)
         self.comments_csv_path = comments_path
-        return self._seed_from_csv(notes_path)
+        inserted = self._seed_from_csv(notes_path)
+        self._seed_comments_from_csv(comments_path)
+        return inserted
 
     def _find_match(
         self,
@@ -2031,19 +2206,24 @@ class MonitorStore:
                 comment_id = supplied_id or f"dom-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
                 content_hash = self._content_hash(content)
                 existing = db.execute(
-                    "SELECT comment_id, content_hash FROM comments WHERE comment_id = ?",
+                    """SELECT comment_id,content_hash,payload_json,semantic_analysis_count,
+                              analysis_is_negative,negative_type,negative_subtype,is_deleted
+                       FROM comments WHERE comment_id=?""",
                     (comment_id,),
                 ).fetchone()
                 if existing is None and not supplied_id:
                     existing = db.execute(
-                        """SELECT comment_id,content_hash FROM comments
-                           WHERE note_id=? AND author=? AND content=? AND published_at=? AND parent_comment_id=? LIMIT 1""",
+                        """SELECT comment_id,content_hash,payload_json,semantic_analysis_count,
+                                  analysis_is_negative,negative_type,negative_subtype,is_deleted
+                           FROM comments WHERE note_id=? AND author=? AND content=? AND published_at=?
+                             AND parent_comment_id=? LIMIT 1""",
                         (note_id, author, content, published_at, parent_comment_id),
                     ).fetchone()
                 if existing is None and not supplied_id and not published_at:
                     existing = db.execute(
-                        """SELECT comment_id,content_hash FROM comments
-                           WHERE note_id=? AND author=? AND content=? AND parent_comment_id=? LIMIT 1""",
+                        """SELECT comment_id,content_hash,payload_json,semantic_analysis_count,
+                                  analysis_is_negative,negative_type,negative_subtype,is_deleted
+                           FROM comments WHERE note_id=? AND author=? AND content=? AND parent_comment_id=? LIMIT 1""",
                         (note_id, author, content, parent_comment_id),
                     ).fetchone()
                 if existing:
@@ -2051,12 +2231,27 @@ class MonitorStore:
                     if supplied_id:
                         comment_id_aliases[supplied_id] = stored_id
                     changed = str(existing["content_hash"]) != content_hash
+                    try:
+                        stored_payload = json.loads(existing["payload_json"] or "{}")
+                        if not isinstance(stored_payload, dict):
+                            stored_payload = {}
+                    except (TypeError, ValueError):
+                        stored_payload = {}
+                    current_payload = {
+                        **stored_payload, **item, "commentId": stored_id, "noteId": note_id,
+                        "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                        "semanticAnalysisCount": int(existing["semantic_analysis_count"] or 0),
+                        "analysisIsNegative": text(existing["analysis_is_negative"], 40),
+                        "negativeType": text(existing["negative_type"], 1000),
+                        "negativeSubtype": text(existing["negative_subtype"], 2000),
+                    }
                     db.execute(
                         """
                         UPDATE comments SET last_seen_at=?, like_count=?, reply_count=?,
                             parent_comment_id=?, content=?, author=?, author_url=?, published_at=?,
                             comment_url=?, comment_level=?, content_hash=?, payload_json=?,
-                            ai_analysis_status=CASE WHEN ? THEN 'not_analyzed' ELSE ai_analysis_status END
+                            ai_analysis_status=CASE WHEN ? THEN 'not_analyzed' ELSE ai_analysis_status END,
+                            comment_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?
                         WHERE comment_id=?
                         """,
                         (timestamp, int(item.get("likeCount") or 0), int(item.get("replyCount") or 0),
@@ -2064,34 +2259,41 @@ class MonitorStore:
                          text(item.get("authorUrl"), 2000), published_at,
                          text(item.get("commentUrl"), 2000),
                          max(1, min(int(item.get("commentLevel") or 1), 3)),
-                         content_hash, json.dumps(item, ensure_ascii=False), int(changed), stored_id),
+                         content_hash, json.dumps(current_payload, ensure_ascii=False), int(changed),
+                         COMMENT_STATUS_PRESENT, timestamp, stored_id),
                     )
                     if changed:
                         changed_ids.append(stored_id)
                     continue
+                current_payload = {
+                    **item, "commentId": comment_id, "noteId": note_id,
+                    "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                }
                 db.execute(
                     """
                     INSERT INTO comments (
                         comment_id,note_id,parent_comment_id,content,author,author_url,published_at,
                         like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
-                        payload_json,content_hash
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        payload_json,content_hash,comment_status,is_deleted,deleted_at,last_presence_checked_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',?)
                     """,
                     (comment_id, note_id, parent_comment_id, content, author,
                      text(item.get("authorUrl"), 2000), published_at, int(item.get("likeCount") or 0),
                      int(item.get("replyCount") or 0), text(item.get("commentUrl"), 2000),
                      max(1, min(int(item.get("commentLevel") or 1), 3)), timestamp, timestamp,
-                     json.dumps(item, ensure_ascii=False), content_hash),
+                     json.dumps(current_payload, ensure_ascii=False), content_hash, COMMENT_STATUS_PRESENT, timestamp),
                 )
                 if supplied_id:
                     comment_id_aliases[supplied_id] = comment_id
                 inserted_ids.append(comment_id)
-            count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+            count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+            ).fetchone()[0])
             expected_count = int(payload.get("expectedCount") or 0)
             if collection_status == "likely_complete" and (expected_count <= 0 or count < expected_count):
                 collection_status = "partial"
             negative = int(db.execute(
-                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_negative=1 AND ai_confidence>=0.85",
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0 AND is_negative=1 AND ai_confidence>=0.85",
                 (note_id,),
             ).fetchone()[0])
             db.execute(
@@ -2132,6 +2334,10 @@ class MonitorStore:
             "commentLevel": max(1, min(int(item.get("commentLevel") or item.get("comment_level") or 1), 3)),
             "likeCount": int(item.get("likeCount") or item.get("like_count") or 0),
             "replyCount": int(item.get("replyCount") or item.get("reply_count") or 0),
+            "commentStatus": comment_status_label(
+                item.get("commentStatus") or item.get("comment_status"), item.get("isDeleted") or item.get("is_deleted")
+            ),
+            "isDeleted": bool_value(item.get("isDeleted") or item.get("is_deleted")),
         }
 
     def compare_comments(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2148,7 +2354,8 @@ class MonitorStore:
             raise ValueError("comments must be an array")
         current = [self._comment_api_row(item) for item in raw_comments
                    if isinstance(item, dict) and text(item.get("content"), 8000)]
-        local = [self._comment_api_row(item) for item in self.list_comments(note_id, 2000)]
+        all_local = [self._comment_api_row(item) for item in self.list_comments(note_id, 10000)]
+        local = [item for item in all_local if not item["isDeleted"] and item["commentStatus"] != COMMENT_STATUS_DELETED]
         incoming_note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
         with self.lock, self._session() as db:
             stored_note_row = db.execute(
@@ -2209,6 +2416,7 @@ class MonitorStore:
         return {
             "ok": True, "noteId": note_id, "status": status,
             "expectedCount": expected_count, "currentCount": len(current), "localCount": len(local),
+            "historicalCount": len(all_local), "deletedLocalCount": len(all_local) - len(local),
             "canPrune": can_prune, "newCount": len(new_comments), "removedCount": len(removed),
             "changedCount": len(changed_comments), "pendingRemovedCount": len(pending_removed),
             "hasChanges": bool(new_comments or removed or changed_comments or note_changes),
@@ -2341,18 +2549,52 @@ class MonitorStore:
                 note, comments, media_result, replace_comments=bool(comparison["canPrune"])
             )
             removed = comparison["removedComments"] if comparison["canPrune"] else []
-            excel_removed = int(xlsx_result.get("commentRemoved", 0) or 0)
+            excel_removed = int(xlsx_result.get("commentMarkedDeleted", 0) or 0)
             current_ids = [text(item.get("commentId"), 256) for item in comments if text(item.get("commentId"), 256)]
+            checked_at = now_iso()
+            deleted_marked = 0
             with self.lock, self._session() as db:
                 if comparison["canPrune"]:
                     if current_ids:
                         placeholders = ",".join("?" for _ in current_ids)
-                        db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id NOT IN ({placeholders})",
-                                   (note_id, *current_ids))
+                        deleted_marked = db.execute(
+                            f"""UPDATE comments SET comment_status=?,is_deleted=1,
+                                deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                                last_presence_checked_at=?
+                                WHERE note_id=? AND is_deleted=0 AND comment_id NOT IN ({placeholders})""",
+                            (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id, *current_ids),
+                        ).rowcount
                     else:
-                        db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
-                count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
-                checked_at = now_iso()
+                        deleted_marked = db.execute(
+                            """UPDATE comments SET comment_status=?,is_deleted=1,
+                               deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                               last_presence_checked_at=? WHERE note_id=? AND is_deleted=0""",
+                            (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id),
+                        ).rowcount
+                if comparison["canPrune"] and deleted_marked:
+                    newly_deleted_rows = db.execute(
+                        """SELECT comment_id,payload_json,deleted_at,last_presence_checked_at FROM comments
+                           WHERE note_id=? AND is_deleted=1 AND last_presence_checked_at=?""",
+                        (note_id, checked_at),
+                    ).fetchall()
+                    for deleted_row in newly_deleted_rows:
+                        try:
+                            deleted_payload = json.loads(deleted_row["payload_json"] or "{}")
+                            if not isinstance(deleted_payload, dict):
+                                deleted_payload = {}
+                        except (TypeError, ValueError):
+                            deleted_payload = {}
+                        deleted_payload.update({
+                            "commentId": str(deleted_row["comment_id"]), "noteId": note_id,
+                            "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
+                            "deletedAt": str(deleted_row["deleted_at"] or checked_at),
+                            "lastPresenceCheckedAt": str(deleted_row["last_presence_checked_at"] or checked_at),
+                        })
+                        db.execute("UPDATE comments SET payload_json=? WHERE comment_id=?",
+                                   (json.dumps(deleted_payload, ensure_ascii=False), deleted_row["comment_id"]))
+                count = int(db.execute(
+                    "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+                ).fetchone()[0])
                 db.execute(
                     """UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=?,
                        access_status='ok',access_error='',last_access_checked_at=?,access_check_result='opened',
@@ -2391,7 +2633,8 @@ class MonitorStore:
                 "newCount": comparison["newCount"], "removedCount": len(removed),
                 "changedCount": comparison["changedCount"], "collectedCount": count,
                 "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
-                "excelRemoved": excel_removed, "canPrune": comparison["canPrune"],
+                "excelRemoved": excel_removed, "commentsMarkedDeleted": deleted_marked,
+                "canPrune": comparison["canPrune"],
                 "storesSynced": ["notes_csv", "comments_csv", "sqlite"] + (["materials"] if media_dir else []),
                 "consistencyVerified": True, "consistency": consistency,
                 "runId": note_change_result.get("runId") or change_result.get("runId", 0),
@@ -2415,13 +2658,14 @@ class MonitorStore:
             )
         return {"ok": True, "jobId": cursor.lastrowid, "noteId": note_id, "status": "collecting"}
 
-    def list_comments(self, note_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    def list_comments(self, note_id: str, limit: int = 500, include_deleted: bool = True) -> list[dict[str, Any]]:
         note_id = valid_note_id(note_id)
         if not note_id:
             return []
+        where = "note_id=?" if include_deleted else "note_id=? AND is_deleted=0"
         with self.lock, self._session() as db:
             rows = db.execute(
-                "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT ?",
+                f"SELECT * FROM comments WHERE {where} ORDER BY first_seen_at LIMIT ?",
                 (note_id, max(1, min(int(limit), 10000))),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -2545,10 +2789,13 @@ class MonitorStore:
                 "SELECT priority,reason,created_at,updated_at FROM watchlist WHERE note_id=?", (note_id,)
             ).fetchone() if row is not None else None
             comment_rows = db.execute(
-                "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT 12", (note_id,)
+                "SELECT * FROM comments WHERE note_id=? AND is_deleted=0 ORDER BY first_seen_at LIMIT 12", (note_id,)
             ).fetchall() if row is not None else []
             comment_count = int(db.execute(
-                "SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+            ).fetchone()[0]) if row is not None else 0
+            deleted_comment_count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=1", (note_id,)
             ).fetchone()[0]) if row is not None else 0
         if row is None:
             return {"ok": True, "noteId": note_id, "found": False, "inExcel": False,
@@ -2603,6 +2850,10 @@ class MonitorStore:
             "postSentiment": sentiment_label(item.get("post_sentiment")) if item.get("post_sentiment") else "",
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
+            "semanticAnalysisCount": int(item.get("semantic_analysis_count") or 0),
+            "analysisIsNegative": item.get("analysis_is_negative") or "",
+            "negativeType": item.get("negative_type") or "",
+            "negativeSubtype": item.get("negative_subtype") or "",
         }
         comments: list[dict[str, Any]] = []
         for comment_row in comment_rows:
@@ -2619,6 +2870,8 @@ class MonitorStore:
                 "author": stored.get("author") or payload.get("author") or "",
                 "content": stored.get("content") or payload.get("content") or "",
                 "publishedAt": stored.get("published_at") or payload.get("publishedAt") or "",
+                "commentStatus": comment_status_label(stored.get("comment_status"), stored.get("is_deleted")),
+                "isDeleted": bool(stored.get("is_deleted")),
             })
         return {
             "ok": True, "noteId": note_id, "found": True, "status": item.get("status", "new"),
@@ -2629,7 +2882,10 @@ class MonitorStore:
             "relevanceConfidence": float(item.get("relevance_confidence") or 0),
             "note": stored_note, "mediaDir": media_dir, "mediaFiles": media_files,
             "excelPath": item.get("excel_sync_path") or (str(self.seed_xlsx_path) if self.seed_xlsx_path else ""),
-            "excelRow": excel_row, "commentCount": comment_count, "commentRows": comments,
+            "excelRow": excel_row, "commentCount": comment_count,
+            "deletedCommentCount": deleted_comment_count,
+            "totalHistoricalCommentCount": comment_count + deleted_comment_count,
+            "commentRows": comments,
             "aiStatus": item.get("ai_analysis_status") or "",
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
@@ -3727,7 +3983,8 @@ class MonitorStore:
         with self.lock, self._session() as db:
             note_rows = [dict(row) for row in db.execute(
                 """SELECT note_id,title,url,source,pull_status,media_status,media_dir,media_file_count,
-                   comment_count_collected,access_status,payload_json FROM notes"""
+                   comment_count_collected,access_status,payload_json,semantic_analysis_count,
+                   analysis_is_negative,negative_type,negative_subtype FROM notes"""
             ).fetchall()]
             db_note_ids = {row["note_id"] for row in note_rows}
             pulled_ids = {
@@ -3735,13 +3992,28 @@ class MonitorStore:
                 if row["source"] == "existing_xlsx" or row["pull_status"] in {"synced", "partial"}
             }
             db_comment_rows = [dict(row) for row in db.execute(
-                "SELECT comment_id,note_id,parent_comment_id,review_status FROM comments"
+                """SELECT comment_id,note_id,parent_comment_id,review_status,comment_status,is_deleted,
+                          semantic_analysis_count,analysis_is_negative,negative_type,negative_subtype
+                   FROM comments"""
             ).fetchall()]
             db_comment_count = len(db_comment_rows)
             db_comment_ids = {text(row.get("comment_id"), 256) for row in db_comment_rows}
+            db_comment_status = {
+                text(row.get("comment_id"), 256): comment_status_label(row.get("comment_status"), row.get("is_deleted"))
+                for row in db_comment_rows if text(row.get("comment_id"), 256)
+            }
+            db_comment_semantic = {
+                text(row.get("comment_id"), 256): (
+                    int(row.get("semantic_analysis_count") or 0), text(row.get("analysis_is_negative"), 40),
+                    text(row.get("negative_type"), 1000), text(row.get("negative_subtype"), 2000)
+                ) for row in db_comment_rows if text(row.get("comment_id"), 256)
+            }
+            db_deleted_comment_count = sum(bool(row.get("is_deleted")) for row in db_comment_rows)
             actual_comment_counts = {
                 str(row["note_id"]): int(row["count"])
-                for row in db.execute("SELECT note_id,COUNT(*) count FROM comments GROUP BY note_id").fetchall()
+                for row in db.execute(
+                    "SELECT note_id,COUNT(*) count FROM comments WHERE is_deleted=0 GROUP BY note_id"
+                ).fetchall()
             }
             orphan_comments = int(db.execute(
                 "SELECT COUNT(*) FROM comments c LEFT JOIN notes n ON n.note_id=c.note_id WHERE n.note_id IS NULL"
@@ -3842,14 +4114,20 @@ class MonitorStore:
         mapping_review_ids: list[str] = []
         unreviewed_orphan_ids: list[str] = []
         missing_parent_ids: list[str] = []
+        invalid_comment_status_ids: list[str] = []
+        csv_comment_status_by_id: dict[str, str] = {}
+        csv_comment_semantic_by_id: dict[str, tuple[int, str, str, str]] = {}
+        note_semantic_mismatches: list[str] = []
         if not notes_path or not comments_path or not notes_path.exists() or not comments_path.exists():
             add_issue("csv_missing", "critical", "CSV 总表不存在", "当前配置路径下缺少笔记总表或评论总表。", 1, False)
         else:
             try:
                 note_headers, csv_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
                 comment_headers, csv_comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-                if "笔记ID" not in note_headers or "笔记ID" not in comment_headers or "笔记评论ID" not in comment_headers:
-                    add_issue("csv_schema", "critical", "CSV 表头结构不完整", "笔记或评论表缺少明确的笔记ID/评论ID列。", 1, False)
+                if ("笔记ID" not in note_headers or "笔记ID" not in comment_headers
+                        or "笔记评论ID" not in comment_headers or "评论状态" not in comment_headers):
+                    add_issue("csv_schema", "critical", "CSV 表头结构不完整",
+                              "笔记或评论表缺少笔记ID、评论ID或评论状态列。", 1, False)
                 excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
                 invalid_note_rows = [str(index) for index, note_id in enumerate(excel_note_ids, 2) if not note_id]
                 excel_note_ids = [value for value in excel_note_ids if value]
@@ -3869,12 +4147,32 @@ class MonitorStore:
                             media_differs = csv_media.casefold() != db_media.casefold()
                         if media_differs:
                             media_path_mismatches.append(note_id)
+                    stored_note = db_note_by_id.get(note_id) or {}
+                    csv_semantic = (
+                        nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                        text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000)
+                    )
+                    db_semantic = (
+                        int(stored_note.get("semantic_analysis_count") or 0),
+                        text(stored_note.get("analysis_is_negative"), 40),
+                        text(stored_note.get("negative_type"), 1000), text(stored_note.get("negative_subtype"), 2000)
+                    )
+                    if note_id and stored_note and csv_semantic != db_semantic:
+                        note_semantic_mismatches.append(note_id)
                 for index, row in enumerate(csv_comment_rows, 2):
                     explicit_note_id = valid_note_id(row.get("笔记ID"))
                     url_id = note_url_identity(row.get("原笔记url"))
                     comment_id = text(row.get("笔记评论ID"), 256)
                     if comment_id:
                         csv_comment_ids.append(comment_id)
+                        raw_status = text(row.get("评论状态"), 40)
+                        if raw_status not in {COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED}:
+                            invalid_comment_status_ids.append(comment_id)
+                        csv_comment_status_by_id[comment_id] = comment_status_label(raw_status)
+                        csv_comment_semantic_by_id[comment_id] = (
+                            nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                            text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000)
+                        )
                     if not explicit_note_id:
                         missing_comment_note_ids.append(comment_id or f"row:{index}")
                     if explicit_note_id and url_id and explicit_note_id != url_id:
@@ -3912,6 +4210,14 @@ class MonitorStore:
                     missing_parent_ids.append(comment_id or parent_id)
         csv_missing_db = sorted(csv_comment_id_set - db_comment_ids)
         db_missing_csv = sorted(db_comment_ids - csv_comment_id_set)
+        presence_status_mismatches = sorted(
+            comment_id for comment_id in csv_comment_id_set.intersection(db_comment_ids)
+            if csv_comment_status_by_id.get(comment_id) != db_comment_status.get(comment_id)
+        )
+        comment_semantic_mismatches = sorted(
+            comment_id for comment_id in csv_comment_id_set.intersection(db_comment_ids)
+            if csv_comment_semantic_by_id.get(comment_id) != db_comment_semantic.get(comment_id)
+        )
         add_issue("csv_invalid_note_rows", "critical", "笔记 CSV 存在无有效 ID 的行",
                   "无法建立稳定外键；重复空 ID 行也会造成界面状态误判。",
                   len(invalid_note_rows), False, invalid_note_rows)
@@ -3928,6 +4234,18 @@ class MonitorStore:
                   len(abnormal_comment_rows), False, abnormal_comment_rows)
         add_issue("csv_duplicate_comment_ids", "critical", "评论 ID 重复",
                   "同一个评论ID对应多行，无法保证幂等同步。", duplicate_comment_ids, False)
+        add_issue("csv_comment_status_invalid", "critical", "评论状态字段存在空值或非法值",
+                  "评论状态只能是“存在”或“已删除”。", len(invalid_comment_status_ids), False,
+                  invalid_comment_status_ids)
+        add_issue("csv_sqlite_comment_status_mismatch", "critical", "CSV 与 SQLite 评论状态不一致",
+                  "同一评论在两个数据源中的存在/已删除状态不同。", len(presence_status_mismatches), False,
+                  presence_status_mismatches)
+        add_issue("csv_sqlite_note_semantic_mismatch", "critical", "笔记语义字段与 SQLite 不一致",
+                  "语义分析次数、差评结论或分类字段未同步。", len(note_semantic_mismatches), False,
+                  note_semantic_mismatches)
+        add_issue("csv_sqlite_comment_semantic_mismatch", "critical", "评论语义字段与 SQLite 不一致",
+                  "语义分析次数、差评结论或分类字段未同步。", len(comment_semantic_mismatches), False,
+                  comment_semantic_mismatches)
         add_issue("csv_comment_url_mismatch", "warning", "评论笔记ID与原笔记 URL 不一致",
                   "同步时可能写入错误帖子。", len(comment_url_mismatches), False, comment_url_mismatches)
         add_issue("csv_orphan_comments", "critical", "评论指向笔记总表之外的帖子",
@@ -3955,6 +4273,8 @@ class MonitorStore:
             "ok": True, "status": status, "score": score, "checkedAt": now_iso(), "issues": issues,
             "summary": {
                 "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
+                "activeComments": db_comment_count - db_deleted_comment_count,
+                "deletedComments": db_deleted_comment_count,
                 "csvNotes": len(excel_note_ids), "csvComments": excel_comment_rows,
                 "excelNotes": len(excel_note_ids), "excelComments": excel_comment_rows,
                 "pulledNotes": len(pulled_ids),
@@ -3963,7 +4283,9 @@ class MonitorStore:
                 "csvOnlyCommentIds": len(csv_missing_db), "sqliteOnlyCommentIds": len(db_missing_csv),
                 "relationshipsConsistent": not any(item["id"] in {
                     "csv_invalid_note_rows", "csv_note_url_mismatch", "csv_sqlite_media_path_mismatch", "csv_comment_missing_note_id",
-                    "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_url_mismatch",
+                    "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_status_invalid",
+                    "csv_sqlite_comment_status_mismatch", "csv_sqlite_note_semantic_mismatch",
+                    "csv_sqlite_comment_semantic_mismatch", "csv_comment_url_mismatch",
                     "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory",
                     "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
                 } for item in issues),
@@ -3985,7 +4307,7 @@ class MonitorStore:
         with self.lock, self._session() as db:
             db.execute(
                 """UPDATE notes SET comment_count_collected=(
-                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
             )
             actions.append("重算全部帖子评论计数")
             media_rows = db.execute(
@@ -4036,6 +4358,12 @@ class MonitorStore:
             "commentLevel": level,
             "isAuthor": text(row.get("是否帖主评论"), 20) == "是",
             "sentiment": text(row.get("AI情绪判断"), 80),
+            "commentStatus": comment_status_label(row.get("评论状态")),
+            "isDeleted": comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED,
+            "semanticAnalysisCount": nonnegative_int(row.get("语义分析次数")),
+            "analysisIsNegative": text(row.get("分析结论是否差评"), 40),
+            "negativeType": text(row.get("差评类型"), 1000),
+            "negativeSubtype": text(row.get("差评子类型"), 2000),
         }
 
     @staticmethod
@@ -4061,6 +4389,13 @@ class MonitorStore:
             "AI情绪判断": text(item.get("sentiment"), 80),
             "映射状态": "已映射",
             "映射备注": "",
+            "语义分析次数": nonnegative_int(item.get("semanticAnalysisCount") or item.get("semantic_analysis_count")),
+            "分析结论是否差评": text(item.get("analysisIsNegative") or item.get("analysis_is_negative"), 40),
+            "差评类型": text(item.get("negativeType") or item.get("negative_type"), 1000),
+            "差评子类型": text(item.get("negativeSubtype") or item.get("negative_subtype"), 2000),
+            "评论状态": comment_status_label(
+                item.get("commentStatus") or item.get("comment_status"), item.get("isDeleted") or item.get("is_deleted")
+            ),
         }
 
     def repair_csv_relationships(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4212,6 +4547,11 @@ class MonitorStore:
                                 """UPDATE comments SET note_id=?,parent_comment_id=?,content=?,author=?,author_url=?,
                                    published_at=?,like_count=?,comment_level=?,last_seen_at=?,payload_json=?,content_hash=?,
                                    sentiment=CASE WHEN ?<>'' THEN ? ELSE sentiment END,
+                                   semantic_analysis_count=?,analysis_is_negative=?,negative_type=?,negative_subtype=?,
+                                   comment_status=?,is_deleted=?,
+                                   deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ?
+                                                   WHEN ?=0 THEN '' ELSE deleted_at END,
+                                   last_presence_checked_at=?,
                                    review_status=CASE WHEN ? THEN 'mapping_review'
                                       WHEN review_status='mapping_review' THEN 'pending_review' ELSE review_status END,
                                    review_note=CASE WHEN ? THEN ?
@@ -4219,20 +4559,35 @@ class MonitorStore:
                                 (note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
                                  api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, payload_json,
                                  self._content_hash(content_value), sentiment_code(row.get("AI情绪判断")),
-                                 sentiment_code(row.get("AI情绪判断")), int(mapping_review), int(mapping_review),
+                                 sentiment_code(row.get("AI情绪判断")),
+                                 nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                                 text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                                 comment_status_label(row.get("评论状态")),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED), timestamp,
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED), timestamp,
+                                 int(mapping_review), int(mapping_review),
                                  text(row.get("映射备注"), 1000), comment_id),
                             )
                         else:
                             db.execute(
                                 """INSERT INTO comments(comment_id,note_id,parent_comment_id,content,author,author_url,
                                    published_at,like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
-                                   payload_json,content_hash,review_status,review_note,sentiment)
-                                   VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?)""",
+                                   payload_json,content_hash,review_status,review_note,sentiment,semantic_analysis_count,
+                                   analysis_is_negative,negative_type,negative_subtype,comment_status,is_deleted,
+                                   deleted_at,last_presence_checked_at)
+                                   VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (comment_id, note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
                                  api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, timestamp,
                                  payload_json, self._content_hash(content_value),
                                  "mapping_review" if mapping_review else "pending_review",
-                                 text(row.get("映射备注"), 1000), sentiment_code(row.get("AI情绪判断"))),
+                                 text(row.get("映射备注"), 1000), sentiment_code(row.get("AI情绪判断")),
+                                 nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                                 text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                                 comment_status_label(row.get("评论状态")),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED),
+                                 timestamp if comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED else "",
+                                 timestamp),
                             )
                     db.execute("CREATE TEMP TABLE IF NOT EXISTS repair_comment_ids(comment_id TEXT PRIMARY KEY)")
                     db.execute("DELETE FROM repair_comment_ids")
@@ -4240,7 +4595,7 @@ class MonitorStore:
                     db.execute("DELETE FROM comments WHERE comment_id NOT IN (SELECT comment_id FROM repair_comment_ids)")
                     db.execute(
                         """UPDATE notes SET comment_count_collected=(
-                           SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+                           SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
                     )
             except Exception:
                 for target, backup in csv_backups:
@@ -5102,6 +5457,14 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "likeCount": int(row.get("like_count") or 0),
                 "replyCount": int(row.get("reply_count") or 0),
                 "commentLevel": int(row.get("comment_level") or 1),
+                "commentStatus": comment_status_label(row.get("comment_status"), row.get("is_deleted")),
+                "isDeleted": bool(row.get("is_deleted")),
+                "deletedAt": text(row.get("deleted_at"), 80),
+                "lastPresenceCheckedAt": text(row.get("last_presence_checked_at"), 80),
+                "semanticAnalysisCount": int(row.get("semantic_analysis_count") or 0),
+                "analysisIsNegative": text(row.get("analysis_is_negative"), 40),
+                "negativeType": text(row.get("negative_type"), 1000),
+                "negativeSubtype": text(row.get("negative_subtype"), 2000),
             })
         return output
 
@@ -5150,33 +5513,52 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
         _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
         note_matches = sum(valid_note_id(row.get("笔记ID")) == note_id for row in note_rows)
-        csv_ids = {text(row.get("笔记评论ID"), 256) for row in comment_rows
-                   if csv_comment_note_id(row) == note_id and text(row.get("笔记评论ID"), 256)}
+        csv_status = {
+            text(row.get("笔记评论ID"), 256): comment_status_label(row.get("评论状态"))
+            for row in comment_rows
+            if csv_comment_note_id(row) == note_id and text(row.get("笔记评论ID"), 256)
+        }
+        csv_ids = set(csv_status)
         with self.lock, self._session() as db:
-            db_ids = {str(row[0]) for row in db.execute(
-                "SELECT comment_id FROM comments WHERE note_id=?", (note_id,)
-            ).fetchall()}
+            db_status = {
+                str(row[0]): comment_status_label(row[1], row[2]) for row in db.execute(
+                    "SELECT comment_id,comment_status,is_deleted FROM comments WHERE note_id=?", (note_id,)
+                ).fetchall()
+            }
+        db_ids = set(db_status)
         if note_matches != 1:
             raise ValueError(f"本地一致性校验失败：笔记 CSV 中该帖子有 {note_matches} 行")
         if csv_ids != db_ids:
             raise ValueError(
                 f"本地一致性校验失败：评论 CSV={len(csv_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
             )
+        if csv_status != db_status:
+            raise ValueError("本地一致性校验失败：评论 CSV 与 SQLite 的存在/已删除状态不一致")
         material_ids: set[str] | None = None
         if media_dir and Path(media_dir).is_dir():
             material_path = Path(media_dir) / "comments.json"
             if not material_path.is_file():
                 raise ValueError("本地一致性校验失败：素材目录缺少 comments.json")
             loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
-            material_ids = {text(item.get("commentId"), 256) for item in loaded
-                            if isinstance(item, dict) and text(item.get("commentId"), 256)}
+            material_status = {
+                text(item.get("commentId"), 256): comment_status_label(
+                    item.get("commentStatus"), item.get("isDeleted")
+                )
+                for item in loaded if isinstance(item, dict) and text(item.get("commentId"), 256)
+            }
+            material_ids = set(material_status)
             if material_ids != db_ids:
                 raise ValueError(
                     f"本地一致性校验失败：素材评论={len(material_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
                 )
+            if material_status != db_status:
+                raise ValueError("本地一致性校验失败：素材快照与 SQLite 的评论状态不一致")
+        deleted_count = sum(status == COMMENT_STATUS_DELETED for status in db_status.values())
         return {
             "ok": True, "noteId": note_id, "noteRows": note_matches,
-            "commentIds": len(db_ids), "materialIds": len(material_ids) if material_ids is not None else None,
+            "commentIds": len(db_ids), "activeComments": len(db_ids) - deleted_count,
+            "deletedComments": deleted_count,
+            "materialIds": len(material_ids) if material_ids is not None else None,
         }
 
     def _legacy_sync_pull_to_xlsx(
@@ -5217,6 +5599,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             note_sheet = workbook["sheet1_笔记总表"]
             comment_sheet = workbook["sheet2_评论总表"]
             self._ensure_excel_header(note_sheet, "访问状态")
+            self._ensure_excel_header(comment_sheet, "评论状态")
             note_headers = self._excel_headers(note_sheet)
             comment_headers = self._excel_headers(comment_sheet)
             if "笔记ID" not in note_headers:
@@ -5344,6 +5727,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     "对应帖子文件夹地址": media_folder,
                     "文件夹内清单": media_files,
                     "AI情绪判断": text(item.get("sentiment"), 80),
+                    "评论状态": COMMENT_STATUS_PRESENT,
                 }
                 for name, value in comment_fields.items():
                     column = comment_headers.get(name)
@@ -5454,16 +5838,20 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             set_note_value(name, value)
 
         removed_comments = 0
-        if replace_comments:
-            retained = [row for row in comment_rows if csv_comment_note_id(row) != note_id]
-            removed_comments = len(comment_rows) - len(retained)
-            comment_rows = retained
-        else:
-            for row in comment_rows:
-                if csv_comment_note_id(row) == note_id:
-                    row["笔记ID"] = note_id
-                    row["映射状态"] = "已映射"
-                    row["映射备注"] = ""
+        previously_present_ids: set[str] = set()
+        for row in comment_rows:
+            if csv_comment_note_id(row) != note_id:
+                continue
+            row["笔记ID"] = note_id
+            row["映射状态"] = "已映射"
+            row["映射备注"] = ""
+            previous_status = comment_status_label(row.get("评论状态"))
+            if not text(row.get("评论状态"), 40):
+                row["评论状态"] = COMMENT_STATUS_PRESENT
+            if replace_comments:
+                if previous_status != COMMENT_STATUS_DELETED and text(row.get("笔记评论ID"), 256):
+                    previously_present_ids.add(text(row.get("笔记评论ID"), 256))
+                row["评论状态"] = COMMENT_STATUS_DELETED
 
         by_id: dict[str, int] = {}
         by_key: dict[tuple[str, str, str, str], int] = {}
@@ -5511,6 +5899,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
                 "AI情绪判断": text(item.get("sentiment"), 80),
                 "映射状态": "已映射", "映射备注": "",
+                "评论状态": COMMENT_STATUS_PRESENT,
             }
             for name, value in fields.items():
                 if name not in comment_headers:
@@ -5522,11 +5911,17 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             by_key[key] = row_index
             by_loose[key[:3]] = row_index
 
+        if replace_comments:
+            removed_comments = sum(
+                text(row.get("笔记评论ID"), 256) in previously_present_ids
+                and comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED
+                for row in comment_rows if csv_comment_note_id(row) == note_id
+            )
         self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "sync")
         return {
             "ok": True, "path": str(notes_path), "commentsPath": str(comments_path),
             "postAdded": int(is_new_note), "commentAdded": inserted_comments,
-            "commentRemoved": removed_comments,
+            "commentRemoved": removed_comments, "commentMarkedDeleted": removed_comments,
             "commentSkipped": duplicate_comments, "deduplicated": (not is_new_note) or duplicate_comments > 0,
             "matchedBy": matched_by, "noteRow": int(existing_index) + 2,
         }
@@ -5542,12 +5937,13 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
             "图片数量", "发布日期", "来源词", "笔记ID", "博主ID",
             "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "帖子好坏",
-            "访问状态",
+            "访问状态", "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型",
         ]
         comment_headers = [
-            "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
+            "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
             "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
-            "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断",
+            "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "映射状态", "映射备注",
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "评论状态",
         ]
         xlsx_path.parent.mkdir(parents=True, exist_ok=True)
         workbook = Workbook()
@@ -6590,7 +6986,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 note_id = text(query.get("noteId", [""])[0], 128)
                 limit = int(query.get("limit", [500])[0])
-                self._send_json(200, {"ok": True, "comments": self.store.list_comments(note_id, limit)})
+                include_deleted = text(query.get("includeDeleted", ["true"])[0], 10).lower() not in {"0", "false", "no"}
+                comments = self.store.list_comments(note_id, limit, include_deleted)
+                self._send_json(200, {"ok": True, "includeDeleted": include_deleted, "comments": comments})
             elif parsed.path == "/api/ai/settings":
                 self._send_json(200, self.store.ai_settings_public())
             elif parsed.path == "/api/ai/status":

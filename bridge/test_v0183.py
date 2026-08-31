@@ -281,10 +281,23 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("known", status)
         self.assertEqual(note["noteId"], self.store.list_unreachable_notes()[0]["note_id"])
 
-    def test_comment_sync_updates_sqlite_and_csv_without_blank_rows(self):
+    def test_comment_sync_marks_deleted_without_losing_history_or_semantic_fields(self):
         note, old, kept = self._seed_pulled_note_with_comments()
         _notes_path, comments_path = self._configure_csv("comments")
-        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        media_dir = Path(self.tmp.name) / "posts_materials" / "评论状态"
+        media_dir.mkdir(parents=True)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(media_dir), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": str(media_dir), "files": []})
+        headers, rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        old_row = next(row for row in rows if row["笔记评论ID"] == "comment-old")
+        old_row.update({"语义分析次数": "2", "分析结论是否差评": "是",
+                        "差评类型": "Sales pitch", "差评子类型": "Aggressive pull-in"})
+        self.store._replace_csv_table(comments_path, headers, rows, "semantic-test")
+        with self.store._session() as db:
+            db.execute("""UPDATE comments SET semantic_analysis_count=2,analysis_is_negative='是',
+                       negative_type='Sales pitch',negative_subtype='Aggressive pull-in'
+                       WHERE comment_id='comment-old'""")
         fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
         result = self.store.sync_comment_snapshot({
             "noteId": note["noteId"], "note": note, "comments": [kept, fresh],
@@ -292,10 +305,85 @@ class V0183Tests(unittest.TestCase):
         })
         self.assertEqual("latest", result["status"])
         self.assertEqual((1, 1), (result["newCount"], result["removedCount"]))
-        ids = {row["comment_id"] for row in self.store.list_comments(note["noteId"])}
-        self.assertEqual({"comment-kept", "comment-new"}, ids)
-        csv_ids = {row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
-        self.assertEqual({"comment-kept", "comment-new"}, csv_ids)
+        db_rows = {row["comment_id"]: row for row in self.store.list_comments(note["noteId"])}
+        self.assertEqual({"comment-old", "comment-kept", "comment-new"}, set(db_rows))
+        self.assertEqual(1, db_rows["comment-old"]["is_deleted"])
+        self.assertEqual("已删除", db_rows["comment-old"]["comment_status"])
+        self.assertEqual(2, db_rows["comment-old"]["semantic_analysis_count"])
+        csv_rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual(set(db_rows), set(csv_rows))
+        self.assertEqual("已删除", csv_rows["comment-old"]["评论状态"])
+        self.assertEqual("存在", csv_rows["comment-kept"]["评论状态"])
+        self.assertEqual("Sales pitch", csv_rows["comment-old"]["差评类型"])
+        material_rows = {row["commentId"]: row for row in json.loads(
+            (media_dir / "comments.json").read_text(encoding="utf-8")
+        )}
+        self.assertTrue(material_rows["comment-old"]["isDeleted"])
+        self.assertEqual("已删除", material_rows["comment-old"]["commentStatus"])
+        self.assertEqual("Sales pitch", material_rows["comment-old"]["negativeType"])
+        repeat = self.store.compare_comments({
+            "noteId": note["noteId"], "comments": [kept, fresh],
+            "expectedCount": 2, "status": "likely_complete"
+        })
+        self.assertEqual(0, repeat["removedCount"])
+
+        restored = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [old, kept, fresh],
+            "expectedCount": 3, "status": "likely_complete"
+        })
+        self.assertEqual(1, restored["newCount"])
+        restored_row = next(row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
+                            if row["笔记评论ID"] == "comment-old")
+        self.assertEqual("存在", restored_row["评论状态"])
+        self.assertEqual("Sales pitch", restored_row["差评类型"])
+        restored_material = {row["commentId"]: row for row in json.loads(
+            (media_dir / "comments.json").read_text(encoding="utf-8")
+        )}
+        self.assertFalse(restored_material["comment-old"]["isDeleted"])
+
+    def test_partial_sync_never_marks_unloaded_comments_deleted(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        _notes_path, comments_path = self._configure_csv("partial-presence")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        result = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [kept],
+            "expectedCount": 2, "status": "partial"
+        })
+        self.assertFalse(result["canPrune"])
+        csv_rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual("存在", csv_rows["comment-old"]["评论状态"])
+        with self.store._session() as db:
+            deleted = db.execute(
+                "SELECT is_deleted FROM comments WHERE comment_id='comment-old'"
+            ).fetchone()[0]
+        self.assertEqual(0, deleted)
+
+    def test_csv_semantic_and_presence_fields_import_to_sqlite(self):
+        notes_path, comments_path = self._configure_csv("semantic-import")
+        note_headers, note_rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        note_rows.append({**{name: "" for name in note_headers},
+                          "笔记ID": "semanticnote123", "笔记url": "https://www.xiaohongshu.com/explore/semanticnote123",
+                          "笔记标题": "语义字段帖子", "语义分析次数": "3", "分析结论是否差评": "是",
+                          "差评类型": "Price discrepancy", "差评子类型": "Felt overcharged"})
+        self.store._replace_csv_table(notes_path, note_headers, note_rows, "semantic-note")
+        comment_headers, comment_rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        comment_rows.append({**{name: "" for name in comment_headers},
+                             "笔记ID": "semanticnote123", "原笔记url": "https://www.xiaohongshu.com/explore/semanticnote123",
+                             "笔记评论ID": "semantic-comment-1", "用户昵称": "用户", "评论内容": "历史评论",
+                             "评论层级": "1级评论", "语义分析次数": "2", "分析结论是否差评": "是",
+                             "差评类型": "Sales pitch", "差评子类型": "Aggressive pull-in", "评论状态": "已删除"})
+        self.store._replace_csv_table(comments_path, comment_headers, comment_rows, "semantic-comment")
+
+        self.store.seed_from_xlsx(notes_path)
+
+        with self.store._session() as db:
+            note_row = db.execute("""SELECT semantic_analysis_count,analysis_is_negative,negative_type,negative_subtype
+                                      FROM notes WHERE note_id='semanticnote123'""").fetchone()
+            comment_row = db.execute("""SELECT semantic_analysis_count,analysis_is_negative,negative_type,
+                                         negative_subtype,comment_status,is_deleted
+                                         FROM comments WHERE comment_id='semantic-comment-1'""").fetchone()
+        self.assertEqual((3, "是", "Price discrepancy", "Felt overcharged"), tuple(note_row))
+        self.assertEqual((2, "是", "Sales pitch", "Aggressive pull-in", "已删除", 1), tuple(comment_row))
 
     def test_note_status_repairs_legacy_csv_media_path(self):
         note_id = "legacy123456"
