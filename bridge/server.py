@@ -43,7 +43,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.25.6"
+VERSION = "0.25.7"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -8022,7 +8022,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     }
                 for item in result_items:
                     verified.append(self._verify_note_store_consistency(
-                        item["noteId"], media_by_id.get(item["noteId"], ""), verify_fields=False
+                        item["noteId"], media_by_id.get(item["noteId"], ""), verify_fields=True
                     ))
                 if len(verified) != len(note_ids):
                     raise ValueError("批量状态同步未完成全部帖子的一致性校验")

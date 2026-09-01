@@ -457,6 +457,29 @@ class V0183Tests(unittest.TestCase):
             ).fetchall()]
         self.assertEqual(before_db, after_db)
 
+    def test_access_status_rejects_cross_store_field_drift(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        notes_path, _comments_path = self._configure_csv("access-field-gate")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        rows[0]["笔记标题"] = "外部改坏的标题"
+        self.store._replace_csv_table(notes_path, headers, rows, "simulate-field-drift")
+        with self.store._session() as db:
+            before = tuple(db.execute(
+                "SELECT access_status,post_status,is_deleted FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone())
+        with self.assertRaisesRegex(ValueError, "字段一致性"):
+            self.store.set_note_access_status({"noteId": note["noteId"], "status": "unreachable"})
+        with self.store._session() as db:
+            after = tuple(db.execute(
+                "SELECT access_status,post_status,is_deleted FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone())
+            active_comments = db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note["noteId"],)
+            ).fetchone()[0]
+        self.assertEqual(before, after)
+        self.assertEqual(2, active_comments)
+
     def test_failed_pull_restores_managed_media_files_and_snapshots(self):
         note, old, kept = self._seed_pulled_note_with_comments()
         notes_path, comments_path = self._configure_csv("media-rollback")
