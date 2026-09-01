@@ -299,18 +299,49 @@ class V0183Tests(unittest.TestCase):
         self.assertFalse(result["commentHasChanges"])
         self.assertEqual((0, 0, 0), (result["newCount"], result["removedCount"], result["changedCount"]))
 
-    def test_ignored_pulled_note_restores_to_known(self):
-        note, _old, _kept = self._seed_pulled_note_with_comments()
+    def test_ignored_pulled_note_cascades_and_selectively_restores_presence(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        notes_path, comments_path = self._configure_csv("ignored-presence")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
         with self.store._session() as db:
             db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced',access_status='unreachable' WHERE note_id=?", (note["noteId"],))
-        self.store.ignore({"noteId": note["noteId"]})
+        ignored = self.store.ignore({"noteId": note["noteId"]})
+        self.assertTrue(ignored["consistencyVerified"])
+        self.assertEqual(2, ignored["commentsMarkedDeleted"])
         self.assertEqual([], self.store.list_unreachable_notes())
+        note_row = self._csv_rows(notes_path, NOTE_CSV_HEADERS)[0]
+        self.assertEqual("已删除", note_row["帖子状态"])
+        self.assertEqual({"已删除"}, {row["评论状态"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)})
+        with self.store._session() as db:
+            self.assertEqual(2, db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=1", (note["noteId"],)
+            ).fetchone()[0])
         restored = self.store.restore({"noteId": note["noteId"]})
-        self.assertTrue(restored["ok"])
+        self.assertTrue(restored["consistencyVerified"])
+        self.assertEqual(2, restored["commentsRestored"])
         with self.store._session() as db:
             status = db.execute("SELECT status FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0]
         self.assertEqual("known", status)
+        self.assertEqual({"存在"}, {row["评论状态"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)})
         self.assertEqual(note["noteId"], self.store.list_unreachable_notes()[0]["note_id"])
+
+    def test_restore_ignored_note_does_not_revive_previously_missing_comment(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        _notes_path, comments_path = self._configure_csv("ignored-selective-restore")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [kept],
+            "expectedCount": 1, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete",
+        })
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced' WHERE note_id=?", (note["noteId"],))
+        self.store.ignore({"noteId": note["noteId"]})
+        restored = self.store.restore({"noteId": note["noteId"]})
+        self.assertEqual(1, restored["commentsRestored"])
+        rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual("已删除", rows[old["commentId"]]["评论状态"])
+        self.assertEqual("存在", rows[kept["commentId"]]["评论状态"])
 
     def test_comment_sync_marks_deleted_without_losing_history_or_semantic_fields(self):
         note, old, kept = self._seed_pulled_note_with_comments()
@@ -1122,6 +1153,9 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("outsideThreshold", content)
         self.assertIn("_appliedGeometry", content)
         self.assertIn("batchFailureRenderSignature", panel)
+        self.assertIn("ignoredNotes", worker)
+        self.assertIn("ignoredReconciled", worker)
+        self.assertIn("restoreNote(message.note", worker)
         self.assertIn('message.type === "localNoteStateChanged"', content)
         self.assertIn('message.type === "localNoteStateChanged"', panel)
 
@@ -1267,6 +1301,15 @@ class V0183Tests(unittest.TestCase):
         material_note = json.loads((media_dir / "note.json").read_text(encoding="utf-8"))
         self.assertTrue(material_note["isDeleted"])
         self.assertEqual("已删除", material_note["postStatus"])
+        comment_csv = next(row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
+                           if row["笔记评论ID"] == comment["commentId"])
+        self.assertEqual("已删除", comment_csv["评论状态"])
+        with self.store._session() as db:
+            self.assertEqual(("已删除", 1), tuple(db.execute(
+                "SELECT comment_status,is_deleted FROM comments WHERE comment_id=?", (comment["commentId"],)
+            ).fetchone()))
+        material_comments = json.loads((media_dir / "comments.json").read_text(encoding="utf-8"))
+        self.assertTrue(material_comments[0]["isDeleted"])
 
         cleared = self.store.set_note_access_status({"noteId": note_id, "status": "ok"})
         self.assertEqual(("ok", "存在", False),

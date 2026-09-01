@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.25.5";
+const CONTENT_SCRIPT_VERSION = "0.25.6";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -32,7 +32,7 @@ let batchCommentSyncState = {
   total: 0, current: 0, currentNoteId: "", currentTitle: "",
   changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
   accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
-  statusSyncFailures: 0,
+  statusSyncFailures: 0, ignoredReconciled: 0,
   newComments: 0, removedComments: 0, changedComments: 0,
   failures: [], mode: "all", phase: "idle", error: "", startedAt: "",
   updatedAt: "", finishedAt: ""
@@ -1089,7 +1089,9 @@ async function ignoreBatchFailures(noteIds = []) {
       const result = await bridgeApi("/api/ignore", {
         method: "POST", body: JSON.stringify({ noteId }), timeoutMs: 30000
       });
-      if (!result?.ok) throw new Error(result?.error || "忽略失败");
+      if (!result?.ok || (result.pulled && !result.consistencyVerified)) {
+        throw new Error(result?.error || "忽略状态未通过 CSV、SQLite 与素材一致性校验");
+      }
       ignored.push(noteId);
     } catch (error) {
       failures.push({ noteId, error: error?.message || "忽略失败" });
@@ -1480,12 +1482,23 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const selection = Array.isArray(selectedNoteIds) && selectedNoteIds.length
     ? new Set(selectedNoteIds.map((item) => String(item || "")).filter(Boolean))
     : null;
-  const seen = new Set();
-  const notes = (source.notes || []).filter((note) => {
+  const pulledCandidates = (source.notes || []).filter((note) => {
     const pulled = note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
+    return pulled && note.noteId && (!selection || selection.has(note.noteId));
+  });
+  const ignoredNotes = pulledCandidates.filter((note) => note.status === "ignored");
+  for (const note of ignoredNotes) {
+    const reconciled = await bridgeApi("/api/ignore", {
+      method: "POST", body: JSON.stringify({ noteId: note.noteId }), timeoutMs: 60000
+    });
+    if (!reconciled?.ok || !reconciled.consistencyVerified) {
+      throw new Error("已忽略帖子状态同步失败：" + (note.title || note.noteId));
+    }
+  }
+  const seen = new Set();
+  const notes = pulledCandidates.filter((note) => {
     const selectedDeleted = Boolean(selection && selection.has(note.noteId));
-    return pulled && note.status !== "ignored" && (!note.isDeleted || selectedDeleted)
-      && note.noteId && (!selection || selection.has(note.noteId))
+    return note.status !== "ignored" && (!note.isDeleted || selectedDeleted)
       && !seen.has(note.noteId) && seen.add(note.noteId);
   });
   const startedAt = new Date().toISOString();
@@ -1494,7 +1507,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
     total: notes.length, current: 0, currentNoteId: "", currentTitle: "",
     changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
     accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
-    statusSyncFailures: 0,
+    statusSyncFailures: 0, ignoredReconciled: ignoredNotes.length,
     newComments: 0, removedComments: 0, changedComments: 0,
     failures: [], mode, phase: notes.length ? "preparing" : "done", error: "",
     startedAt, finishedAt: notes.length ? "" : startedAt
@@ -1657,7 +1670,7 @@ async function startPulledCommentSync(selectedNoteIds = null, mode = "all") {
     total: 0, current: 0, currentNoteId: "", currentTitle: "",
     changedPosts: 0, unchangedPosts: 0, failedPosts: 0,
     accessiblePosts: 0, reviewPosts: 0, unreachablePosts: 0, processingFailedPosts: 0,
-    statusSyncFailures: 0,
+    statusSyncFailures: 0, ignoredReconciled: 0,
     newComments: 0, removedComments: 0, changedComments: 0,
     failures: [], mode, phase: "preparing", error: "", startedAt, finishedAt: ""
   });
@@ -1995,12 +2008,38 @@ async function ignoreNote(note) {
       method: "POST",
       body: JSON.stringify(note)
     });
+    if (!result?.ok || (result.pulled && !result.consistencyVerified)) {
+      throw new Error(result?.error || "忽略状态未通过全存储一致性校验");
+    }
+    await broadcastLocalNoteState(note.noteId, {
+      found: true, inExcel: Boolean(result.pulled), status: "ignored",
+      postStatus: result.postStatus || (result.pulled ? "已删除" : "存在"),
+      isDeleted: Boolean(result.pulled),
+      locallyReconciled: true, consistencyVerified: true
+    });
     setBridgeState("online", { bridgeUrl: config.bridgeUrl, error: "" });
     return result;
   } catch (error) {
     setBridgeState("offline", { bridgeUrl: config.bridgeUrl, error: error.message });
     return { ok: false, offline: true, error: `未更新本地数据库：${error.message}` };
   }
+}
+
+
+async function restoreNote(note) {
+  if (!note?.noteId) return { ok: false, error: "缺少帖子 ID，无法恢复" };
+  const result = await bridgeApi("/api/restore", {
+    method: "POST", body: JSON.stringify(note), timeoutMs: 60000
+  });
+  if (!result?.ok || (result.pulled && !result.consistencyVerified)) {
+    throw new Error(result?.error || "恢复状态未通过全存储一致性校验");
+  }
+  await broadcastLocalNoteState(note.noteId, {
+    found: true, inExcel: Boolean(result.pulled), status: result.status || "known",
+    postStatus: result.postStatus || "存在", isDeleted: false,
+    locallyReconciled: true, consistencyVerified: true
+  });
+  return result;
 }
 
 async function getStats() {
@@ -2219,7 +2258,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return bridgeApi(`/api/negative/items?${query}`);
     }
     if (message.type === "updateReview") return bridgeApi("/api/review", { method: "POST", body: JSON.stringify(message.payload || {}) });
-    if (message.type === "restoreNote") return bridgeApi("/api/restore", { method: "POST", body: JSON.stringify(message.note || {}) });
+    if (message.type === "restoreNote") return restoreNote(message.note || {});
     if (message.type === "cancelDeepScan") {
       deepScanCancelled = true;
       return { ok: true, cancelled: true };

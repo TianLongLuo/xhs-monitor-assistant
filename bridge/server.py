@@ -43,7 +43,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
 
 
-VERSION = "0.25.5"
+VERSION = "0.25.6"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -2846,29 +2846,73 @@ class MonitorStore:
         return {"ok": True, "noteId": note_id, "status": "known" if existing and existing["source"] == "existing_xlsx" else "confirmed"}
 
     def ignore(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ignore a note and soft-delete its retained post/comment presence as one transaction."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
         with self.pull_lock, self.lock, self._session() as db:
-            updated = db.execute("UPDATE notes SET status = 'ignored', last_seen_at = ? WHERE note_id = ?", (now_iso(), note_id)).rowcount
-        if not updated:
+            stored = db.execute(
+                "SELECT source,pull_status,status FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        if not stored:
             raise ValueError("帖子尚未写入本地数据库，请先重新扫描")
-        return {"ok": True, "noteId": note_id, "status": "ignored", "updated": True}
+        pulled = stored["source"] == "existing_xlsx" or stored["pull_status"] in {"synced", "partial"}
+        if pulled:
+            reconciled = self.set_note_access_statuses({"items": [{
+                "noteId": note_id,
+                "preserveAccess": True,
+                "forcePostStatus": POST_STATUS_DELETED,
+                "workflowStatus": "ignored",
+                "cascadeComments": True,
+                "commentDeletionReason": "parent_ignored",
+            }]})
+            item = reconciled["items"][0]
+            return {
+                "ok": True, "noteId": note_id, "status": "ignored", "updated": True,
+                "pulled": True, "postStatus": item["postStatus"],
+                "commentsMarkedDeleted": int(item.get("commentsMarkedDeleted") or 0),
+                "consistencyVerified": reconciled.get("consistencyVerified") is True,
+                "verified": reconciled.get("verified", []),
+            }
+        with self.pull_lock, self.lock, self._session() as db:
+            db.execute("UPDATE notes SET status='ignored',last_seen_at=? WHERE note_id=?", (now_iso(), note_id))
+        return {"ok": True, "noteId": note_id, "status": "ignored", "updated": True,
+                "pulled": False, "consistencyVerified": True}
 
     def restore(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Restore workflow participation without reviving comments deleted before the ignore."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
         with self.pull_lock, self.lock, self._session() as db:
-            updated = db.execute(
-                """UPDATE notes SET status=CASE
-                   WHEN source='existing_xlsx' OR pull_status IN ('synced','partial') THEN 'known'
-                   ELSE 'new' END, last_seen_at=? WHERE note_id=? AND status='ignored'""",
-                (now_iso(), note_id),
-            ).rowcount
-        if not updated:
+            stored = db.execute(
+                "SELECT source,pull_status,status FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        if not stored or stored["status"] != "ignored":
             raise ValueError("帖子不存在或当前不是已忽略状态")
-        return {"ok": True, "noteId": note_id, "status": "new"}
+        pulled = stored["source"] == "existing_xlsx" or stored["pull_status"] in {"synced", "partial"}
+        workflow_status = "known" if pulled else "new"
+        if pulled:
+            reconciled = self.set_note_access_statuses({"items": [{
+                "noteId": note_id,
+                "preserveAccess": True,
+                "forcePostStatus": POST_STATUS_PRESENT,
+                "workflowStatus": workflow_status,
+                "restoreIgnoredComments": True,
+            }]})
+            item = reconciled["items"][0]
+            return {
+                "ok": True, "noteId": note_id, "status": workflow_status, "pulled": True,
+                "postStatus": item["postStatus"],
+                "commentsRestored": int(item.get("commentsRestored") or 0),
+                "consistencyVerified": reconciled.get("consistencyVerified") is True,
+                "verified": reconciled.get("verified", []),
+            }
+        with self.pull_lock, self.lock, self._session() as db:
+            db.execute("UPDATE notes SET status=?,last_seen_at=? WHERE note_id=?",
+                       (workflow_status, now_iso(), note_id))
+        return {"ok": True, "noteId": note_id, "status": workflow_status,
+                "pulled": False, "consistencyVerified": True}
 
     def ai_settings_public(self) -> dict[str, Any]:
         return {"ok": True, **self.ai_settings.get(False)}
@@ -2982,6 +3026,10 @@ class MonitorStore:
                         "negativeType": text(existing["negative_type"], 1000),
                         "negativeSubtype": text(existing["negative_subtype"], 2000),
                     }
+                    current_payload.pop("presenceReason", None)
+                    current_payload.pop("presenceReasonAt", None)
+                    current_payload.pop("presenceReason", None)
+                    current_payload.pop("presenceReasonAt", None)
                     db.execute(
                         """
                         UPDATE comments SET last_seen_at=?, like_count=?, reply_count=?,
@@ -3313,6 +3361,7 @@ class MonitorStore:
                         "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
                         "deletedAt": str(row["deleted_at"] or checked_at),
                         "lastPresenceCheckedAt": str(row["last_presence_checked_at"] or checked_at),
+                        "presenceReason": "snapshot_missing", "presenceReasonAt": checked_at,
                     })
                     db.execute(
                         "UPDATE comments SET payload_json=? WHERE comment_id=?",
@@ -3425,6 +3474,7 @@ class MonitorStore:
                             "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
                             "deletedAt": str(deleted_row["deleted_at"] or checked_at),
                             "lastPresenceCheckedAt": str(deleted_row["last_presence_checked_at"] or checked_at),
+                            "presenceReason": "snapshot_missing", "presenceReasonAt": checked_at,
                         })
                         db.execute("UPDATE comments SET payload_json=? WHERE comment_id=?",
                                    (json.dumps(deleted_payload, ensure_ascii=False), deleted_row["comment_id"]))
@@ -7993,9 +8043,10 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             return output
 
     def _set_note_access_statuses_unchecked(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Unchecked implementation; public callers use the rollback wrapper above."""
+        """Update access, post presence and dependent comment presence in one retained-row transaction."""
         raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
         labels = {"ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""}
+        workflows = {"", "new", "known", "confirmed", "ignored"}
         deduplicated: dict[str, dict[str, Any]] = {}
         for raw in raw_items:
             if isinstance(raw, dict):
@@ -8004,6 +8055,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     deduplicated[note_id] = raw
         if not deduplicated:
             raise ValueError("items must contain at least one noteId")
+
         normalized: list[dict[str, Any]] = []
         for note_id, raw in deduplicated.items():
             requested = text(raw.get("status"), 40).strip().lower()
@@ -8011,94 +8063,225 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 requested = "check_failed"
             if requested not in labels:
                 raise ValueError("status must be ok, check_failed, unreachable or empty")
+            forced_post_status = text(raw.get("forcePostStatus"), 40)
+            if forced_post_status and forced_post_status not in {POST_STATUS_PRESENT, POST_STATUS_DELETED}:
+                raise ValueError("forcePostStatus must be 存在 or 已删除")
+            workflow_status = text(raw.get("workflowStatus"), 40).strip().lower()
+            if workflow_status not in workflows:
+                raise ValueError("workflowStatus is invalid")
+            preserve_access = bool_value(raw.get("preserveAccess"))
+            cascade_comments = (
+                bool_value(raw.get("cascadeComments"))
+                or requested == "unreachable"
+                or forced_post_status == POST_STATUS_DELETED
+            )
+            restore_ignored = bool_value(raw.get("restoreIgnoredComments"))
+            deletion_reason = text(raw.get("commentDeletionReason"), 80) or (
+                "parent_ignored" if workflow_status == "ignored" else "parent_deleted"
+            )
             normalized.append({
                 "noteId": note_id, "status": requested, "excelStatus": labels[requested],
                 "error": "" if requested == "ok" else text(raw.get("error"), 1000),
-                "result": text(raw.get("result"), 80) or {"ok": "opened", "check_failed": "inconclusive",
-                           "unreachable": "confirmed_v2", "": ""}[requested],
+                "result": text(raw.get("result"), 80) or {
+                    "ok": "opened", "check_failed": "inconclusive", "unreachable": "confirmed_v2", "": ""
+                }[requested],
                 "checkedAt": text(raw.get("checkedAt"), 80) or now_iso(),
+                "preserveAccess": preserve_access, "forcePostStatus": forced_post_status,
+                "workflowStatus": workflow_status, "cascadeComments": cascade_comments,
+                "restoreIgnoredComments": restore_ignored, "commentDeletionReason": deletion_reason,
             })
-        notes_path, _comments_path = self._csv_paths()
-        headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+
+        notes_path, comments_path = self._csv_paths()
+        note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
         for required, default in (("访问状态", ""), ("帖子状态", POST_STATUS_PRESENT)):
-            if required not in headers:
-                headers.append(required)
-                for row in rows:
+            if required not in note_headers:
+                note_headers.append(required)
+                for row in note_rows:
                     row[required] = default
+        if "评论状态" not in comment_headers:
+            comment_headers.append("评论状态")
+            for row in comment_rows:
+                row["评论状态"] = COMMENT_STATUS_PRESENT
         rows_by_id: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
+        for row in note_rows:
             row_id = valid_note_id(row.get("笔记ID"))
             if row_id:
                 rows_by_id.setdefault(row_id, []).append(row)
-        with self.pull_lock:
-            with self.lock, self._session() as db:
-                for item in normalized:
-                    stored = db.execute(
-                        """SELECT title,access_status,post_status,is_deleted,deleted_at,media_dir
-                           FROM notes WHERE note_id=?""",
-                        (item["noteId"],),
-                    ).fetchone()
-                    if not stored:
-                        raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
-                    item["previousStatus"] = text(stored["access_status"], 40)
-                    item["previousPostStatus"] = post_status_label(stored["post_status"], stored["is_deleted"])
-                    item["postStatus"] = (
-                        POST_STATUS_DELETED if item["status"] == "unreachable"
-                        else POST_STATUS_PRESENT if item["status"] == "ok"
-                        else item["previousPostStatus"]
-                    )
-                    item["isDeleted"] = item["postStatus"] == POST_STATUS_DELETED
-                    item["deletedAt"] = (
-                        text(stored["deleted_at"], 80) or item["checkedAt"] if item["isDeleted"] else ""
-                    )
-                    item["mediaDir"] = text(stored["media_dir"], 4000)
-                    item["title"] = text(stored["title"], 1000)
-                    matched = rows_by_id.get(item["noteId"], [])
-                    for row in matched:
-                        row["访问状态"] = item["excelStatus"]
-                        row["帖子状态"] = item["postStatus"]
-                    item["excelRows"] = len(matched)
-            self._replace_csv_table(notes_path, headers, rows, "access-presence")
-            with self.lock, self._session() as db:
-                for item in normalized:
-                    presence_confirmed = item["status"] in {"ok", "unreachable"}
-                    db.execute(
-                        """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?,
-                           post_status=?,is_deleted=?,
-                           deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ? WHEN ?=0 THEN '' ELSE deleted_at END,
-                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
-                           WHERE note_id=?""",
-                        (item["status"], item["error"], item["checkedAt"], item["result"],
-                         item["postStatus"], int(item["isDeleted"]), int(item["isDeleted"]), item["checkedAt"],
-                         int(item["isDeleted"]), int(presence_confirmed), item["checkedAt"], item["noteId"]),
-                    )
-                    previous, current = item.get("previousStatus") or "", item["status"]
-                    previous_post, current_post = item["previousPostStatus"], item["postStatus"]
-                    if previous != current or previous_post != current_post:
-                        human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
-                        summary = f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}"
-                        if previous_post != current_post:
-                            summary += f"；帖子状态：{previous_post} → {current_post}（本地记录保留）"
-                        db.execute(
-                            """INSERT INTO change_events
-                               (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
-                               VALUES (?,?,?,?,?,?,?,?)""",
-                            (max(0, int(payload.get("runId") or 0)), item["noteId"], "access_status_changed",
-                             item.get("title") or "", summary,
-                             json.dumps({"status": previous, "postStatus": previous_post}, ensure_ascii=False),
-                             json.dumps({"status": current, "postStatus": current_post,
-                                         "error": item["error"]}, ensure_ascii=False), item["checkedAt"]),
-                        )
+
+        with self.lock, self._session() as db:
             for item in normalized:
-                if item["status"] in {"ok", "unreachable"}:
-                    self._write_material_note_presence(
-                        item["noteId"], item.get("mediaDir") or "", item["postStatus"],
-                        item["checkedAt"], item.get("deletedAt") or "",
+                stored = db.execute(
+                    """SELECT title,status,source,pull_status,access_status,access_error,
+                              last_access_checked_at,access_check_result,post_status,is_deleted,
+                              deleted_at,media_dir FROM notes WHERE note_id=?""",
+                    (item["noteId"],),
+                ).fetchone()
+                if not stored:
+                    raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
+                item["previousStatus"] = text(stored["access_status"], 40)
+                item["previousWorkflowStatus"] = text(stored["status"], 40)
+                item["previousPostStatus"] = post_status_label(stored["post_status"], stored["is_deleted"])
+                if item["preserveAccess"]:
+                    item["status"] = item["previousStatus"] if item["previousStatus"] in labels else ""
+                    item["excelStatus"] = labels[item["status"]]
+                    item["error"] = text(stored["access_error"], 1000)
+                    item["result"] = text(stored["access_check_result"], 80)
+                item["postStatus"] = item["forcePostStatus"] or (
+                    POST_STATUS_DELETED if item["status"] == "unreachable"
+                    else POST_STATUS_PRESENT if item["status"] == "ok"
+                    else item["previousPostStatus"]
+                )
+                item["isDeleted"] = item["postStatus"] == POST_STATUS_DELETED
+                item["deletedAt"] = (
+                    text(stored["deleted_at"], 80) or item["checkedAt"]
+                ) if item["isDeleted"] else ""
+                item["mediaDir"] = text(stored["media_dir"], 4000)
+                item["title"] = text(stored["title"], 1000)
+                item["workflowStatus"] = item["workflowStatus"] or item["previousWorkflowStatus"]
+                item["commentMutations"] = []
+                for comment in db.execute(
+                    """SELECT comment_id,payload_json,comment_status,is_deleted,deleted_at
+                       FROM comments WHERE note_id=?""", (item["noteId"],)
+                ).fetchall():
+                    try:
+                        comment_payload = json.loads(comment["payload_json"] or "{}")
+                        if not isinstance(comment_payload, dict):
+                            comment_payload = {}
+                    except (TypeError, ValueError):
+                        comment_payload = {}
+                    comment_id = text(comment["comment_id"], 256)
+                    if item["cascadeComments"] and not bool(comment["is_deleted"]):
+                        comment_payload.update({
+                            "commentId": comment_id, "noteId": item["noteId"],
+                            "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
+                            "deletedAt": text(comment["deleted_at"], 80) or item["checkedAt"],
+                            "lastPresenceCheckedAt": item["checkedAt"],
+                            "presenceReason": item["commentDeletionReason"],
+                            "presenceReasonAt": item["checkedAt"],
+                        })
+                        item["commentMutations"].append({
+                            "commentId": comment_id, "status": COMMENT_STATUS_DELETED,
+                            "isDeleted": True, "deletedAt": text(comment["deleted_at"], 80) or item["checkedAt"],
+                            "payload": comment_payload,
+                        })
+                    elif (
+                        item["restoreIgnoredComments"]
+                        and bool(comment["is_deleted"])
+                        and text(comment_payload.get("presenceReason"), 80) == "parent_ignored"
+                    ):
+                        comment_payload.update({
+                            "commentId": comment_id, "noteId": item["noteId"],
+                            "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                            "deletedAt": "", "lastPresenceCheckedAt": item["checkedAt"],
+                        })
+                        comment_payload.pop("presenceReason", None)
+                        comment_payload.pop("presenceReasonAt", None)
+                        item["commentMutations"].append({
+                            "commentId": comment_id, "status": COMMENT_STATUS_PRESENT,
+                            "isDeleted": False, "deletedAt": "", "payload": comment_payload,
+                        })
+
+                matched = rows_by_id.get(item["noteId"], [])
+                for row in matched:
+                    row["访问状态"] = item["excelStatus"]
+                    row["帖子状态"] = item["postStatus"]
+                item["excelRows"] = len(matched)
+                mutation_by_id = {entry["commentId"]: entry for entry in item["commentMutations"]}
+                item["commentsMarkedDeleted"] = sum(entry["isDeleted"] for entry in item["commentMutations"])
+                item["commentsRestored"] = sum(not entry["isDeleted"] for entry in item["commentMutations"])
+                for row in comment_rows:
+                    if csv_comment_note_id(row) != item["noteId"]:
+                        continue
+                    mutation = mutation_by_id.get(text(row.get("笔记评论ID"), 256))
+                    if mutation:
+                        row["评论状态"] = mutation["status"]
+                    elif item["cascadeComments"]:
+                        row["评论状态"] = COMMENT_STATUS_DELETED
+
+        self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "access-presence")
+        with self.lock, self._session() as db:
+            for item in normalized:
+                presence_changed = item["previousPostStatus"] != item["postStatus"]
+                presence_confirmed = presence_changed or item["status"] in {"ok", "unreachable"}
+                db.execute(
+                    """UPDATE notes SET
+                       access_status=CASE WHEN ? THEN access_status ELSE ? END,
+                       access_error=CASE WHEN ? THEN access_error ELSE ? END,
+                       last_access_checked_at=CASE WHEN ? THEN last_access_checked_at ELSE ? END,
+                       access_check_result=CASE WHEN ? THEN access_check_result ELSE ? END,
+                       status=?,last_seen_at=?,post_status=?,is_deleted=?,
+                       deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ? WHEN ?=0 THEN '' ELSE deleted_at END,
+                       last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
+                       WHERE note_id=?""",
+                    (int(item["preserveAccess"]), item["status"], int(item["preserveAccess"]), item["error"],
+                     int(item["preserveAccess"]), item["checkedAt"], int(item["preserveAccess"]), item["result"],
+                     item["workflowStatus"], item["checkedAt"], item["postStatus"], int(item["isDeleted"]),
+                     int(item["isDeleted"]), item["checkedAt"], int(item["isDeleted"]),
+                     int(presence_confirmed), item["checkedAt"], item["noteId"]),
+                )
+                for mutation in item["commentMutations"]:
+                    db.execute(
+                        """UPDATE comments SET comment_status=?,is_deleted=?,deleted_at=?,
+                           last_presence_checked_at=?,payload_json=? WHERE note_id=? AND comment_id=?""",
+                        (mutation["status"], int(mutation["isDeleted"]), mutation["deletedAt"],
+                         item["checkedAt"], json.dumps(mutation["payload"], ensure_ascii=False),
+                         item["noteId"], mutation["commentId"]),
                     )
+                active_count = int(db.execute(
+                    "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (item["noteId"],)
+                ).fetchone()[0])
+                negative_count = int(db.execute(
+                    """SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0
+                       AND is_negative=1 AND ai_confidence>=0.85""", (item["noteId"],)
+                ).fetchone()[0])
+                db.execute(
+                    "UPDATE notes SET comment_count_collected=?,negative_comment_count=? WHERE note_id=?",
+                    (active_count, negative_count, item["noteId"]),
+                )
+                previous, current = item.get("previousStatus") or "", item["status"]
+                previous_post, current_post = item["previousPostStatus"], item["postStatus"]
+                previous_workflow, current_workflow = item["previousWorkflowStatus"], item["workflowStatus"]
+                if (
+                    previous != current
+                    or previous_post != current_post
+                    or previous_workflow != current_workflow
+                    or item["commentMutations"]
+                ):
+                    human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
+                    summary = f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}"
+                    if previous_post != current_post:
+                        summary += f"；帖子状态：{previous_post} → {current_post}（本地记录保留）"
+                    if item["commentsMarkedDeleted"]:
+                        summary += f"；关联评论标记已删除 {item['commentsMarkedDeleted']} 条"
+                    if item["commentsRestored"]:
+                        summary += f"；恢复忽略关联评论 {item['commentsRestored']} 条"
+                    db.execute(
+                        """INSERT INTO change_events
+                           (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (max(0, int(payload.get("runId") or 0)), item["noteId"], "presence_status_changed",
+                         item.get("title") or "", summary,
+                         json.dumps({"status": previous, "postStatus": previous_post,
+                                     "workflowStatus": previous_workflow}, ensure_ascii=False),
+                         json.dumps({"status": current, "postStatus": current_post,
+                                     "workflowStatus": current_workflow, "error": item["error"],
+                                     "commentsMarkedDeleted": item["commentsMarkedDeleted"],
+                                     "commentsRestored": item["commentsRestored"]}, ensure_ascii=False),
+                         item["checkedAt"]),
+                    )
+
         by_status = dict(Counter(item["status"] for item in normalized))
-        return {"ok": True, "updated": len(normalized), "excelRows": sum(item["excelRows"] for item in normalized),
-                "markedDeleted": sum(bool(item["isDeleted"]) for item in normalized),
-                "byStatus": by_status, "items": normalized, "path": str(notes_path)}
+        for item in normalized:
+            item.pop("commentMutations", None)
+        return {
+            "ok": True, "updated": len(normalized),
+            "excelRows": sum(item["excelRows"] for item in normalized),
+            "markedDeleted": sum(bool(item["isDeleted"]) for item in normalized),
+            "commentsMarkedDeleted": sum(int(item["commentsMarkedDeleted"]) for item in normalized),
+            "commentsRestored": sum(int(item["commentsRestored"]) for item in normalized),
+            "byStatus": by_status, "items": normalized, "path": str(notes_path),
+        }
 
     def set_note_access_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         result = self.set_note_access_statuses({"items": [payload], "runId": payload.get("runId")})
@@ -8106,6 +8289,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         return {"ok": True, "noteId": item["noteId"], "accessStatus": item["status"],
                 "excelStatus": item["excelStatus"], "excelRows": item["excelRows"],
                 "postStatus": item["postStatus"], "isDeleted": item["isDeleted"],
+                "commentsMarkedDeleted": int(item.get("commentsMarkedDeleted") or 0),
+                "commentsRestored": int(item.get("commentsRestored") or 0),
                 "checkedAt": item["checkedAt"],
                 "consistencyVerified": result.get("consistencyVerified") is True,
                 "verified": result.get("verified", [])}

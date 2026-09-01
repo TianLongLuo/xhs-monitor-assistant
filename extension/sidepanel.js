@@ -209,7 +209,7 @@ const STATUS_VIEWS = {
   new: { title: "新相关未拉取", kicker: "NEW & RELEVANT", hint: "与 XHS-Monitor 品牌相关，但本地笔记 CSV 中还没有" },
   known: { title: "CSV 已有", kicker: "IN LOCAL CSV", hint: "这些帖子已经存在于本地笔记 CSV" },
   confirmed: { title: "待加入 CSV", kicker: "MARKED", hint: "已人工标记，但当前仍未写入 CSV" },
-  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "不再参与批量同步，可随时恢复" }
+  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "本地记录保留，帖子与关联评论标记已删除；恢复后重新参与同步" }
 };
 
 const PANEL_VIEWS = new Set(["overview", "posts", "tools"]);
@@ -471,7 +471,7 @@ function renderBatchFailures(failures = []) {
     ignore.type = "button";
     ignore.className = "batch-sync-failure__ignore";
     ignore.textContent = "忽略";
-    ignore.title = "忽略后不再参与批量同步，可在运营页面恢复";
+    ignore.title = "忽略后帖子与关联评论会标记已删除，可在运营页面恢复";
     ignore.disabled = !failure.noteId;
     ignore.addEventListener("click", async () => {
       ignore.disabled = true;
@@ -953,7 +953,7 @@ function renderIgnoredOperations(result) {
         const restored = await sendRuntime({ type: "restoreNote", note: { noteId: item.noteId } });
         if (!restored?.ok) throw new Error(restored?.error || "恢复失败");
         await Promise.all([refreshIgnoredOperations(), refreshStats()]);
-        showToast("帖子已恢复，将重新参与批量同步");
+        showToast("帖子已恢复，忽略前仍存在的评论已恢复并将重新参与同步");
       } catch (error) {
         restore.disabled = false; restore.textContent = "重试";
         setStatus(error.message || "恢复失败", "error");
@@ -1548,7 +1548,7 @@ function renderNoteList(notes, options = {}) {
         actionButton("忽略", async () => {
           const result = await sendRuntime({ type: "ignoreNote", note: { ...note, noteId, url: noteUrl(note) } });
           if (!result?.ok) throw new Error(result?.error || "忽略失败");
-          setStatus("已忽略；该帖子不再参与批量同步", "success");
+          setStatus("已忽略；帖子与关联评论已标记为删除态", "success");
           await Promise.all([refreshStats(), refreshPending()]);
         })
       );
