@@ -187,6 +187,7 @@ let batchSyncViewState = {
   error: "", startedAt: "", finishedAt: ""
 };
 let batchSyncCompletionNotified = "";
+let batchFailureRenderSignature = "";
 let unreachableNotes = [];
 let unreachableDeleteRunning = false;
 let panelView = "overview";
@@ -388,8 +389,21 @@ async function ignoreBatchFailureItems(items = [], confirmMany = false) {
 function renderBatchFailures(failures = []) {
   if (!elements.batchSyncFailures || !elements.batchSyncFailureList) return;
   const items = Array.isArray(failures) ? failures.filter((item) => item?.noteId || item?.url) : [];
+  const signature = JSON.stringify({
+    running: Boolean(batchSyncViewState.running),
+    items: items.map((item) => [
+      item.noteId || "", item.url || "", item.title || "", item.error || "",
+      item.markedUnreachable === true, item.diagnosis?.code || "",
+      item.diagnosis?.label || "", item.diagnosis?.summary || "", item.diagnosis?.localSummary || ""
+    ])
+  });
+  if (signature === batchFailureRenderSignature) return;
+  batchFailureRenderSignature = signature;
   elements.batchSyncFailures.hidden = items.length === 0;
-  if (elements.batchSyncFailureCount) elements.batchSyncFailureCount.textContent = `${items.length} 篇`;
+  if (elements.batchSyncFailureCount) {
+    const countLabel = `${items.length} 篇`;
+    if (elements.batchSyncFailureCount.textContent !== countLabel) elements.batchSyncFailureCount.textContent = countLabel;
+  }
   if (elements.ignoreAllBatchFailures) {
     elements.ignoreAllBatchFailures.hidden = items.length === 0;
     elements.ignoreAllBatchFailures.disabled = batchSyncViewState.running || !items.some((item) => item?.noteId);
@@ -478,6 +492,10 @@ function renderBatchFailures(failures = []) {
 }
 
 function renderBatchSync(state = {}, notify = false) {
+  const setStableText = (node, value) => {
+    const next = String(value ?? "");
+    if (node && node.textContent !== next) node.textContent = next;
+  };
   batchSyncViewState = { ...batchSyncViewState, ...(state || {}) };
   const view = batchSyncViewState;
   const total = Math.max(0, Number(view.total) || 0);
@@ -491,23 +509,27 @@ function renderBatchSync(state = {}, notify = false) {
   elements.syncAllPulled?.classList.toggle("is-running", running);
   if (elements.syncAllPulled) elements.syncAllPulled.disabled = running;
   if (elements.syncAllPulledLabel) {
-    elements.syncAllPulledLabel.textContent = running
+    setStableText(elements.syncAllPulledLabel, running
       ? `正在同步 ${current}/${total || "?"}`
-      : "同步全部已拉取帖子";
+      : "同步全部已拉取帖子");
   }
-  if (elements.batchSyncTitle) elements.batchSyncTitle.textContent = batchSyncPhaseLabel(view);
-  if (elements.batchSyncCount) elements.batchSyncCount.textContent = `${current} / ${total}`;
+  setStableText(elements.batchSyncTitle, batchSyncPhaseLabel(view));
+  setStableText(elements.batchSyncCount, `${current} / ${total}`);
   if (elements.batchSyncBar) elements.batchSyncBar.style.width = `${percent}%`;
   if (elements.batchSyncCurrent) {
     const failures = Array.isArray(view.failures) ? view.failures : [];
     const failure = failures[failures.length - 1] || null;
-    elements.batchSyncCurrent.textContent = view.error
+    setStableText(elements.batchSyncCurrent, view.error
       || (view.currentTitle ? `当前：${view.currentTitle}` : "")
       || (failure ? `${failure.title}：${failure.error}` : "")
-      || (view.done ? "已完成所有可访问帖子的评论核对" : "正在读取已拉取帖子列表…");
+      || (view.done
+        ? (Number(view.failedPosts) || Number(view.statusSyncFailures)
+          ? "批量同步已结束；成功项已校验，失败项未提交或等待复核"
+          : "帖子、评论及存续状态已写入并通过一致性校验")
+        : "正在读取已拉取帖子列表…"));
   }
   if (elements.batchSyncStats) {
-    elements.batchSyncStats.textContent = `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 标记删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`;
+    setStableText(elements.batchSyncStats, `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 标记删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`);
   }
   renderBatchFailures(view.failures);
   if (elements.cancelBatchSync) {
@@ -540,7 +562,7 @@ function renderBatchSync(state = {}, notify = false) {
     setStatus(`批量同步失败：${view.error || "请重新启动"}`, "error");
     showToast(`批量同步失败：${view.error || "请重新启动"}`, "error");
   } else {
-    const message = `评论同步完成 · ${batchSyncSummary(view)}`;
+    const message = `${Number(view.failedPosts) || Number(view.statusSyncFailures) ? "帖子与评论状态同步已结束" : "帖子与评论状态同步完成"} · ${batchSyncSummary(view)}`;
     setStatus(message, Number(view.failedPosts) ? "warning" : "success");
     showToast(message, Number(view.failedPosts) ? "error" : "success");
   }
@@ -1592,7 +1614,9 @@ async function pullNoteToExcel(note, button) {
       type: "pullNote",
       note: { ...note, noteId, url: noteUrl(note), showProcess: true, process: true }
     });
-    if (!result?.ok) throw new Error(result?.error || "拉取失败");
+    if (!result?.ok || result.consistencyVerified !== true) {
+      throw new Error(result?.error || "拉取未通过全存储一致性校验");
+    }
     const partial = result.pullStatus === "partial"
       || result.commentStatus === "partial"
       || result.commentStatus === "failed"
@@ -2187,6 +2211,7 @@ document.addEventListener("visibilitychange", () => {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "localNoteStateChanged") {
+    if (message.inExcel === true && message.consistencyVerified !== true) return false;
     if (message.noteId && currentDetailNote?.noteId === message.noteId) {
       currentDetailNote = message.deleted
         ? { ...currentDetailNote, ...message, inExcel: false, pullStatus: "not_started", status: "new" }

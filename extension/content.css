@@ -1196,6 +1196,8 @@
   color: var(--process-text) !important;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif !important;
   isolation: isolate;
+  backface-visibility: hidden;
+  transform: translate3d(0, 0, 0);
   max-height: calc(100vh - 16px);
   overflow-x: hidden !important;
   overflow-y: auto !important;

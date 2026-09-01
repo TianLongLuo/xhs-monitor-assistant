@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.25.3";
+  const CONTENT_VERSION = "0.25.5";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -194,6 +194,60 @@
     return ["undefined", "null", "none", "unknown", "nan"].includes(noteId.toLocaleLowerCase()) ? "" : noteId;
   }
 
+  function normalizeTagValues(value) {
+    const values = (Array.isArray(value) ? value : [value]).map((item) => clean(item, 6000)).filter(Boolean);
+    if (values.length >= 3 && values.filter((item) => item.length === 1).length / values.length >= .6) return [];
+    const output = [];
+    for (const item of values) {
+      const collapsed = item.replace(/\s+/g, "");
+      if (!collapsed || ["#", "作者", "无话题作者"].includes(collapsed)) continue;
+      if (collapsed === "无话题") { output.push("无话题"); continue; }
+      const hashtags = item.match(/#[^\s#]+/g) || [];
+      output.push(...hashtags);
+      const remainder = item.replace(/#[^\s#]+/g, " ").trim();
+      const tokens = remainder.split(/\s+/).filter(Boolean);
+      if (tokens.length >= 5 && tokens.filter((token) => token.length === 1).length / tokens.length >= .6) {
+        if (hashtags.length) continue;
+        const reconstructed = remainder.replace(/\s+/g, "").replace(/作者$/, "");
+        if (reconstructed.startsWith("#") && reconstructed.length > 1) output.push(reconstructed);
+        continue;
+      }
+      for (const plain of tokens) {
+        output.push(plain.startsWith("#") ? plain : `#${plain}`);
+      }
+    }
+    return [...new Set(output)];
+  }
+
+  function sourceNoteSnapshot(note = {}) {
+    const keys = [
+      "noteId", "url", "title", "author", "authorUrl", "authorId", "publishedAt", "updatedAt",
+      "content", "detailRead", "tags", "mediaText", "imageUrls", "imageCount", "videoUrls",
+      "videoCount", "mediaType", "likeCount", "collectCount", "commentCount", "shareCount",
+      "ipLocation", "keyword", "pageUrl"
+    ];
+    const result = {};
+    for (const key of keys) if (Object.prototype.hasOwnProperty.call(note, key)) result[key] = note[key];
+    result.noteId = validNoteId(result.noteId);
+    if (Object.prototype.hasOwnProperty.call(result, "tags")) {
+      const tags = normalizeTagValues(result.tags);
+      if (tags.length) result.tags = tags;
+      else delete result.tags;
+    }
+    for (const field of ["imageUrls", "videoUrls"]) {
+      if (!Object.prototype.hasOwnProperty.call(result, field)) continue;
+      const values = Array.isArray(result[field])
+        ? [...new Set(result[field].map((item) => clean(item, 4000)).filter(Boolean))] : [];
+      if (values.length) result[field] = values;
+      else delete result[field];
+    }
+    if (result.detailRead !== true) delete result.detailRead;
+    for (const field of ["imageCount", "videoCount"]) {
+      if (!(Number(result[field]) > 0)) delete result[field];
+    }
+    return result;
+  }
+
   function processValue(value, limit = 220) {
     if (Array.isArray(value)) return value.map((item) => processValue(item, 80)).filter(Boolean).join("、").slice(0, limit);
     if (value === null || value === undefined) return "";
@@ -356,6 +410,18 @@
     });
   }
 
+  function processPanelMutationIsInternal(record, panel) {
+    if (!record || !panel) return false;
+    const target = record.target instanceof Element
+      ? record.target
+      : record.target?.parentElement;
+    if (target && panel.contains(target)) return true;
+    const changedNodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+    return changedNodes.length > 0 && changedNodes.every((node) => (
+      node === panel || (node instanceof Node && panel.contains(node))
+    ));
+  }
+
   function scheduleProcessPanelLifecycleCheck(panel = processPanel, delay = 260) {
     if (!panel || panel !== processPanel) return;
     if (processPanelLifecycleTimer) clearTimeout(processPanelLifecycleTimer);
@@ -461,6 +527,28 @@
     const noteId = clean(note.noteId, 128);
     const titleNeedle = clean(note.title, 1000).slice(0, 28);
     const activeDetailId = noteIdFromUrl(location.href);
+    const cachedNode = processPanel?._dockNode;
+    const cachedRect = cachedNode?.isConnected ? cachedNode.getBoundingClientRect?.() : null;
+    if (cachedRect
+      && cachedRect.width >= 520
+      && cachedRect.height >= 280
+      && cachedRect.right > 0
+      && cachedRect.bottom > 0
+      && cachedRect.left < window.innerWidth
+      && cachedRect.top < window.innerHeight) {
+      const cachedMarker = `${cachedNode.id || ""} ${typeof cachedNode.className === "string" ? cachedNode.className : ""} ${cachedNode.getAttribute?.("role") || ""}`;
+      const cachedRootId = clean(cachedNode.getAttribute?.("note-id") || cachedNode.dataset?.noteId, 128);
+      const cachedContainsDetail = Boolean(detail && (
+        cachedNode === detail || cachedNode.contains(detail) || detail.contains(cachedNode)
+      ));
+      const cachedMatchesNote = Boolean(
+        (noteId && cachedRootId === noteId)
+        || (noteId && activeDetailId === noteId && /notecontainer|note.?detail|modal|dialog/i.test(cachedMarker))
+      );
+      if (cachedContainsDetail || cachedMatchesNote) {
+        return { node: cachedNode, rect: cachedRect, score: Number.POSITIVE_INFINITY, cached: true };
+      }
+    }
     const shellSelector = [
       "#noteContainer.note-container",
       "#noteContainer[role='dialog']",
@@ -511,9 +599,16 @@
     }
     if (candidates.length) {
       candidates.sort((left, right) => right.score - left.score || left.area - right.area);
-      return candidates[0];
+      const selected = candidates[0];
+      if (processPanel) processPanel._dockNode = selected.node;
+      return selected;
     }
-    return detailRect ? { node: detail, rect: detailRect } : null;
+    if (detailRect) {
+      if (processPanel) processPanel._dockNode = detail;
+      return { node: detail, rect: detailRect };
+    }
+    if (processPanel) processPanel._dockNode = null;
+    return null;
   }
 
   function applyProcessPanelPosition() {
@@ -524,6 +619,7 @@
     const gap = 10;
     const edge = 12;
     const availableRight = Math.floor(window.innerWidth - rect.right - gap - edge);
+    const previous = processPanel._appliedGeometry || null;
     const top = Math.max(edge, Math.min(Math.round(rect.top), window.innerHeight - 180));
     const dockBottom = rect.bottom > top + 180 ? rect.bottom : window.innerHeight - edge;
     const bottom = Math.min(window.innerHeight - edge, Math.round(dockBottom));
@@ -531,7 +627,8 @@
     let panelWidth;
     let panelLeft;
     let position;
-    if (availableRight >= 196) {
+    const outsideThreshold = previous?.position === "outside" ? 184 : 212;
+    if (availableRight >= outsideThreshold) {
       panelWidth = Math.min(292, availableRight);
       panelLeft = Math.round(rect.right + gap);
       position = "outside";
@@ -542,9 +639,22 @@
       position = "overlay";
     }
     const density = panelWidth < 224 ? "ultra" : panelWidth < 270 ? "compact" : "regular";
+    const nextGeometry = {
+      top, maxHeight, panelWidth, panelLeft, position, density,
+      dockRight: Math.round(rect.right)
+    };
+    if (previous
+      && previous.position === nextGeometry.position
+      && previous.density === nextGeometry.density
+      && Math.abs(previous.top - nextGeometry.top) <= 3
+      && Math.abs(previous.maxHeight - nextGeometry.maxHeight) <= 3
+      && Math.abs(previous.panelWidth - nextGeometry.panelWidth) <= 3
+      && Math.abs(previous.panelLeft - nextGeometry.panelLeft) <= 3
+      && Math.abs(previous.dockRight - nextGeometry.dockRight) <= 3) return;
     const geometry = [top, maxHeight, panelWidth, panelLeft, position, density, Math.round(rect.right)].join(":");
     if (geometry === processPanelGeometry) return;
     processPanelGeometry = geometry;
+    processPanel._appliedGeometry = nextGeometry;
     processPanel.style.top = `${top}px`;
     processPanel.style.maxHeight = `${maxHeight}px`;
     processPanel.style.width = `${panelWidth}px`;
@@ -578,6 +688,8 @@
     panel.setAttribute("aria-label", "帖子拉取与核对 Process");
     panel._processNote = { ...note };
     panel._detailOpened = false;
+    panel._dockNode = null;
+    panel._appliedGeometry = null;
 
     const header = document.createElement("div");
     header.className = `${PROCESS_PANEL_CLASS}__head`;
@@ -744,7 +856,8 @@
     (document.body || document.documentElement).append(panel);
     enableProcessPanelScroll(panel);
     processPanel = panel;
-    processPanelObserver = new MutationObserver(() => {
+    processPanelObserver = new MutationObserver((records) => {
+      if (records.length && records.every((record) => processPanelMutationIsInternal(record, panel))) return;
       queueProcessPanelPrune(panel);
       scheduleProcessPanelLifecycleCheck(panel);
     });
@@ -908,7 +1021,9 @@
         type: "pullNote",
         note: { ...note, noteId, showProcess: true, process: true }
       });
-      if (!result?.ok) throw new Error(result?.error || "拉取失败");
+      if (!result?.ok || !result.consistencyVerified) {
+        throw new Error(result?.error || "拉取后全存储一致性校验失败");
+      }
       const freshStatus = { ...result, noteId, status: "known", inExcel: true,
         pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true };
       applyFreshStatusToCard({ ...note, ...(result.note || {}) }, freshStatus);
@@ -1480,7 +1595,7 @@
         updatedAt: baseNote.updatedAt || metadata.updatedAt,
         content,
         detailRead: true,
-        tags: [...new Set([...(baseNote.tags || []), ...tags])],
+        tags: normalizeTagValues([...(Array.isArray(baseNote.tags) ? baseNote.tags : [baseNote.tags]), ...tags]),
         mediaText: extractMediaText(detailRoot),
         imageUrls: imageUrls.length ? imageUrls : (baseNote.imageUrls || []),
         imageCount: imageUrls.length || baseNote.imageCount || (baseNote.imageUrls || []).length,
@@ -1704,17 +1819,19 @@
             noteId: panel.dataset.noteId,
             snapshot: result.snapshot
           });
-          if (!response?.ok) throw new Error(response?.error || "更新失败");
+          if (!response?.ok || !response.consistencyVerified) {
+            throw new Error(response?.error || "帖子、评论与素材一致性校验失败");
+          }
           button.textContent = automatic ? "已自动同步" : "已更新";
           button.dataset.state = "updated";
           section.dataset.state = "updated";
           setProcessLatest(panel);
           const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
-          if (status) status.textContent = `评论同步成功：新增 ${response.newCount || 0}，标记已删除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}`;
+          if (status) status.textContent = `帖子/评论状态同步成功：新增 ${response.newCount || 0}，标记已删除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}；全存储已校验`;
           panel._commentAuditDone = true;
           panel._commentAudit = { ...result, synced: response };
           panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
-          showPageToast(`评论同步成功 · 新增 ${response.newCount || 0} · 标记已删除 ${response.removedCount || 0} · 修改 ${response.changedCount || 0}`);
+          showPageToast(`帖子/评论状态同步成功 · 新增 ${response.newCount || 0} · 标记已删除 ${response.removedCount || 0} · 全存储一致`);
           return response;
         } catch (error) {
           button.disabled = false;
@@ -1755,7 +1872,7 @@
         }
         setProcessLatest(panel);
         const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
-        if (status) status.textContent = "评论无变化；CSV、SQLite 与素材快照已校准";
+        if (status) status.textContent = "帖子与评论无变化；CSV、SQLite、存续状态与素材快照已校准";
         panel._commentAuditDone = true;
         panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
       }
@@ -2228,17 +2345,20 @@
           if (!buttons.length) break;
           continue;
         }
-        const snapshot = collectSnapshot();
-        if (largestExpectedCount > 0 && collectedComments.size >= largestExpectedCount) break;
+        collectSnapshot();
         stagnantRounds = collectedComments.size === priorExtractedCount ? stagnantRounds + 1 : 0;
         priorExtractedCount = collectedComments.size;
         const scroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']") || commentScroller;
+        let scrollExhausted = true;
         if (scroller) {
           const before = scroller.scrollTop;
           scroller.scrollTop = Math.min(scroller.scrollHeight, before + Math.max(320, scroller.clientHeight * .78));
           scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-          if (stagnantRounds >= 3 && scroller.scrollTop === before) break;
-        } else if (stagnantRounds >= 3) break;
+          scrollExhausted = scroller.scrollTop === before
+            && before + scroller.clientHeight >= scroller.scrollHeight - 4;
+        }
+        const expandersExhausted = commentUtils.expandableButtons(commentRoot).length === 0;
+        if (expandersExhausted && scrollExhausted && stagnantRounds >= 2) break;
         await waitFor(320);
       }
       const refreshed = extractCurrentDetail(detail.note);
@@ -2251,10 +2371,33 @@
       }
       const finalComments = allComments ? [...collectedComments.values()] : extracted.comments;
       const expectedCount = Math.max(largestExpectedCount, Number(extracted.expectedCount || 0));
-      const commentStatus = expectedCount === 0 && finalComments.length === 0
-        ? "likely_complete"
-        : expectedCount > 0 && finalComments.length >= expectedCount ? "likely_complete" : "partial";
+      const remainingExpanders = commentUtils.expandableButtons(commentRoot).length;
+      const finalScroller = commentRoot.querySelector?.(
+        ".note-scroller, [class*='note-scroller'], [class*='comments-container']"
+      ) || commentScroller;
+      const scrollExhausted = !finalScroller
+        || finalScroller.scrollTop + finalScroller.clientHeight >= finalScroller.scrollHeight - 4;
+      const collectionEvidence = {
+        expandersExhausted: remainingExpanders === 0,
+        scrollExhausted,
+        stableRounds: stagnantRounds,
+        allCommentsRequested: allComments
+      };
+      const explicitEmptyVerified = allComments && finalComments.length === 0
+        && commentUtils.hasExplicitEmptyState(commentRoot)
+        && collectionEvidence.expandersExhausted;
       const commentsWithIds = await ensureCommentIds(detail.note, finalComments || []);
+      const uniqueCommentCount = new Set(
+        commentsWithIds.map((item) => item.commentId).filter(Boolean)
+      ).size;
+      const collectionVerified = collectionEvidence.allCommentsRequested
+        && collectionEvidence.expandersExhausted
+        && collectionEvidence.scrollExhausted
+        && collectionEvidence.stableRounds >= 2;
+      const commentStatus = explicitEmptyVerified
+        ? "likely_complete"
+        : expectedCount > 0 && uniqueCommentCount >= expectedCount && collectionVerified
+          ? "likely_complete" : "partial";
       if (allComments && commentScroller) commentScroller.scrollTop = originalCommentScroll;
       if (showProcess) updateProcessPanel({
         process: true, noteId: note.noteId, phase: "media",
@@ -2265,9 +2408,11 @@
       return {
         ok: true,
         access: { state: "ok", marker: "detail_loaded" },
-        note: detail.note,
+        note: sourceNoteSnapshot(detail.note),
         comments: commentsWithIds,
         expectedCount,
+        explicitEmptyVerified,
+        collectionEvidence,
         status: commentStatus,
         commentError: commentStatus === "partial" ? `当前读取 ${commentsWithIds.length}/${expectedCount || "?"} 条，仍有回复未加载，可再次补采` : "",
         expandedCount: totalClicked
@@ -2569,7 +2714,9 @@
         renderDecoration(card, note, { ...status, pullStatus: "pulling" });
         try {
           const result = await sendRuntime({ type: "pullNote", note: { ...note, showProcess: true, process: true } });
-          if (!result?.ok) throw new Error(result?.error || "操作失败");
+          if (!result?.ok || !result.consistencyVerified) {
+            throw new Error(result?.error || "拉取后全存储一致性校验失败");
+          }
           const freshStatus = { ...status, ...result, noteId: note.noteId, status: "known", inExcel: true, isNew: false,
             pullStatus: result.pullStatus || "synced", relevanceStatus: "relevant", isRelevant: true };
           renderDecoration(card, note, freshStatus);
@@ -2779,7 +2926,7 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "localNoteStateChanged") {
       const noteId = clean(message.noteId, 128);
-      if (!noteId) return false;
+      if (!noteId || (message.inExcel === true && message.consistencyVerified !== true)) return false;
       const note = { ...(processPanel?._processNote || {}), noteId };
       const freshStatus = message.deleted
         ? { ...message, noteId, found: false, inExcel: false, status: "new", pullStatus: "not_started" }

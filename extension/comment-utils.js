@@ -150,6 +150,23 @@
     return 0;
   }
 
+  function hasExplicitEmptyState(root) {
+    const selectors = [
+      ".comments-container", "[class*='comments-container']", "[class*='comment-title']",
+      "[class*='comments-header']", "[class*='comment-empty']", "[class*='empty-comment']",
+      "[class*='no-comment']", "[class*='empty']"
+    ];
+    for (const selector of selectors) {
+      for (const element of root.querySelectorAll?.(selector) || []) {
+        const value = clean(element.innerText || element.textContent, 500);
+        if (/(?:共\s*)?0\s*条?评论|暂无评论|还没有评论|暂时没有评论|成为第一个评论|快来(?:发表|发布)?评论/.test(value)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function extractComments(root, note) {
     const candidates = Array.from(root.querySelectorAll?.(ITEM_SELECTORS.join(",")) || []);
     const items = [];
@@ -289,6 +306,6 @@
 
   return {
     clean, numericText, profileIdFromUrl, isPostAuthorComment, stableCommentId, isReplyElement,
-    extractExpectedCount, extractComments, expandableButtons, findCommentElement, replyButtonFor
+    extractExpectedCount, hasExplicitEmptyState, extractComments, expandableButtons, findCommentElement, replyButtonFor
   };
 });

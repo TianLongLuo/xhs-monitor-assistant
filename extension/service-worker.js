@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.25.3";
+const CONTENT_SCRIPT_VERSION = "0.25.5";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -733,6 +733,7 @@ async function sendTabMessage(tabId, message) {
 async function broadcastLocalNoteState(noteId, state = {}) {
   const safeNoteId = String(noteId || "").trim();
   if (!safeNoteId) return;
+  if (state.inExcel === true && state.consistencyVerified !== true) return;
   const message = { type: "localNoteStateChanged", noteId: safeNoteId, ...state };
   chrome.runtime.sendMessage(message).catch(() => {});
   const tabs = await chrome.tabs.query({}).catch(() => []);
@@ -860,6 +861,8 @@ async function collectComments(note) {
           noteId: note.noteId,
           comments: extracted.comments || [],
           expectedCount: extracted.expectedCount || 0,
+          explicitEmptyVerified: extracted.explicitEmptyVerified === true,
+          collectionEvidence: extracted.collectionEvidence || {},
           status: extracted.status || "partial",
           collectedAt: new Date().toISOString()
         }),
@@ -996,23 +999,32 @@ async function readCurrentNoteComments(note, preferredTabId = null) {
   });
 }
 
+function requireConsistencyVerified(result, label = "本地同步") {
+  if (!result?.ok || result.consistencyVerified !== true) {
+    throw new Error(result?.error || `${label}未通过全存储一致性校验`);
+  }
+  return result;
+}
+
 async function setNoteAccessStatus(noteId, status, error = "") {
   if (!noteId) return { ok: false, error: "缺少帖子 ID" };
-  return bridgeApi("/api/note/access-status", {
+  const result = await bridgeApi("/api/note/access-status", {
     method: "POST",
     body: JSON.stringify({ noteId, status, error }),
     timeoutMs: 60000
   });
+  return requireConsistencyVerified(result, "访问状态同步");
 }
 
 async function setNoteAccessStatuses(items = [], runId = 0) {
   const updates = Array.isArray(items) ? items.filter((item) => item?.noteId) : [];
-  if (!updates.length) return { ok: true, updated: 0, items: [] };
-  return bridgeApi("/api/notes/access-status/batch", {
+  if (!updates.length) return { ok: true, updated: 0, items: [], consistencyVerified: true, verified: [] };
+  const result = await bridgeApi("/api/notes/access-status/batch", {
     method: "POST",
     body: JSON.stringify({ items: updates, runId: Number(runId) || 0 }),
     timeoutMs: 120000
   });
+  return requireConsistencyVerified(result, "批量访问状态同步");
 }
 
 async function getUnreachableNotes() {
@@ -1023,14 +1035,14 @@ async function deleteUnreachableNotes() {
   // Legacy action name retained for loaded v0.25.2 panels. The Bridge now
   // marks post presence as deleted and keeps CSV, SQLite, comments and media.
   await bridgeApi("/api/excel/reload", { method: "POST", body: "{}", timeoutMs: 30000 });
-  const result = await bridgeApi("/api/notes/unreachable/mark-deleted", {
+  const result = requireConsistencyVerified(await bridgeApi("/api/notes/unreachable/mark-deleted", {
     method: "POST", body: "{}", timeoutMs: 300000
-  });
+  }), "帖子存续状态同步");
   for (const item of result?.marked || []) {
     await broadcastLocalNoteState(item.noteId, {
       deleted: false, found: true, inExcel: true, status: "known",
       postStatus: "已删除", isDeleted: true, accessStatus: "unreachable",
-      locallyReconciled: true
+      locallyReconciled: true, consistencyVerified: true
     });
   }
   return result;
@@ -1051,7 +1063,7 @@ async function deleteReviewedFailures(noteIds = []) {
     await broadcastLocalNoteState(item.noteId, {
       deleted: false, found: true, inExcel: true, status: "known",
       postStatus: item.postStatus || "已删除", isDeleted: true,
-      accessStatus: "unreachable", locallyReconciled: true
+      accessStatus: "unreachable", locallyReconciled: true, consistencyVerified: true
     });
   }
   const markedIds = new Set(marked.map((item) => item.noteId));
@@ -1107,6 +1119,8 @@ async function auditCurrentNoteComments(note, preferredTabId = null) {
     note: extracted.note || note,
     comments: Array.isArray(extracted.comments) ? extracted.comments : [],
     expectedCount: Number(extracted.expectedCount) || 0,
+    explicitEmptyVerified: extracted.explicitEmptyVerified === true,
+    collectionEvidence: extracted.collectionEvidence || {},
     status: extracted.status || "partial"
   };
   const comparison = await bridgeApi("/api/comments/compare", {
@@ -1125,16 +1139,19 @@ async function syncCurrentNoteComments(payload) {
       note: snapshot.note || payload?.note || {},
       comments: Array.isArray(snapshot.comments) ? snapshot.comments : [],
       expectedCount: Number(snapshot.expectedCount) || 0,
+      explicitEmptyVerified: snapshot.explicitEmptyVerified === true,
+      collectionEvidence: snapshot.collectionEvidence || {},
       status: snapshot.status || "partial",
       runId: Number(payload?.runId) || 0
     }),
     timeoutMs: 120000
   });
+  requireConsistencyVerified(result, "评论同步");
   if (result?.ok) {
     await broadcastLocalNoteState(noteId, {
       deleted: false, found: true, inExcel: true, status: "known",
       postStatus: result.postStatus || "存在", isDeleted: false,
-      pullStatus: "synced", locallyReconciled: true,
+      pullStatus: result.pullStatus || "not_started", locallyReconciled: true,
       consistencyVerified: Boolean(result.consistencyVerified)
     });
   }
@@ -1385,6 +1402,8 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     note: extracted.note || note,
     comments: Array.isArray(extracted.comments) ? extracted.comments : [],
     expectedCount: Number(extracted.expectedCount) || 0,
+    explicitEmptyVerified: extracted.explicitEmptyVerified === true,
+    collectionEvidence: extracted.collectionEvidence || {},
     status: extracted.status || "partial"
   };
   await sendTabMessage(tabId, {
@@ -1423,7 +1442,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     phase: "excel",
     title: hasCommentChanges
       ? `发现 ${Number(comparison.newCount || 0) + Number(comparison.removedCount || 0) + Number(comparison.changedCount || 0)} 项变化，正在同步全部本地数据`
-      : "评论无变化，正在校准 CSV、SQLite 与素材快照",
+      : "帖子与评论无变化，正在校准存续状态、CSV、SQLite 与素材快照",
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
@@ -1445,7 +1464,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     note: snapshot.note,
     phase: "excel",
     done: true,
-    title: hasCommentChanges ? "评论变化及全部本地数据已同步" : "评论无变化，本地数据已全部校准",
+    title: hasCommentChanges ? "帖子、评论及存续状态已通过全存储校验" : "帖子与评论无变化，全存储状态已校准",
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
@@ -1584,7 +1603,8 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           await broadcastLocalNoteState(item.noteId, {
             deleted: false, found: true, inExcel: true, status: "known",
             postStatus: item.postStatus || "存在", isDeleted: Boolean(item.isDeleted),
-            accessStatus: item.status || "", locallyReconciled: true
+            accessStatus: item.status || "", locallyReconciled: true,
+            consistencyVerified: true
           });
         }
       }
@@ -1750,12 +1770,15 @@ async function pullNote(note, preferredTabId = null) {
           note: detail.note,
           comments,
           expectedCount: extracted?.expectedCount || 0,
+          explicitEmptyVerified: extracted?.explicitEmptyVerified === true,
+          collectionEvidence: extracted?.collectionEvidence || {},
           commentStatus,
           commentError,
           collectedAt: new Date().toISOString()
         }),
         timeoutMs: 10 * 60 * 1000
       });
+      requireConsistencyVerified(result, "帖子拉取");
       broadcastPullProgress({
         noteId, phase: "excel", process: showProcess,
         title: "素材与 CSV / SQLite 已写入，正在核对结果",

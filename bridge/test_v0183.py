@@ -7,7 +7,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from data_relationships import repair_relationship_rows
-from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, replace_with_retry, valid_note_id
+from server import COMMENT_CSV_HEADERS, NOTE_CSV_HEADERS, MonitorStore, _decode_powershell_output, audit_reply_candidate, classify_reply_context, comment_level_value, replace_with_retry, tag_text, valid_note_id
+
+
+COMPLETE_EVIDENCE = {
+    "allCommentsRequested": True,
+    "expandersExhausted": True,
+    "scrollExhausted": True,
+    "stableRounds": 2,
+}
 
 
 class MediaHandler(BaseHTTPRequestHandler):
@@ -234,7 +242,8 @@ class V0183Tests(unittest.TestCase):
         fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
         result = self.store.compare_comments({
             "noteId": note["noteId"], "comments": [kept, fresh],
-            "expectedCount": 2, "status": "likely_complete"
+            "expectedCount": 2, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete"
         })
         self.assertTrue(result["hasChanges"])
         self.assertTrue(result["canPrune"])
@@ -249,13 +258,15 @@ class V0183Tests(unittest.TestCase):
         replacement = {**old, "commentId": "comment-new-identity"}
         compared = self.store.compare_comments({
             "noteId": note["noteId"], "comments": [replacement, kept],
-            "expectedCount": 2, "status": "likely_complete",
+            "expectedCount": 2, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete",
         })
         self.assertEqual((1, 1), (compared["newCount"], compared["removedCount"]))
         self.assertEqual("comment-old", compared["removedComments"][0]["commentId"])
         self.store.sync_comment_snapshot({
             "noteId": note["noteId"], "note": note, "comments": [replacement, kept],
-            "expectedCount": 2, "status": "likely_complete",
+            "expectedCount": 2, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete",
         })
         rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
         self.assertEqual({"comment-old", "comment-kept", "comment-new-identity"}, set(rows))
@@ -321,9 +332,11 @@ class V0183Tests(unittest.TestCase):
         fresh = {"commentId": "comment-new", "author": "新用户", "content": "新增评论", "publishedAt": "08-24"}
         result = self.store.sync_comment_snapshot({
             "noteId": note["noteId"], "note": note, "comments": [kept, fresh],
-            "expectedCount": 2, "status": "likely_complete"
+            "expectedCount": 2, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete"
         })
         self.assertEqual("latest", result["status"])
+        self.assertEqual("not_started", result["pullStatus"])
         self.assertEqual((1, 1), (result["newCount"], result["removedCount"]))
         db_rows = {row["comment_id"]: row for row in self.store.list_comments(note["noteId"])}
         self.assertEqual({"comment-old", "comment-kept", "comment-new"}, set(db_rows))
@@ -349,7 +362,8 @@ class V0183Tests(unittest.TestCase):
 
         restored = self.store.sync_comment_snapshot({
             "noteId": note["noteId"], "note": note, "comments": [old, kept, fresh],
-            "expectedCount": 3, "status": "likely_complete"
+            "expectedCount": 3, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete"
         })
         self.assertEqual(1, restored["newCount"])
         restored_row = next(row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
@@ -360,6 +374,647 @@ class V0183Tests(unittest.TestCase):
             (media_dir / "comments.json").read_text(encoding="utf-8")
         )}
         self.assertFalse(restored_material["comment-old"]["isDeleted"])
+
+    def test_single_pull_complete_snapshot_marks_missing_comment_deleted(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        _notes_path, comments_path = self._configure_csv("single-complete-presence")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        result = self.store.pull_to_excel({
+            "note": note, "comments": [kept], "expectedCount": 1,
+            "collectionEvidence": COMPLETE_EVIDENCE,
+            "commentStatus": "likely_complete",
+        })
+        self.assertEqual(1, result["commentMarkedDeleted"])
+        self.assertTrue(result["consistencyVerified"])
+        self.assertTrue(result["consistency"]["stateHash"])
+        csv_rows = {row["笔记评论ID"]: row for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)}
+        self.assertEqual("已删除", csv_rows["comment-old"]["评论状态"])
+        with self.store._session() as db:
+            status = db.execute(
+                "SELECT comment_status,is_deleted FROM comments WHERE comment_id='comment-old'"
+            ).fetchone()
+        self.assertEqual(("已删除", 1), tuple(status))
+
+    def test_failed_field_verification_rolls_back_csv_and_sqlite(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        notes_path, comments_path = self._configure_csv("sync-rollback")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        before_files = (notes_path.read_bytes(), comments_path.read_bytes())
+        with self.store._session() as db:
+            before_db = [tuple(row) for row in db.execute(
+                "SELECT comment_id,content,comment_status,is_deleted FROM comments WHERE note_id=? ORDER BY comment_id",
+                (note["noteId"],),
+            ).fetchall()]
+        original_verify = self.store._verify_note_store_consistency
+        self.store._verify_note_store_consistency = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("forced field mismatch")
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "forced field mismatch"):
+                self.store.sync_comment_snapshot({
+                    "noteId": note["noteId"], "note": note,
+                    "comments": [kept, {"commentId": "comment-new", "author": "新", "content": "新增"}],
+                    "expectedCount": 2, "status": "likely_complete",
+                })
+        finally:
+            self.store._verify_note_store_consistency = original_verify
+        self.assertEqual(before_files, (notes_path.read_bytes(), comments_path.read_bytes()))
+        with self.store._session() as db:
+            after_db = [tuple(row) for row in db.execute(
+                "SELECT comment_id,content,comment_status,is_deleted FROM comments WHERE note_id=? ORDER BY comment_id",
+                (note["noteId"],),
+            ).fetchall()]
+        self.assertEqual(before_db, after_db)
+
+    def test_failed_pull_restores_managed_media_files_and_snapshots(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        notes_path, comments_path = self._configure_csv("media-rollback")
+        media_dir = Path(self.tmp.name) / "posts_materials" / "rollback"
+        media_dir.mkdir(parents=True)
+        (media_dir / "image-01.jpg").write_bytes(b"original-image")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(media_dir), note["noteId"]))
+        self.store._sync_pull_to_xlsx(
+            note, [old, kept], {"folder": str(media_dir), "files": ["image-01.jpg"]}
+        )
+        self.store._refresh_material_snapshot_for_note(note["noteId"])
+        before_files = {
+            path.name: path.read_bytes() for path in media_dir.iterdir() if path.is_file()
+        }
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        original_download = self.store._download_note_media
+        original_verify = self.store._verify_note_store_consistency
+
+        def destructive_download(_note):
+            (media_dir / "image-01.jpg").write_bytes(b"changed-image")
+            (media_dir / "image-02.jpg").write_bytes(b"new-image")
+            (media_dir / "note.json").write_text("{}", encoding="utf-8")
+            return {
+                "status": "complete", "folder": str(media_dir),
+                "files": ["image-01.jpg", "image-02.jpg", "note.json", "帖子正文.txt"],
+                "fileCount": 4, "imageCount": 2, "videoCount": 0, "error": "",
+            }
+
+        self.store._download_note_media = destructive_download
+        self.store._verify_note_store_consistency = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("forced media rollback")
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "forced media rollback"):
+                self.store.pull_to_excel({
+                    "note": note, "comments": [old, kept], "expectedCount": 2,
+                    "commentStatus": "likely_complete",
+                })
+        finally:
+            self.store._download_note_media = original_download
+            self.store._verify_note_store_consistency = original_verify
+        after_files = {path.name: path.read_bytes() for path in media_dir.iterdir() if path.is_file()}
+        self.assertEqual(before_files, after_files)
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+
+    def test_legacy_comment_url_and_deleted_status_schema_migration_is_lossless(self):
+        notes_path, comments_path = self._configure_csv("legacy-comment-columns")
+        note = {
+            "noteId": "legacynote123", "title": "旧评论列迁移", "content": "正文",
+            "author": "帖主", "authorUrl": "https://www.xiaohongshu.com/user/profile/post-owner",
+            "url": "https://www.xiaohongshu.com/explore/legacynote123", "detailRead": True,
+        }
+        existing = {
+            "commentId": "legacy-url-existing", "author": "评论者甲", "content": "旧列评论甲",
+            "authorUrl": "https://www.xiaohongshu.com/user/profile/comment-owner-a",
+        }
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [existing], "status": "partial"})
+        self.store._sync_pull_to_xlsx(note, [existing], {"folder": "", "files": []})
+        with self.store._session() as db:
+            db.execute(
+                """UPDATE comments SET comment_status='已删除',is_deleted=1,
+                   author_url=? WHERE comment_id=?""",
+                (existing["authorUrl"], existing["commentId"]),
+            )
+        legacy_headers = [
+            name for name in COMMENT_CSV_HEADERS if name not in {"评论用户主页url", "评论状态"}
+        ]
+        legacy_rows = [
+            {
+                "笔记ID": note["noteId"], "原笔记url": note["url"],
+                "帖子用户主页url": existing["authorUrl"], "笔记评论ID": existing["commentId"],
+                "用户昵称": existing["author"], "评论内容": existing["content"],
+            },
+            {
+                "笔记ID": note["noteId"], "原笔记url": note["url"],
+                "帖子用户主页url": "https://www.xiaohongshu.com/user/profile/comment-owner-b",
+                "笔记评论ID": "legacy-url-new", "用户昵称": "评论者乙", "评论内容": "旧列评论乙",
+            },
+        ]
+        self.store._replace_csv_table(comments_path, legacy_headers, legacy_rows, "legacy-schema")
+
+        self.store._ensure_seed_workbook(notes_path)
+        _headers, migrated = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        by_id = {row["笔记评论ID"]: row for row in migrated}
+        self.assertEqual(existing["authorUrl"], by_id[existing["commentId"]]["评论用户主页url"])
+        self.assertEqual("https://www.xiaohongshu.com/user/profile/comment-owner-b",
+                         by_id["legacy-url-new"]["评论用户主页url"])
+        self.assertEqual(note["authorUrl"], by_id[existing["commentId"]]["帖子用户主页url"])
+        self.assertEqual("已删除", by_id[existing["commentId"]]["评论状态"])
+        self.store.seed_from_xlsx(notes_path)
+        with self.store._session() as db:
+            saved = db.execute(
+                "SELECT comment_id,author_url,comment_status,is_deleted FROM comments "
+                "WHERE comment_id IN ('legacy-url-existing','legacy-url-new') ORDER BY comment_id"
+            ).fetchall()
+        self.assertEqual(("legacy-url-existing", existing["authorUrl"], "已删除", 1), tuple(saved[0]))
+        self.assertEqual(("legacy-url-new", "https://www.xiaohongshu.com/user/profile/comment-owner-b", "存在", 0),
+                         tuple(saved[1]))
+
+    def test_empty_comment_snapshot_requires_explicit_evidence_and_deduplicated_count(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        self._configure_csv("empty-evidence")
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": "", "files": []})
+        unverified = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [],
+            "expectedCount": 0, "status": "likely_complete",
+        })
+        self.assertFalse(unverified["canPrune"])
+        self.assertEqual(0, unverified["commentsMarkedDeleted"])
+        duplicate = self.store.compare_comments({
+            "noteId": note["noteId"], "comments": [kept, dict(kept)],
+            "expectedCount": 2, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete",
+        })
+        self.assertEqual(1, duplicate["currentCount"])
+        self.assertFalse(duplicate["canPrune"])
+        verified = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [],
+            "expectedCount": 0, "explicitEmptyVerified": True,
+            "collectionEvidence": COMPLETE_EVIDENCE, "status": "likely_complete",
+        })
+        self.assertTrue(verified["canPrune"])
+        self.assertEqual(2, verified["commentsMarkedDeleted"])
+
+    def test_access_status_without_exact_business_csv_row_rolls_back(self):
+        notes_path, _comments_path = self._configure_csv("access-no-row")
+        note = {
+            "noteId": "accessnorow123", "title": "不在业务表", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/accessnorow123",
+        }
+        self.store.confirm(note)
+        before_csv = notes_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "恰有一行"):
+            self.store.set_note_access_status({"noteId": note["noteId"], "status": "unreachable"})
+        self.assertEqual(before_csv, notes_path.read_bytes())
+        with self.store._session() as db:
+            saved = db.execute(
+                "SELECT access_status,post_status,is_deleted FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone()
+        self.assertEqual(("", "存在", 0), tuple(saved))
+
+    def test_partial_media_result_rolls_back_old_binary_instead_of_committing(self):
+        note, old, kept = self._seed_pulled_note_with_comments()
+        notes_path, comments_path = self._configure_csv("partial-media-rollback")
+        media_dir = Path(self.tmp.name) / "posts_materials" / "partial-media"
+        media_dir.mkdir(parents=True)
+        (media_dir / "image-01.jpg").write_bytes(b"original")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(media_dir), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [old, kept], {"folder": str(media_dir), "files": ["image-01.jpg"]})
+        self.store._refresh_material_snapshot_for_note(note["noteId"])
+        before = {path.name: path.read_bytes() for path in media_dir.iterdir() if path.is_file()}
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        original_download = self.store._download_note_media
+
+        def partial_download(_note):
+            (media_dir / "image-01.jpg").write_bytes(b"damaged")
+            (media_dir / "image-02.jpg").write_bytes(b"partial-new")
+            return {"status": "partial", "folder": str(media_dir), "files": ["image-01.jpg"],
+                    "fileCount": 1, "imageCount": 1, "videoCount": 0, "error": "图片2下载失败"}
+
+        self.store._download_note_media = partial_download
+        try:
+            with self.assertRaisesRegex(ValueError, "素材下载未完整"):
+                self.store.pull_to_excel({
+                    "note": note, "comments": [old, kept], "expectedCount": 2,
+                    "commentStatus": "likely_complete",
+                })
+        finally:
+            self.store._download_note_media = original_download
+        after = {path.name: path.read_bytes() for path in media_dir.iterdir() if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+
+    def test_persistent_checkpoint_recovers_interrupted_sync_on_next_start(self):
+        notes_path, comments_path = self._configure_csv("persistent-checkpoint")
+        note = {
+            "noteId": "recovernote123", "title": "崩溃恢复", "content": "原正文",
+            "url": "https://www.xiaohongshu.com/explore/recovernote123", "detailRead": True,
+        }
+        comment = {"commentId": "recover-comment", "author": "用户", "content": "原评论"}
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+        media_dir = Path(self.tmp.name) / "posts_materials" / "recover"
+        media_dir.mkdir(parents=True)
+        (media_dir / "image-01.jpg").write_bytes(b"before-crash")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(media_dir), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(media_dir), "files": ["image-01.jpg"]})
+        self.store._refresh_material_snapshot_for_note(note["noteId"])
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        checkpoint = self.store._capture_sync_checkpoint(note["noteId"], capture_media_binaries=True)
+        with self.store._session() as db:
+            db.execute("UPDATE comments SET content='崩溃后的半成品' WHERE comment_id='recover-comment'")
+        (media_dir / "image-01.jpg").write_bytes(b"after-crash")
+        self.store._replace_csv_table(notes_path, NOTE_CSV_HEADERS, [], "interrupted")
+        self.assertTrue(Path(checkpoint["checkpointDir"], "checkpoint.json").is_file())
+
+        recovered = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        recovered.configure_data_files(notes_path)
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+        with recovered._session() as db:
+            content = db.execute(
+                "SELECT content FROM comments WHERE comment_id='recover-comment'"
+            ).fetchone()[0]
+        self.assertEqual("原评论", content)
+        self.assertEqual(b"before-crash", (media_dir / "image-01.jpg").read_bytes())
+        self.assertFalse((self.store.export_dir / ".sync_checkpoints").exists())
+
+    def test_manual_review_write_waits_for_transactional_comment_sync(self):
+        self._configure_csv("concurrent-review")
+        note = {
+            "noteId": "concurrent123", "title": "并发串行", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/concurrent123", "detailRead": True,
+        }
+        comment = {"commentId": "concurrent-comment", "author": "用户", "content": "评论"}
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+        folder = Path(self.tmp.name) / "posts_materials" / "concurrent"
+        folder.mkdir(parents=True)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(folder), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(folder), "files": []})
+        self.store._refresh_material_snapshot_for_note(note["noteId"])
+        original_write = self.store._write_media_snapshot
+        entered = threading.Event()
+        release = threading.Event()
+        review_done = threading.Event()
+        errors = []
+
+        def blocked_write(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("test release timeout")
+            return original_write(*args, **kwargs)
+
+        def sync_worker():
+            try:
+                self.store.sync_comment_snapshot({
+                    "noteId": note["noteId"], "note": note, "comments": [comment],
+                    "expectedCount": 1, "collectionEvidence": COMPLETE_EVIDENCE,
+                    "status": "likely_complete",
+                })
+            except Exception as exc:
+                errors.append(exc)
+
+        def review_worker():
+            try:
+                self.store.update_review({
+                    "targetType": "note", "targetId": note["noteId"],
+                    "reviewStatus": "resolved", "manualNegative": True,
+                })
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                review_done.set()
+
+        self.store._write_media_snapshot = blocked_write
+        sync_thread = threading.Thread(target=sync_worker)
+        review_thread = threading.Thread(target=review_worker)
+        try:
+            sync_thread.start()
+            self.assertTrue(entered.wait(5))
+            review_thread.start()
+            self.assertFalse(review_done.wait(.2))
+            release.set()
+            sync_thread.join(10)
+            review_thread.join(10)
+        finally:
+            release.set()
+            self.store._write_media_snapshot = original_write
+        self.assertFalse(sync_thread.is_alive())
+        self.assertFalse(review_thread.is_alive())
+        self.assertEqual([], errors)
+        with self.store._session() as db:
+            row = db.execute(
+                "SELECT review_status,manual_negative FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone()
+        self.assertEqual(("resolved", 1), tuple(row))
+
+    def test_global_repair_checkpoint_capture_failure_cleans_prior_checkpoints(self):
+        notes_path, comments_path = self._configure_csv("capture-failure")
+        for suffix in ("aaa", "bbb"):
+            note = {
+                "noteId": f"capture{suffix}123", "title": f"捕获{suffix}", "content": "正文",
+                "url": f"https://www.xiaohongshu.com/explore/capture{suffix}123",
+            }
+            self.store.confirm(note)
+            self.store._sync_pull_to_xlsx(note, [], {"folder": "", "files": []})
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        with self.store._session() as db:
+            before_db = [tuple(row) for row in db.execute(
+                "SELECT note_id,title FROM notes ORDER BY note_id"
+            ).fetchall()]
+        original_capture = self.store._capture_sync_checkpoint
+        calls = 0
+
+        def fail_second(note_id, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("forced checkpoint capture failure")
+            return original_capture(note_id, **kwargs)
+
+        self.store._capture_sync_checkpoint = fail_second
+        try:
+            with self.assertRaisesRegex(OSError, "forced checkpoint capture failure"):
+                self.store.repair_csv_relationships({})
+        finally:
+            self.store._capture_sync_checkpoint = original_capture
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+        with self.store._session() as db:
+            after_db = [tuple(row) for row in db.execute(
+                "SELECT note_id,title FROM notes ORDER BY note_id"
+            ).fetchall()]
+        self.assertEqual(before_db, after_db)
+        self.assertFalse((self.store.export_dir / ".sync_checkpoints").exists())
+
+    def test_failed_global_health_repair_restores_all_checkpointed_stores(self):
+        notes_path, comments_path = self._configure_csv("global-repair-rollback")
+        note = {
+            "noteId": "globalrepair123", "title": "全局修复回滚", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/globalrepair123", "detailRead": True,
+        }
+        comment = {"commentId": "global-repair-comment", "author": "用户", "content": "评论"}
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+        folder = Path(self.tmp.name) / "posts_materials" / "global-repair"
+        folder.mkdir(parents=True)
+        (folder / "image-01.jpg").write_bytes(b"global-before")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=?,comment_count_collected=99 WHERE note_id=?",
+                       (str(folder), note["noteId"]))
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": str(folder), "files": ["image-01.jpg"]})
+        self.store._refresh_material_snapshot_for_note(note["noteId"])
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        before_files = {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()}
+        with self.store._session() as db:
+            before_db = tuple(db.execute(
+                "SELECT comment_count_collected,media_dir FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone())
+        original_refresh = self.store._refresh_all_material_snapshots
+
+        def fail_after_unrelated_database_write():
+            with self.store._session() as db:
+                db.execute(
+                    "INSERT INTO data_repair_archive VALUES(?,?,?,?,?,?)",
+                    ("must-rollback", "test", 1, "forced", "{}", "now"),
+                )
+            raise OSError("forced global failure")
+
+        self.store._refresh_all_material_snapshots = fail_after_unrelated_database_write
+        try:
+            result = self.store.repair_data_health({})
+        finally:
+            self.store._refresh_all_material_snapshots = original_refresh
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rolledBack"])
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+        self.assertEqual(before_files, {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()})
+        with self.store._session() as db:
+            after_db = tuple(db.execute(
+                "SELECT comment_count_collected,media_dir FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone())
+            unrelated_count = db.execute(
+                "SELECT COUNT(*) FROM data_repair_archive WHERE repair_id='must-rollback'"
+            ).fetchone()[0]
+        self.assertEqual(before_db, after_db)
+        self.assertEqual(0, unrelated_count)
+        self.assertFalse((self.store.export_dir / ".sync_checkpoints").exists())
+
+    def test_failed_new_pull_preserves_preexisting_unlinked_user_material_folder(self):
+        notes_path, comments_path = self._configure_csv("preexisting-material")
+        note = {
+            "noteId": "preexisting123", "title": "预存用户目录", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/preexisting123", "detailRead": True,
+        }
+        folder = notes_path.parent / "posts_materials" / self.store._safe_media_folder_name(note)
+        folder.mkdir(parents=True)
+        (folder / "user-file.txt").write_bytes(b"must-survive")
+        before_csv = (notes_path.read_bytes(), comments_path.read_bytes())
+        original_download = self.store._download_note_media
+
+        def fail_after_writing(_note):
+            (folder / "image-01.jpg").write_bytes(b"transaction-file")
+            (folder / "note.json").write_text("{}", encoding="utf-8")
+            raise OSError("forced material failure")
+
+        self.store._download_note_media = fail_after_writing
+        try:
+            with self.assertRaisesRegex(ValueError, "素材快照写入失败"):
+                self.store.pull_to_excel({"note": note, "comments": [], "commentStatus": "partial"})
+        finally:
+            self.store._download_note_media = original_download
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(b"must-survive", (folder / "user-file.txt").read_bytes())
+        self.assertFalse((folder / "image-01.jpg").exists())
+        self.assertFalse((folder / "note.json").exists())
+        self.assertEqual(before_csv, (notes_path.read_bytes(), comments_path.read_bytes()))
+
+    def test_startup_recovery_accepts_declared_internal_csv_crash_window(self):
+        notes_path, _comments_path = self._configure_csv("checkpoint-internal-window")
+        note = {
+            "noteId": "internalwindow123", "title": "内部替换窗口", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/internalwindow123",
+        }
+        self.store.confirm(note)
+        self.store._sync_pull_to_xlsx(note, [], {"folder": "", "files": []})
+        before = notes_path.read_bytes()
+        checkpoint = self.store._capture_sync_checkpoint(note["noteId"])
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        rows[0]["笔记标题"] = "尚未提交完成的内部标题"
+        temporary = self.store._write_csv_temporary(notes_path, headers, rows, "crash-window")
+        self.store._prepare_active_checkpoint_csv_replacement({notes_path: temporary})
+        replace_with_retry(temporary, notes_path)
+        self.assertNotEqual(before, notes_path.read_bytes())
+
+        recovered = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        recovered.configure_data_files(notes_path)
+        self.assertEqual(before, notes_path.read_bytes())
+        self.assertFalse(Path(checkpoint["checkpointDir"]).exists())
+        self.store._active_csv_checkpoint = None
+
+    def test_startup_recovery_stops_on_external_csv_conflict_and_preserves_copy(self):
+        notes_path, _comments_path = self._configure_csv("checkpoint-conflict")
+        note = {
+            "noteId": "conflictnote123", "title": "恢复冲突", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/conflictnote123",
+        }
+        self.store.confirm(note)
+        self.store._sync_pull_to_xlsx(note, [], {"folder": "", "files": []})
+        checkpoint = self.store._capture_sync_checkpoint(note["noteId"])
+        external_bytes = notes_path.read_bytes() + b"\r\n# external edit"
+        notes_path.write_bytes(external_bytes)
+
+        recovered = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        with self.assertRaisesRegex(RuntimeError, "外部 CSV 修改"):
+            recovered.configure_data_files(notes_path)
+        self.assertEqual(external_bytes, notes_path.read_bytes())
+        conflicts = list(Path(checkpoint["checkpointDir"]).glob("external-conflict-*.csv"))
+        self.assertEqual(1, len(conflicts))
+        self.assertEqual(external_bytes, conflicts[0].read_bytes())
+        self.store._discard_sync_checkpoint(checkpoint)
+
+    def test_verifier_rejects_duplicate_csv_rows_and_cross_note_comment_move(self):
+        notes_path, comments_path = self._configure_csv("identity-guards")
+        first = {
+            "noteId": "guardnote123", "title": "帖子甲", "content": "甲",
+            "url": "https://www.xiaohongshu.com/explore/guardnote123",
+        }
+        second = {
+            "noteId": "guardnote456", "title": "帖子乙", "content": "乙",
+            "url": "https://www.xiaohongshu.com/explore/guardnote456",
+        }
+        comment = {"commentId": "guard-comment-1", "author": "用户", "content": "不可串帖"}
+        for note in (first, second):
+            self.store.confirm(note)
+            self.store._sync_pull_to_xlsx(note, [comment] if note is first else [], {"folder": "", "files": []})
+        self.store.upsert_comments({"noteId": first["noteId"], "comments": [comment], "status": "partial"})
+        headers, rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        rows.append(dict(rows[0]))
+        self.store._replace_csv_table(comments_path, headers, rows, "duplicate-id")
+        with self.assertRaisesRegex(ValueError, "重复评论 ID"):
+            self.store._verify_note_store_consistency(first["noteId"])
+        self.store._replace_csv_table(comments_path, headers, rows[:1], "remove-duplicate")
+        with self.assertRaisesRegex(ValueError, "属于其他帖子"):
+            self.store._sync_pull_to_xlsx(second, [comment], {"folder": "", "files": []})
+        self.assertEqual(2, len(self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)[1]))
+        self.assertEqual(first["noteId"], self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)[1][0]["笔记ID"])
+
+    def test_comment_sync_uses_one_canonical_long_title_across_stores(self):
+        notes_path, _comments_path = self._configure_csv("canonical-title")
+        note = {
+            "noteId": "longtitle123", "title": "很长标题" * 30, "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/longtitle123", "detailRead": True,
+        }
+        comment = {"commentId": "long-title-comment", "author": "用户", "content": "评论"}
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+        result = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": note, "comments": [comment],
+            "expectedCount": 1, "collectionEvidence": COMPLETE_EVIDENCE,
+            "status": "likely_complete",
+        })
+        self.assertTrue(result["consistencyVerified"])
+        csv_title = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)[1][0]["笔记标题"]
+        with self.store._session() as db:
+            db_title = db.execute("SELECT title FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0]
+        self.assertEqual(csv_title, db_title)
+        self.assertLessEqual(len(db_title), 80)
+
+    def test_empty_csv_source_fields_preserve_tags_and_db_analysis_repairs_csv(self):
+        notes_path, comments_path = self._configure_csv("source-preserve")
+        note = {
+            "noteId": "preservetags123", "title": "保留来源字段", "content": "正文",
+            "tags": ["#保留话题"], "url": "https://www.xiaohongshu.com/explore/preservetags123",
+            "detailRead": True,
+        }
+        comment = {"commentId": "preserve-comment", "author": "用户", "content": "评论"}
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "partial"})
+        self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+        headers, rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        rows[0]["笔记话题"] = ""
+        rows[0]["AI情绪判断"] = ""
+        rows[0]["帖子好坏"] = ""
+        self.store._replace_csv_table(notes_path, headers, rows, "blank-source")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET post_sentiment='negative' WHERE note_id=?", (note["noteId"],))
+        self.store._seed_from_csv(notes_path)
+        with self.store._session() as db:
+            stored_tags = db.execute("SELECT tags FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0]
+        self.assertEqual("#保留话题", stored_tags)
+        result = self.store.sync_comment_snapshot({
+            "noteId": note["noteId"], "note": {"noteId": note["noteId"], "detailRead": True},
+            "comments": [comment], "expectedCount": 1, "status": "likely_complete",
+        })
+        self.assertTrue(result["consistencyVerified"])
+        saved_note = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)[1][0]
+        self.assertEqual("#保留话题", saved_note["笔记话题"])
+        self.assertEqual(("差评", "差评"), (saved_note["AI情绪判断"], saved_note["帖子好坏"]))
+        self.assertEqual(1, len(self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)[1]))
+
+    def test_data_health_reports_comment_aliases_without_auto_merging(self):
+        self._configure_csv("identity-audit")
+        note = {
+            "noteId": "identitynote123", "title": "评论身份体检", "content": "正文",
+            "author": "作者", "url": "https://www.xiaohongshu.com/explore/identitynote123",
+        }
+        self.store.confirm(note)
+        comments = [
+            {"commentId": "raw-id-1", "author": "用户", "content": "同一条", "publishedAt": "09-01"},
+            {"commentId": "comment-raw-id-1", "author": "用户", "content": "同一条", "publishedAt": "09-01"},
+            {"commentId": "legacy-separate-id", "author": "用户", "content": "同一条", "publishedAt": "09-01"},
+        ]
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": comments, "status": "partial"})
+        self.store._sync_pull_to_xlsx(note, comments, {"folder": "", "files": []})
+
+        health = self.store.data_health()
+        self.assertEqual(1, health["summary"]["commentIdAliasCandidates"])
+        self.assertEqual(1, health["summary"]["logicalDuplicateCommentCandidates"])
+        issue_ids = {item["id"] for item in health["issues"]}
+        self.assertIn("comment_id_alias_candidates", issue_ids)
+        self.assertIn("comment_logical_duplicate_candidates", issue_ids)
+        self.assertTrue(health["summary"]["relationshipsConsistent"])
+        with self.store._session() as db:
+            self.assertEqual(3, db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=?", (note["noteId"],)
+            ).fetchone()[0])
+
+    def test_tag_and_chinese_comment_level_normalization(self):
+        self.assertEqual("#Origani #护肤", tag_text("# O r i g a n 护 肤 #Origani #护肤"))
+        self.assertEqual("#现代美容仪", tag_text("# 现 代 美 容 仪 作 者"))
+        self.assertEqual(2, comment_level_value("二级评论"))
+        notes_path, comments_path = self._configure_csv("chinese-level")
+        note_headers, note_rows = self.store._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        note_rows.append({**{name: "" for name in note_headers},
+                          "笔记ID": "levelnote123", "笔记url": "https://www.xiaohongshu.com/explore/levelnote123",
+                          "笔记标题": "层级测试", "笔记内容": "正文", "帖子状态": "存在"})
+        self.store._replace_csv_table(notes_path, note_headers, note_rows, "level-note")
+        comment_headers, comment_rows = self.store._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        comment_rows.append({**{name: "" for name in comment_headers},
+                             "笔记ID": "levelnote123", "原笔记url": "https://www.xiaohongshu.com/explore/levelnote123",
+                             "笔记评论ID": "level-comment-1", "用户昵称": "用户", "评论内容": "回复",
+                             "评论层级": "二级评论", "父评论ID": "parent-1", "评论状态": "存在"})
+        self.store._replace_csv_table(comments_path, comment_headers, comment_rows, "level-comment")
+        self.store.seed_from_xlsx(notes_path)
+        with self.store._session() as db:
+            stored_level = db.execute(
+                "SELECT comment_level,payload_json FROM comments WHERE comment_id='level-comment-1'"
+            ).fetchone()
+        self.assertEqual(2, stored_level[0])
+        self.assertEqual("子评论", json.loads(stored_level[1])["commentType"])
+
+        self.store.upsert_comments({
+            "noteId": "levelnote123", "status": "partial", "comments": [{
+                "commentId": "level-comment-2", "parentCommentId": "parent-2",
+                "commentLevel": 1, "author": "用户2", "content": "新回复",
+            }]
+        })
+        with self.store._session() as db:
+            inserted = db.execute(
+                "SELECT comment_level,payload_json FROM comments WHERE comment_id='level-comment-2'"
+            ).fetchone()
+        self.assertEqual(2, inserted[0])
+        self.assertEqual("子评论", json.loads(inserted[1])["commentType"])
 
     def test_partial_sync_never_marks_unloaded_comments_deleted(self):
         note, old, kept = self._seed_pulled_note_with_comments()
@@ -460,9 +1115,13 @@ class V0183Tests(unittest.TestCase):
         panel = (extension / "sidepanel.js").read_text(encoding="utf-8")
         self.assertIn("deletePulledNoteAndBroadcast", worker)
         self.assertIn('type: "localNoteStateChanged"', worker)
-        self.assertIn("评论无变化，正在校准 CSV、SQLite 与素材快照", worker)
+        self.assertIn("帖子与评论无变化，正在校准存续状态、CSV、SQLite 与素材快照", worker)
         self.assertIn("enforceExactNoteIdentity", worker)
         self.assertIn("identityConflictBlocked", content)
+        self.assertIn("processPanelMutationIsInternal", content)
+        self.assertIn("outsideThreshold", content)
+        self.assertIn("_appliedGeometry", content)
+        self.assertIn("batchFailureRenderSignature", panel)
         self.assertIn('message.type === "localNoteStateChanged"', content)
         self.assertIn('message.type === "localNoteStateChanged"', panel)
 
