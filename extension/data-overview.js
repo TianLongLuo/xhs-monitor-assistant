@@ -46,8 +46,8 @@ const STATUS_FIELDS = new Set(["status", "pull_status", "post_status", "comment_
 const LONG_FIELD_HINTS = ["content", "summary", "reason", "json", "error", "categories", "note"];
 const MONO_FIELD_HINTS = ["_id", "url", "path", "dir", "hash", "json"];
 const NO_VALUE_OPERATORS = new Set(["is_empty", "not_empty", "is_true", "is_false"]);
-const REQUIRED_NOTE_FIELDS = new Set(["note_id", "ignore_status"]);
-const REQUIRED_COMMENT_FIELDS = new Set(["comment_id", "note_id", "thread_root_content"]);
+const REQUIRED_NOTE_FIELDS = new Set(["note_id", "open_material", "ignore_status"]);
+const REQUIRED_COMMENT_FIELDS = new Set(["comment_id", "note_id", "post_locator", "thread_root_content"]);
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
 const INFINITE_BATCH_SIZE = 100;
 
@@ -235,9 +235,11 @@ function renderFieldOptions() {
   elements.fieldCount.textContent = String(selected.size);
 }
 
-function fieldOptionsHtml(selectedKey = "") {
+function fieldOptionsHtml(selectedKey = "", mode = "all") {
   const groups = new Map();
   for (const field of orderedDatasetFields()) {
+    if (mode === "filter" && !field.filterable) continue;
+    if (mode === "sort" && !field.sortable) continue;
     if (!groups.has(field.source)) groups.set(field.source, []);
     groups.get(field.source).push(field);
   }
@@ -407,9 +409,15 @@ function clearColumnFilters() {
 
 function updateHeaderFilterState() {
   for (const header of elements.tableHead.querySelectorAll("th[data-field]")) {
+    const field = fieldMap().get(header.dataset.field);
+    const badge = header.querySelector("i");
+    if (field?.filterable === false) {
+      header.dataset.filtered = "false";
+      if (badge) badge.textContent = "↗";
+      continue;
+    }
     const count = state.filters.filter((item) => item.field === header.dataset.field).length;
     header.dataset.filtered = String(count > 0);
-    const badge = header.querySelector("i");
     if (badge) badge.textContent = count ? String(count) : "⌄";
   }
 }
@@ -426,7 +434,7 @@ function renderFilters() {
     row.dataset.filterId = filter.id;
     const fieldSelect = document.createElement("select");
     fieldSelect.dataset.role = "field";
-    fieldSelect.innerHTML = fieldOptionsHtml(filter.field);
+    fieldSelect.innerHTML = fieldOptionsHtml(filter.field, "filter");
     const operatorSelect = document.createElement("select");
     operatorSelect.dataset.role = "operator";
     operatorSelect.innerHTML = operatorsFor(field).map((operator) => `<option value="${operator.id}"${operator.id === filter.operator ? " selected" : ""}>${escapeHtml(operator.label)}</option>`).join("");
@@ -477,7 +485,7 @@ function renderSorts() {
     row.dataset.sortId = sort.id;
     const field = document.createElement("select");
     field.dataset.role = "field";
-    field.innerHTML = fieldOptionsHtml(sort.field);
+    field.innerHTML = fieldOptionsHtml(sort.field, "sort");
     const direction = document.createElement("select");
     direction.dataset.role = "direction";
     direction.innerHTML = `<option value="desc"${sort.direction !== "asc" ? " selected" : ""}>降序</option><option value="asc"${sort.direction === "asc" ? " selected" : ""}>升序</option>`;
@@ -784,6 +792,52 @@ async function runQuery({ retrySnapshot = true, append = false } = {}) {
   }
 }
 
+async function locatePostInDatabase(noteId) {
+  const targetId = String(noteId || "").trim();
+  if (!targetId) { showToast("该评论缺少关联笔记 ID"); return; }
+  state.dataset = "notes";
+  state.page = 0;
+  state.search = "";
+  state.filterLogic = "and";
+  state.filters = [{ id: crypto.randomUUID(), field: "note_id", operator: "eq", value: targetId, value2: "" }];
+  state.sorts = [];
+  elements.globalSearch.value = "";
+  document.querySelectorAll("[data-quick-view]").forEach((item) => item.classList.remove("is-active"));
+  renderSchemaState();
+  renderFieldOptions();
+  renderFilters();
+  renderSorts();
+  savePreferences();
+  await runQuery({ append: false });
+  const row = elements.tableBody.querySelector("tr[data-record-id]");
+  row?.scrollIntoView({ block: "center", inline: "nearest" });
+  showToast(state.total === 1 ? "已定位到帖子数据库" : "未找到对应的帖子记录");
+}
+
+async function runTableAction(button) {
+  const action = button?.dataset.action || "";
+  const value = button?.dataset.value || "";
+  if (!action || !value || button.disabled) return;
+  button.disabled = true;
+  const original = button.textContent;
+  try {
+    if (action === "locate_post") {
+      button.textContent = "定位中…";
+      await locatePostInDatabase(value);
+      return;
+    }
+    if (action === "open_material") {
+      button.textContent = "打开中…";
+      await sendRuntime({ type: "openLocalArtifact", payload: { kind: "folder", noteId: value } });
+      showToast("已打开本地素材目录");
+    }
+  } catch (error) {
+    showToast(error.message || "操作没有完成");
+  } finally {
+    if (button.isConnected) { button.disabled = false; button.textContent = original; }
+  }
+}
+
 function renderTable(result, { append = false, incomingRows = result.rows || [] } = {}) {
   const fields = currentVisibleFields();
   const map = fieldMap();
@@ -801,14 +855,15 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     for (const key of fields) {
       const field = map.get(key);
       const th = document.createElement("th");
-      th.className = "filterable-header";
-      th.tabIndex = 0;
+      th.className = field?.filterable ? "filterable-header" : "action-header";
+      if (field?.filterable) th.tabIndex = 0;
       th.dataset.field = key;
-      th.title = `${field?.label || key} · 点击筛选`;
+      th.title = field?.filterable ? `${field?.label || key} · 点击筛选` : (field?.label || key);
       th.dataset.type = field?.dataType || "text";
       const wrap = document.createElement("span");
       const name = document.createElement("b"); name.textContent = field?.label || key;
-      const filterIcon = document.createElement("i"); filterIcon.textContent = "⌄"; filterIcon.setAttribute("aria-hidden", "true");
+      const filterIcon = document.createElement("i");
+      filterIcon.textContent = field?.filterable ? "⌄" : "↗"; filterIcon.setAttribute("aria-hidden", "true");
       wrap.append(name, filterIcon); th.append(wrap);
       elements.tableHead.append(th);
     }
@@ -854,7 +909,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
       td.dataset.type = field.dataType;
       td.dataset.long = String(LONG_FIELD_HINTS.some((hint) => key.includes(hint)));
       td.dataset.mono = String(MONO_FIELD_HINTS.some((hint) => key.includes(hint)));
-      renderCell(td, record[key], key, field.dataType);
+      renderCell(td, record[key], key, field.dataType, field);
       tr.append(td);
     }
     elements.tableBody.append(tr);
@@ -884,7 +939,20 @@ function renderThreadRootCell(cell, record) {
   cell.append(author, content, id);
 }
 
-function renderCell(td, value, key, dataType) {
+function renderCell(td, value, key, dataType, field = {}) {
+  if (field.action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "cell-action";
+    button.dataset.action = field.action;
+    button.dataset.value = String(value || "");
+    button.disabled = !value;
+    button.textContent = field.action === "open_material"
+      ? (value ? "打开素材" : "暂无素材")
+      : (value ? "定位原帖" : "无法定位");
+    td.append(button);
+    return;
+  }
   if (value === null || value === undefined || value === "") {
     td.textContent = "—";
     td.style.color = "#a2a6ae";
@@ -952,7 +1020,10 @@ function formatFullValue(value) {
 }
 
 function addFilter(fieldKey = "") {
-  const field = fieldMap().get(fieldKey) || orderedDatasetFields().find((item) => item.key === (state.dataset === "notes" ? "title" : "content")) || orderedDatasetFields()[0];
+  const requested = fieldMap().get(fieldKey);
+  const field = (requested?.filterable ? requested : null)
+    || orderedDatasetFields().find((item) => item.filterable && item.key === (state.dataset === "notes" ? "title" : "content"))
+    || orderedDatasetFields().find((item) => item.filterable);
   if (!field) return;
   const operator = operatorsFor(field)[0]?.id || "eq";
   state.filters.push({ id: crypto.randomUUID(), field: field.key, operator, value: "", value2: "" });
@@ -983,8 +1054,8 @@ function escapeHtml(value) {
 }
 
 function exportCurrentPage() {
-  const fields = currentVisibleFields();
   const map = fieldMap();
+  const fields = currentVisibleFields().filter((key) => !map.get(key)?.action);
   const quote = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
   const lines = [fields.map((key) => quote(map.get(key)?.label || key)).join(",")];
   for (const row of state.rows) lines.push(fields.map((key) => quote(typeof row[key] === "object" ? JSON.stringify(row[key]) : row[key])).join(","));
@@ -1218,7 +1289,8 @@ function bindEvents() {
     savePreferences(); renderFieldOptions(); scheduleQuery(0);
   });
   elements.addSort.addEventListener("click", () => {
-    const field = orderedDatasetFields().find((item) => item.key.endsWith("last_seen_at")) || orderedDatasetFields()[0];
+    const field = orderedDatasetFields().find((item) => item.sortable && item.key.endsWith("last_seen_at"))
+      || orderedDatasetFields().find((item) => item.sortable);
     if (!field) return; state.sorts.push({ id: crypto.randomUUID(), field: field.key, direction: "desc" }); renderSorts();
   });
   elements.clearSorts.addEventListener("click", () => { state.sorts = []; renderSorts(); scheduleQuery(0); });
@@ -1232,8 +1304,15 @@ function bindEvents() {
     const row = event.target.closest("[data-sort-id]"); state.sorts = state.sorts.filter((item) => item.id !== row.dataset.sortId); renderSorts(); scheduleQuery(0);
   });
   elements.tableBody.addEventListener("dblclick", (event) => {
-    if (event.target.closest('[data-role="select-row"]')) return;
+    if (event.target.closest('[data-role="select-row"], .cell-action')) return;
     const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
+  });
+  elements.tableBody.addEventListener("click", (event) => {
+    const action = event.target.closest("button.cell-action");
+    if (!action) return;
+    event.preventDefault();
+    event.stopPropagation();
+    runTableAction(action);
   });
   elements.tableBody.addEventListener("change", (event) => {
     if (event.target.dataset.role !== "select-row") return;
@@ -1244,7 +1323,8 @@ function bindEvents() {
     updateSelectionUi();
   });
   elements.tableBody.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return; const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
+    if (event.key !== "Enter" || event.target.closest("button.cell-action")) return;
+    const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
   });
   elements.exportCurrent.addEventListener("click", exportCurrentPage);
   elements.deleteSelected.addEventListener("click", () => openDeleteDialog());

@@ -45,7 +45,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.30.1"
+VERSION = "0.31.1"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )
@@ -1199,7 +1199,12 @@ class MonitorStore:
             current = db.execute("SELECT media_dir FROM notes WHERE note_id=?", (note_id,)).fetchone()
             current_media_dir = text(current[0], 4000) if current else ""
         global_database_backup = text(checkpoint.get("globalDatabaseBackup"), 4000)
-        if global_database_backup:
+        # Automatic startup recovery must remain note-scoped. A whole-database
+        # backup can predate a later successful delete, ignore, review or AI
+        # write and would silently roll those unrelated operations back.
+        # Synchronous in-process rollback still uses the global image because
+        # it runs inside the operation that created the checkpoint.
+        if global_database_backup and not recovering:
             backup_path = Path(global_database_backup)
             if not backup_path.is_file():
                 raise FileNotFoundError(f"全库检查点不存在：{backup_path}")
@@ -1248,8 +1253,16 @@ class MonitorStore:
                 (note_id, int(checkpoint.get("maxEventId") or 0)),
             )
             if checkpoint.get("watchlistSnapshot") is not None:
-                db.execute("DELETE FROM watchlist")
-                self._insert_snapshot_rows(db, "watchlist", checkpoint.get("watchlistSnapshot") or [])
+                watchlist_snapshot = checkpoint.get("watchlistSnapshot") or []
+                if recovering:
+                    db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
+                    self._insert_snapshot_rows(
+                        db, "watchlist",
+                        [row for row in watchlist_snapshot if text(row.get("note_id"), 256) == note_id],
+                    )
+                else:
+                    db.execute("DELETE FROM watchlist")
+                    self._insert_snapshot_rows(db, "watchlist", watchlist_snapshot)
         previous_media_dir = text(checkpoint.get("mediaDir"), 4000)
         if previous_media_dir:
             folder = Path(previous_media_dir)
@@ -4854,6 +4867,8 @@ class MonitorStore:
                 spec = specs.get(field_key)
                 if not spec:
                     raise ValueError(f"未知筛选字段：{field_key}")
+                if not spec.filterable:
+                    raise ValueError(f"该字段仅用于操作，不能读取筛选选项：{field_key}")
                 base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
                 value_text = f"TRIM(COALESCE(CAST({spec.expression} AS TEXT),''))"
                 clauses = [DATA_OVERVIEW_NOTE_SCOPE, f"{value_text}<>''"]

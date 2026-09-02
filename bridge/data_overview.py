@@ -35,6 +35,7 @@ FIELD_LABELS = {
     "negative_type": "差评类型", "negative_subtype": "差评子类型",
     "payload_json": "原始结构化数据", "content_hash": "内容指纹",
     "business_record": "是否业务总表记录", "ignore_status": "忽略状态",
+    "open_material": "打开本地素材", "post_locator": "定位帖子数据库",
     "active_comment_count": "当前评论数",
     "deleted_comment_count": "已删除评论数", "comment_type": "评论角色",
     "thread_root_id": "一级评论 ID", "thread_root_content": "一级评论",
@@ -50,12 +51,12 @@ FIELD_LABELS = {
 
 DEFAULT_VISIBLE = {
     "notes": [
-        "note_id", "title", "author", "business_record", "ignore_status", "post_status", "access_status",
+        "note_id", "open_material", "title", "author", "business_record", "ignore_status", "post_status", "access_status",
         "pull_status", "source_like_count", "source_collect_count", "active_comment_count",
         "deleted_comment_count", "source_published_at", "last_seen_at", "url",
     ],
     "comments": [
-        "comment_id", "note_id", "thread_root_content", "content", "author", "published_at",
+        "comment_id", "note_id", "post_locator", "thread_root_content", "content", "author", "published_at",
         "like_count", "comment_level", "analysis_is_negative", "negative_type",
         "comment_status", "comment_type", "post__url", "post__title", "post__post_status",
     ],
@@ -63,13 +64,13 @@ DEFAULT_VISIBLE = {
 
 
 NOTE_PRIMARY_ORDER = [
-    "note_id", "url", "title", "content", "author", "published_at", "updated_at", "tags", "keyword",
+    "note_id", "open_material", "url", "title", "content", "author", "published_at", "updated_at", "tags", "keyword",
     "source_like_count", "source_collect_count", "source_comment_count", "source_share_count",
     "post_status", "access_status", "pull_status", "business_record", "ignore_status", "active_comment_count",
     "deleted_comment_count", "media_dir", "last_seen_at",
 ]
 COMMENT_PRIMARY_ORDER = [
-    "comment_id", "note_id", "thread_root_content", "content", "author", "published_at", "like_count",
+    "comment_id", "note_id", "post_locator", "thread_root_content", "content", "author", "published_at", "like_count",
     "comment_level", "analysis_is_negative", "negative_type", "comment_status", "comment_type",
     "post__url", "post__title", "post__post_status", "thread_root_id", "thread_root_author",
     "parent_comment_id", "author_url", "comment_url", "is_post_author", "sentiment", "negative_subtype",
@@ -118,6 +119,9 @@ class FieldSpec:
     default_visible: bool = False
     display_order: int = 10000
     suggest_values: bool = False
+    filterable: bool = True
+    sortable: bool = True
+    action: str = ""
 
     def public(self) -> dict[str, Any]:
         return {
@@ -128,8 +132,9 @@ class FieldSpec:
             "defaultVisible": self.default_visible,
             "displayOrder": self.display_order,
             "suggestValues": self.suggest_values,
-            "filterable": True,
-            "sortable": True,
+            "filterable": self.filterable,
+            "sortable": self.sortable,
+            "action": self.action,
         }
 
 
@@ -184,10 +189,11 @@ def _source_group(dataset: str, key: str, fallback: str) -> str:
 
 
 def _field_spec(dataset: str, key: str, label: str, data_type: str, expression: str,
-                source: str, default_visible: bool = False) -> FieldSpec:
+                source: str, default_visible: bool = False, *, filterable: bool = True,
+                sortable: bool = True, action: str = "") -> FieldSpec:
     return FieldSpec(
         key, label, data_type, expression, _source_group(dataset, key, source), default_visible,
-        _display_order(dataset, key), key in VALUE_OPTION_FIELDS,
+        _display_order(dataset, key), key in VALUE_OPTION_FIELDS, filterable, sortable, action,
     )
 
 
@@ -201,6 +207,10 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
             fields.append(_field_spec(dataset, name, _label(name), _data_type(name, declared),
                                       f"n.{_quote(name)}", "SQLite 扩展", name in defaults))
         fields.extend([
+            _field_spec(dataset, "open_material", _label("open_material"), "text",
+                        "CASE WHEN TRIM(COALESCE(n.media_dir,''))<>'' THEN n.note_id ELSE '' END",
+                        "本地动作", "open_material" in defaults,
+                        filterable=False, sortable=False, action="open_material"),
             _field_spec(dataset, "business_record", _label("business_record"), "boolean",
                         "CASE WHEN n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') THEN 1 ELSE 0 END",
                         "衍生字段", "business_record" in defaults),
@@ -235,6 +245,9 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
             "ELSE c.comment_id END"
         )
         fields.extend([
+            _field_spec(dataset, "post_locator", _label("post_locator"), "text", "c.note_id",
+                        "跨表动作", "post_locator" in defaults,
+                        filterable=False, sortable=False, action="locate_post"),
             _field_spec(dataset, "thread_root_id", _label("thread_root_id"), "text", root_id,
                         "评论线程", "thread_root_id" in defaults),
             _field_spec(
@@ -314,6 +327,8 @@ def compile_filter_group(group: dict[str, Any] | None, specs: dict[str, FieldSpe
         spec = specs.get(field)
         if not spec:
             raise ValueError(f"未知筛选字段：{field}")
+        if not spec.filterable:
+            raise ValueError(f"该字段仅用于操作，不能筛选：{field}")
         if operator not in OPERATOR_IDS:
             raise ValueError(f"未知筛选操作：{operator}")
         expr = spec.expression
@@ -382,7 +397,7 @@ def compile_sort(sort_items: list[dict[str, Any]] | None, specs: dict[str, Field
     for item in (sort_items or [])[:4]:
         field = str(item.get("field") or "")
         spec = specs.get(field)
-        if not spec:
+        if not spec or not spec.sortable:
             continue
         direction = "ASC" if str(item.get("direction") or "desc").lower() == "asc" else "DESC"
         output.append(f"{spec.expression} {direction}")

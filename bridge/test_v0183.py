@@ -734,6 +734,36 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual(b"before-crash", (media_dir / "image-01.jpg").read_bytes())
         self.assertFalse((self.store.export_dir / ".sync_checkpoints").exists())
 
+    def test_startup_checkpoint_recovery_never_reverts_unrelated_database_state(self):
+        notes_path, _comments_path = self._configure_csv("checkpoint-note-scope")
+        first = {
+            "noteId": "checkpoint-scope-1", "title": "检查点帖子", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/checkpoint-scope-1",
+        }
+        unrelated = {
+            "noteId": "checkpoint-scope-2", "title": "原始标题", "content": "正文",
+            "url": "https://www.xiaohongshu.com/explore/checkpoint-scope-2",
+        }
+        self.store.confirm(first)
+        self.store.confirm(unrelated)
+        checkpoint = self.store._capture_sync_checkpoint(first["noteId"], capture_global_database=True)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET title='检查点之后的标题' WHERE note_id=?", (unrelated["noteId"],))
+            db.execute("""INSERT INTO watchlist(note_id,priority,reason,created_at,updated_at)
+                       VALUES (?,'high','检查点之后加入','2026-09-02','2026-09-02')""", (unrelated["noteId"],))
+        self.assertTrue(Path(checkpoint["globalDatabaseBackup"]).is_file())
+
+        recovered = MonitorStore(self.store.db_path, self.store.export_dir, ai_client=FakeAI())
+        recovered.configure_data_files(notes_path)
+        with recovered._session() as db:
+            self.assertEqual("检查点之后的标题", db.execute(
+                "SELECT title FROM notes WHERE note_id=?", (unrelated["noteId"],)
+            ).fetchone()[0])
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM watchlist WHERE note_id=?", (unrelated["noteId"],)
+            ).fetchone()[0])
+        self.assertFalse((self.store.export_dir / ".sync_checkpoints").exists())
+
     def test_manual_review_write_waits_for_transactional_comment_sync(self):
         self._configure_csv("concurrent-review")
         note = {
@@ -1707,11 +1737,18 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue({"comment_id", "content", "post__title", "post__payload_json"}.issubset(comment_fields))
         comment_field_rows = schema["datasets"]["comments"]["fields"]
         self.assertEqual(
-            ["comment_id", "note_id", "thread_root_content", "content", "author", "published_at", "like_count",
+            ["comment_id", "note_id", "post_locator", "thread_root_content", "content", "author", "published_at", "like_count",
              "comment_level", "analysis_is_negative", "negative_type", "comment_status", "comment_type",
              "post__url", "post__title", "post__post_status"],
             [item["key"] for item in comment_field_rows if item["defaultVisible"]],
         )
+        material_action = next(item for item in schema["datasets"]["notes"]["fields"]
+                               if item["key"] == "open_material")
+        locator_action = next(item for item in comment_field_rows if item["key"] == "post_locator")
+        self.assertEqual((False, False, "open_material"),
+                         (material_action["filterable"], material_action["sortable"], material_action["action"]))
+        self.assertEqual((False, False, "locate_post"),
+                         (locator_action["filterable"], locator_action["sortable"], locator_action["action"]))
         self.assertTrue(next(item for item in comment_field_rows if item["key"] == "comment_status")["suggestValues"])
 
         note_result = self.store.query_data_overview({
@@ -1734,6 +1771,26 @@ class V0183Tests(unittest.TestCase):
         })
         self.assertEqual(1, comment_result["total"])
         self.assertEqual("价格反馈", comment_result["rows"][0]["post__title"])
+        locator_result = self.store.query_data_overview({
+            "dataset": "comments", "snapshotToken": schema["snapshotToken"],
+            "fields": ["comment_id", "post_locator"],
+            "filter": {"logic": "and", "children": [
+                {"field": "comment_id", "operator": "eq", "value": "overview-comment-a"},
+            ]},
+        })
+        self.assertEqual("overviewnote123", locator_result["rows"][0]["post_locator"])
+        with self.assertRaisesRegex(ValueError, "仅用于操作"):
+            self.store.query_data_overview({
+                "dataset": "comments", "snapshotToken": schema["snapshotToken"],
+                "filter": {"logic": "and", "children": [
+                    {"field": "post_locator", "operator": "eq", "value": "overviewnote123"},
+                ]},
+            })
+        with self.assertRaisesRegex(ValueError, "仅用于操作"):
+            self.store.data_overview_values({
+                "dataset": "comments", "snapshotToken": schema["snapshotToken"],
+                "field": "post_locator",
+            })
         thread_result = self.store.query_data_overview({
             "dataset": "comments", "snapshotToken": schema["snapshotToken"], "groupThreads": True,
             "fields": ["comment_id", "thread_root_id", "thread_root_content", "thread_root_author", "content"],
@@ -1977,6 +2034,9 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("applyColumnFilter", script)
         self.assertIn("performPermanentDelete", script)
         self.assertIn('type: "deleteDataOverviewRecords"', script)
+        self.assertIn("locatePostInDatabase", script)
+        self.assertIn("runTableAction", script)
+        self.assertIn('type: "openLocalArtifact"', script)
         self.assertGreaterEqual(script.count("await loadSchema({ preserveQuery: true })"), 2)
         self.assertIn('message.type === "queryDataOverview"', worker)
         self.assertIn('message.type === "getDataOverviewValues"', worker)
