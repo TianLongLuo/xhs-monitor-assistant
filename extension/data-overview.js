@@ -17,9 +17,10 @@ const elements = {
   selectDefaultFields: byId("selectDefaultFields"), selectAllFields: byId("selectAllFields"),
   sortPanel: byId("sortPanel"), sortRows: byId("sortRows"), addSort: byId("addSort"), clearSorts: byId("clearSorts"),
   queryBlocked: byId("queryBlocked"), blockedReason: byId("blockedReason"), retryHealth: byId("retryHealth"),
-  dataSurface: byId("dataSurface"), tableHead: byId("tableHead"), tableBody: byId("tableBody"),
+  dataSurface: byId("dataSurface"), tableViewport: byId("tableViewport"),
+  tableHead: byId("tableHead"), tableBody: byId("tableBody"),
   tableEmpty: byId("tableEmpty"), tableLoading: byId("tableLoading"), pageMeta: byId("pageMeta"),
-  pageSize: byId("pageSize"), previousPage: byId("previousPage"), nextPage: byId("nextPage"),
+  infiniteSentinel: byId("infiniteSentinel"), loadMoreText: byId("loadMoreText"),
   recordDrawer: byId("recordDrawer"), drawerType: byId("drawerType"), drawerTitle: byId("drawerTitle"),
   drawerFields: byId("drawerFields"), closeDrawer: byId("closeDrawer"), copyRecord: byId("copyRecord"),
   openRecordLink: byId("openRecordLink"), toast: byId("toast")
@@ -34,6 +35,7 @@ const LONG_FIELD_HINTS = ["content", "summary", "reason", "json", "error", "cate
 const MONO_FIELD_HINTS = ["_id", "url", "path", "dir", "hash", "json"];
 const NO_VALUE_OPERATORS = new Set(["is_empty", "not_empty", "is_true", "is_false"]);
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
+const INFINITE_BATCH_SIZE = 100;
 
 const state = {
   schema: null,
@@ -44,15 +46,17 @@ const state = {
   filterLogic: "and",
   filters: [],
   sorts: [],
-  page: 1,
-  pageSize: 50,
+  page: 0,
+  pageSize: INFINITE_BATCH_SIZE,
   total: 0,
   rows: [],
+  hasMore: true,
   loading: false,
   queryReady: false,
   currentRecord: null,
   querySerial: 0,
-  queryPending: false
+  queryPending: false,
+  resetScheduled: false
 };
 
 let queryTimer = 0;
@@ -89,15 +93,13 @@ function loadPreferences() {
       state.visibleFields.notes = Array.isArray(saved.visibleFields.notes) ? saved.visibleFields.notes : [];
       state.visibleFields.comments = Array.isArray(saved.visibleFields.comments) ? saved.visibleFields.comments : [];
     }
-    state.pageSize = [25, 50, 100, 200].includes(Number(saved.pageSize)) ? Number(saved.pageSize) : 50;
   } catch (_error) {}
 }
 
 function savePreferences() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     dataset: state.dataset,
-    visibleFields: state.visibleFields,
-    pageSize: state.pageSize
+    visibleFields: state.visibleFields
   }));
 }
 
@@ -149,7 +151,6 @@ function renderSchemaState() {
   document.querySelectorAll(".dataset-button").forEach((button) => button.classList.toggle("is-active", button.dataset.dataset === state.dataset));
   elements.datasetTitle.textContent = TITLES[state.dataset][0];
   elements.datasetSubtitle.textContent = TITLES[state.dataset][1];
-  elements.pageSize.value = String(state.pageSize);
 }
 
 function renderFieldOptions() {
@@ -280,11 +281,14 @@ function setPanel(name, open = null) {
 
 function scheduleQuery(delay = 220) {
   clearTimeout(queryTimer);
-  state.page = 1;
-  queryTimer = setTimeout(() => runQuery(), delay);
+  state.resetScheduled = true;
+  queryTimer = setTimeout(() => {
+    state.resetScheduled = false;
+    runQuery({ append: false });
+  }, delay);
 }
 
-function queryPayload() {
+function queryPayload(page = 1) {
   return {
     dataset: state.dataset,
     snapshotToken: state.snapshotToken,
@@ -292,7 +296,7 @@ function queryPayload() {
     search: state.search,
     filter: { logic: state.filterLogic, children: state.filters.map(({ id, ...filter }) => filter) },
     sort: state.sorts.map(({ id, ...sort }) => sort),
-    page: state.page,
+    page,
     pageSize: state.pageSize
   };
 }
@@ -325,7 +329,7 @@ async function loadSchema({ preserveQuery = false } = {}) {
     renderFilters();
     renderSorts();
     savePreferences();
-    if (state.queryReady) await runQuery({ retrySnapshot: false });
+    if (state.queryReady) await runQuery({ retrySnapshot: false, append: false });
   } catch (error) {
     state.queryReady = false;
     state.schema = { datasets: { notes: { fields: [], total: 0 }, comments: { fields: [], total: 0 } }, health: { error: error.message } };
@@ -336,76 +340,138 @@ async function loadSchema({ preserveQuery = false } = {}) {
   }
 }
 
-async function runQuery({ retrySnapshot = true } = {}) {
+function resetLoadedRows() {
+  state.page = 0;
+  state.total = 0;
+  state.rows = [];
+  state.hasMore = true;
+  elements.tableHead.replaceChildren();
+  elements.tableBody.replaceChildren();
+  elements.tableViewport.scrollTop = 0;
+  elements.resultCount.textContent = "—";
+  elements.pageMeta.textContent = "正在加载首批数据…";
+  elements.exportCurrent.disabled = true;
+  elements.infiniteSentinel.hidden = true;
+}
+
+function renderInfiniteState(forcedState = "") {
+  elements.pageMeta.textContent = `已加载 ${state.rows.length.toLocaleString("zh-CN")} / ${state.total.toLocaleString("zh-CN")} 条`;
+  if (!state.rows.length) {
+    elements.infiniteSentinel.hidden = true;
+    return;
+  }
+  elements.infiniteSentinel.hidden = false;
+  if (forcedState === "error") {
+    elements.infiniteSentinel.dataset.state = "error";
+    elements.loadMoreText.textContent = "加载失败，点击重试";
+  } else if (state.loading && state.page > 0) {
+    elements.infiniteSentinel.dataset.state = "loading";
+    elements.loadMoreText.textContent = "正在加载下一批…";
+  } else if (state.hasMore) {
+    elements.infiniteSentinel.dataset.state = "idle";
+    elements.loadMoreText.textContent = "继续向下滚动加载";
+  } else {
+    elements.infiniteSentinel.dataset.state = "done";
+    elements.loadMoreText.textContent = `已加载全部 ${state.total.toLocaleString("zh-CN")} 条`;
+  }
+}
+
+async function runQuery({ retrySnapshot = true, append = false } = {}) {
   if (!state.queryReady) return;
+  if (append && (state.resetScheduled || !state.hasMore || !state.rows.length)) return;
   if (state.loading) {
     // Keep the latest UI intent instead of dropping filter/search/page changes
     // while a previous snapshot query is still in flight.
-    state.queryPending = true;
+    if (!append) state.queryPending = true;
     return;
   }
+  const requestedPage = append ? state.page + 1 : 1;
   const serial = ++state.querySerial;
   state.queryPending = false;
   state.loading = true;
+  if (!append) resetLoadedRows();
   elements.dataSurface.setAttribute("aria-busy", "true");
-  elements.tableLoading.hidden = false;
+  elements.tableLoading.hidden = append;
   elements.tableEmpty.hidden = true;
+  renderInfiniteState();
+  let failed = false;
   try {
-    const result = await sendRuntime({ type: "queryDataOverview", payload: queryPayload() });
+    const result = await sendRuntime({ type: "queryDataOverview", payload: queryPayload(requestedPage) });
     if (serial !== state.querySerial) return;
+    if (state.resetScheduled) {
+      clearTimeout(queryTimer);
+      state.resetScheduled = false;
+      state.queryPending = true;
+    }
     if (state.queryPending) return;
-    state.rows = result.rows || [];
+    const incomingRows = result.rows || [];
+    state.rows = append ? [...state.rows, ...incomingRows] : incomingRows;
     state.total = Number(result.total) || 0;
     state.page = Number(result.page) || 1;
     state.pageSize = Number(result.pageSize) || state.pageSize;
     state.snapshotToken = result.snapshotToken || state.snapshotToken;
-    renderTable(result);
+    const pageCount = Math.max(1, Number(result.pageCount) || Math.ceil(state.total / state.pageSize) || 1);
+    state.hasMore = incomingRows.length > 0 && state.rows.length < state.total && state.page < pageCount;
+    renderTable(result, { append, incomingRows });
   } catch (error) {
+    failed = true;
     if (retrySnapshot && /快照|数据已变化|重新校验/.test(error.message)) {
       state.loading = false;
       await loadSchema({ preserveQuery: true });
       return;
     }
-    elements.tableBody.replaceChildren();
-    elements.tableEmpty.hidden = false;
-    elements.tableEmpty.querySelector("strong").textContent = "查询没有完成";
-    elements.tableEmpty.querySelector("p").textContent = error.message;
+    if (append) {
+      state.hasMore = true;
+      renderInfiniteState("error");
+      showToast(error.message);
+    } else {
+      state.hasMore = false;
+      elements.tableBody.replaceChildren();
+      elements.tableEmpty.hidden = false;
+      elements.tableEmpty.querySelector("strong").textContent = "查询没有完成";
+      elements.tableEmpty.querySelector("p").textContent = error.message;
+    }
   } finally {
     if (serial === state.querySerial) {
       const rerun = state.queryPending;
       state.loading = false;
       state.queryPending = false;
       if (rerun && state.queryReady) {
-        queueMicrotask(() => runQuery());
+        queueMicrotask(() => runQuery({ append: false }));
       } else {
         elements.dataSurface.setAttribute("aria-busy", "false");
         elements.tableLoading.hidden = true;
+        if (!failed) renderInfiniteState();
       }
     }
   }
 }
 
-function renderTable(result) {
+function renderTable(result, { append = false, incomingRows = result.rows || [] } = {}) {
   const fields = currentVisibleFields();
   const map = fieldMap();
-  elements.tableHead.replaceChildren();
-  const rowNumber = document.createElement("th"); rowNumber.textContent = "#"; elements.tableHead.append(rowNumber);
-  for (const key of fields) {
-    const field = map.get(key);
-    const th = document.createElement("th");
-    th.textContent = field?.label || key;
-    th.title = key;
-    th.dataset.type = field?.dataType || "text";
-    elements.tableHead.append(th);
+  if (!append) {
+    elements.tableHead.replaceChildren();
+    const rowNumber = document.createElement("th"); rowNumber.textContent = "#"; elements.tableHead.append(rowNumber);
+    for (const key of fields) {
+      const field = map.get(key);
+      const th = document.createElement("th");
+      th.textContent = field?.label || key;
+      th.title = key;
+      th.dataset.type = field?.dataType || "text";
+      elements.tableHead.append(th);
+    }
+    elements.tableBody.replaceChildren();
   }
-  elements.tableBody.replaceChildren();
-  for (let index = 0; index < state.rows.length; index += 1) {
-    const record = state.rows[index];
+  const rowOffset = append ? state.rows.length - incomingRows.length : 0;
+  for (let index = 0; index < incomingRows.length; index += 1) {
+    const record = incomingRows[index];
+    const absoluteIndex = rowOffset + index;
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
-    tr.dataset.index = String(index);
+    tr.dataset.index = String(absoluteIndex);
     const number = document.createElement("td");
-    number.textContent = String((state.page - 1) * state.pageSize + index + 1);
+    number.textContent = String(absoluteIndex + 1);
     tr.append(number);
     for (const key of fields) {
       const field = map.get(key) || { dataType: "text" };
@@ -418,11 +484,7 @@ function renderTable(result) {
     }
     elements.tableBody.append(tr);
   }
-  const pageCount = Math.max(1, Number(result.pageCount) || Math.ceil(state.total / state.pageSize) || 1);
   elements.resultCount.textContent = state.total.toLocaleString("zh-CN");
-  elements.pageMeta.textContent = `第 ${state.page} / ${pageCount} 页 · 当前 ${state.rows.length} 条`;
-  elements.previousPage.disabled = state.page <= 1;
-  elements.nextPage.disabled = state.page >= pageCount;
   elements.tableEmpty.hidden = state.rows.length > 0;
   if (!state.rows.length) {
     elements.tableEmpty.querySelector("strong").textContent = "没有符合当前条件的数据";
@@ -430,6 +492,7 @@ function renderTable(result) {
   }
   elements.exportCurrent.disabled = state.rows.length === 0;
   elements.snapshotCode.textContent = state.snapshotToken.slice(0, 14).toUpperCase();
+  renderInfiniteState();
 }
 
 function renderCell(td, value, key, dataType) {
@@ -534,18 +597,37 @@ function exportCurrentPage() {
   const blob = new Blob(["\ufeff", lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
-  link.href = url; link.download = `XHS-Monitor_${state.dataset}_${new Date().toISOString().slice(0,10)}_page-${state.page}.csv`;
+  link.href = url; link.download = `XHS-Monitor_${state.dataset}_${new Date().toISOString().slice(0,10)}_loaded-${state.rows.length}.csv`;
   document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-  showToast(`已导出当前页 ${state.rows.length} 条记录`);
+  showToast(`已导出当前已加载的 ${state.rows.length} 条记录`);
+}
+
+function loadNextBatch() {
+  if (!state.queryReady || state.loading || state.resetScheduled || !state.hasMore || !state.rows.length) return;
+  runQuery({ append: true });
+}
+
+function initializeInfiniteScroll() {
+  if ("IntersectionObserver" in window) {
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadNextBatch();
+    }, { root: elements.tableViewport, rootMargin: "0px 0px 240px 0px", threshold: 0.01 });
+    observer.observe(elements.infiniteSentinel);
+  }
+  elements.tableViewport.addEventListener("scroll", () => {
+    const remaining = elements.tableViewport.scrollHeight - elements.tableViewport.scrollTop - elements.tableViewport.clientHeight;
+    if (remaining < 240) loadNextBatch();
+  }, { passive: true });
+  elements.infiniteSentinel.addEventListener("click", loadNextBatch);
 }
 
 function bindEvents() {
   document.querySelectorAll(".dataset-button").forEach((button) => button.addEventListener("click", () => {
     if (button.dataset.dataset === state.dataset) return;
     state.dataset = button.dataset.dataset;
-    state.page = 1; state.filters = []; state.sorts = []; state.search = ""; elements.globalSearch.value = "";
+    state.page = 0; state.filters = []; state.sorts = []; state.search = ""; elements.globalSearch.value = "";
     document.querySelectorAll("[data-quick-view]").forEach((item) => item.classList.remove("is-active"));
-    renderSchemaState(); renderFieldOptions(); renderFilters(); renderSorts(); savePreferences(); runQuery();
+    renderSchemaState(); renderFieldOptions(); renderFilters(); renderSorts(); savePreferences(); runQuery({ append: false });
   }));
   document.querySelectorAll("[data-quick-view]").forEach((button) => button.addEventListener("click", () => applyQuickView(button.dataset.quickView)));
   elements.refreshSchema.addEventListener("click", () => loadSchema({ preserveQuery: true }));
@@ -601,9 +683,6 @@ function bindEvents() {
   elements.tableBody.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return; const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
   });
-  elements.previousPage.addEventListener("click", () => { if (state.page > 1) { state.page -= 1; runQuery(); } });
-  elements.nextPage.addEventListener("click", () => { state.page += 1; runQuery(); });
-  elements.pageSize.addEventListener("change", () => { state.pageSize = Number(elements.pageSize.value); state.page = 1; savePreferences(); runQuery(); });
   elements.exportCurrent.addEventListener("click", exportCurrentPage);
   elements.closeDrawer.addEventListener("click", () => { elements.recordDrawer.hidden = true; });
   elements.copyRecord.addEventListener("click", async () => {
@@ -639,4 +718,5 @@ function handleFilterClick(event) {
 
 loadPreferences();
 bindEvents();
+initializeInfiniteScroll();
 loadSchema();

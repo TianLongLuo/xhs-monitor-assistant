@@ -51,7 +51,7 @@
           <div class="header-actions">
             <button id="exportCurrent" class="quiet-button" type="button" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
-              导出当前页
+              导出已加载
             </button>
             <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
@@ -123,15 +123,17 @@
               <thead><tr id="tableHead"></tr></thead>
               <tbody id="tableBody"></tbody>
             </table>
+            <button id="infiniteSentinel" class="infinite-sentinel" data-state="idle" type="button" aria-live="polite">
+              <i aria-hidden="true"></i><span id="loadMoreText">向下滚动加载更多</span>
+            </button>
             <div id="tableEmpty" class="table-empty" hidden>
               <span>⌕</span><strong>没有符合当前条件的数据</strong><p>调整筛选条件或切换快捷视图。</p>
             </div>
             <div id="tableLoading" class="table-loading"><i></i><span>正在读取一致性快照…</span></div>
           </div>
-          <footer class="table-footer">
-            <span id="pageMeta">第 1 页</span>
-            <label>每页<select id="pageSize"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
-            <div><button id="previousPage" type="button" disabled>上一页</button><button id="nextPage" type="button" disabled>下一页</button></div>
+          <footer class="infinite-status">
+            <span id="pageMeta">已加载 0 / 0 条</span>
+            <small>滚动到底自动加载</small>
           </footer>
         </section>
       </main>
