@@ -118,7 +118,8 @@ class V0183Tests(unittest.TestCase):
     def test_title_only_scan_never_overwrites_dom_sourced_pulled_note(self):
         timestamp = "2026-08-21T12:00:00+08:00"
         canonical_payload = {
-            "noteId": "dompulled123456", "url": "https://www.xiaohongshu.com/explore/dompulled123456",
+            "noteId": "dompulled123456",
+            "url": "https://www.xiaohongshu.com/search_result/dompulled123456?xsec_token=CANONICAL",
             "title": "总表完整标题", "author": "总表作者", "content": "总表完整正文",
         }
         with self.store._session() as db:
@@ -136,7 +137,8 @@ class V0183Tests(unittest.TestCase):
         result = self.store.scan({
             "titleOnly": True, "returnAllStatuses": True, "keyword": "samplebrand",
             "notes": [{
-                "noteId": canonical_payload["noteId"], "url": canonical_payload["url"],
+                "noteId": canonical_payload["noteId"],
+                "url": "https://www.xiaohongshu.com/search_result/dompulled123456?xsec_token=ROTATED",
                 "title": "卡片截断标题", "author": "卡片作者", "content": "卡片截断正文",
                 "tags": ["卡片话题"],
             }],
@@ -144,9 +146,10 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue(result["statuses"][0]["inExcel"])
         with self.store._session() as db:
             stored = dict(db.execute(
-                "SELECT title,author,content,tags,keyword,payload_json FROM notes WHERE note_id=?",
+                "SELECT url,title,author,content,tags,keyword,payload_json FROM notes WHERE note_id=?",
                 (canonical_payload["noteId"],),
             ).fetchone())
+        self.assertEqual(canonical_payload["url"], stored["url"])
         self.assertEqual("总表完整标题", stored["title"])
         self.assertEqual("总表作者", stored["author"])
         self.assertEqual("总表完整正文", stored["content"])

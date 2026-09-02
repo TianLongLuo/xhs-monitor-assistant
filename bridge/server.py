@@ -45,7 +45,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.26.0"
+VERSION = "0.26.1"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -2682,6 +2682,7 @@ class MonitorStore:
                     # Search-card text is often truncated and must never drift
                     # SQLite away from that CSV/material snapshot.
                     preserve_excel = in_excel
+                    update_note_url = "" if preserve_excel else note_url
                     update_title = "" if preserve_excel else title
                     update_author = "" if preserve_excel else author
                     update_content = "" if preserve_excel else content
@@ -2716,8 +2717,8 @@ class MonitorStore:
                         WHERE note_id = ?
                         """,
                         (
-                            note_url,
-                            note_url,
+                            update_note_url,
+                            update_note_url,
                             update_title,
                             update_title,
                             update_author,
