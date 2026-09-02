@@ -24,6 +24,10 @@ const elements = {
   infiniteSentinel: byId("infiniteSentinel"), loadMoreText: byId("loadMoreText"),
   pageFind: byId("pageFind"), pageFindInput: byId("pageFindInput"), pageFindCount: byId("pageFindCount"),
   pageFindPrevious: byId("pageFindPrevious"), pageFindNext: byId("pageFindNext"), closePageFind: byId("closePageFind"),
+  columnFilterPopover: byId("columnFilterPopover"), columnFilterTitle: byId("columnFilterTitle"),
+  columnFilterOperator: byId("columnFilterOperator"), columnFilterValueWrap: byId("columnFilterValueWrap"),
+  columnFilterExisting: byId("columnFilterExisting"), closeColumnFilter: byId("closeColumnFilter"),
+  clearColumnFilter: byId("clearColumnFilter"), applyColumnFilter: byId("applyColumnFilter"),
   recordDrawer: byId("recordDrawer"), drawerType: byId("drawerType"), drawerTitle: byId("drawerTitle"),
   drawerFields: byId("drawerFields"), closeDrawer: byId("closeDrawer"), copyRecord: byId("copyRecord"),
   openRecordLink: byId("openRecordLink"), toast: byId("toast")
@@ -71,6 +75,7 @@ let queryTimer = 0;
 let toastTimer = 0;
 let findTimer = 0;
 let threadMergeCell = null;
+let columnFilterDraft = null;
 const valueOptionsCache = new Map();
 
 function sendRuntime(message) {
@@ -261,6 +266,138 @@ function attachValueOptions(container, input, field, operator, filterId, role) {
   }).catch(() => {});
 }
 
+function closeColumnFilterPopover() {
+  elements.columnFilterPopover.hidden = true;
+  columnFilterDraft = null;
+}
+
+function positionColumnFilterPopover(anchor) {
+  requestAnimationFrame(() => {
+    if (elements.columnFilterPopover.hidden || !anchor?.isConnected) return;
+    const rect = anchor.getBoundingClientRect();
+    const popup = elements.columnFilterPopover.getBoundingClientRect();
+    const left = Math.max(12, Math.min(rect.left, window.innerWidth - popup.width - 12));
+    const below = rect.bottom + 7;
+    const top = below + popup.height <= window.innerHeight - 12
+      ? below : Math.max(12, rect.top - popup.height - 7);
+    elements.columnFilterPopover.style.left = `${left}px`;
+    elements.columnFilterPopover.style.top = `${top}px`;
+  });
+}
+
+function populateColumnValueOptions(input, field) {
+  if (!field.suggestValues || !columnFilterDraft) return;
+  const list = document.createElement("datalist");
+  list.id = `column-values-${field.key.replace(/[^a-z0-9_-]/gi, "-")}`;
+  input.setAttribute("list", list.id);
+  input.placeholder = columnFilterDraft.operator === "in" ? "选择已有值；多项用逗号" : "选择或输入已有值";
+  elements.columnFilterValueWrap.append(list);
+  getFieldValueOptions(field).then((result) => {
+    if (!list.isConnected || columnFilterDraft?.field !== field.key) return;
+    const fragment = document.createDocumentFragment();
+    for (const item of result.values || []) {
+      const option = document.createElement("option");
+      option.value = field.dataType === "boolean" ? String(item.label) : String(item.value ?? "");
+      option.label = `${item.label ?? item.value} · ${Number(item.count || 0).toLocaleString("zh-CN")} 条`;
+      fragment.append(option);
+    }
+    list.replaceChildren(fragment);
+  }).catch(() => {});
+}
+
+function renderColumnFilterValue() {
+  elements.columnFilterValueWrap.replaceChildren();
+  elements.columnFilterValueWrap.className = "column-filter-value";
+  if (!columnFilterDraft) return;
+  const field = fieldMap().get(columnFilterDraft.field);
+  if (!field || NO_VALUE_OPERATORS.has(columnFilterDraft.operator)) {
+    const hint = document.createElement("span");
+    hint.className = "column-filter-no-value";
+    hint.textContent = "该条件无需输入值";
+    elements.columnFilterValueWrap.append(hint);
+    return;
+  }
+  elements.columnFilterValueWrap.className = columnFilterDraft.operator === "between"
+    ? "column-filter-value range-values" : "column-filter-value";
+  const first = makeValueInput(field, columnFilterDraft.value, "value");
+  first.id = "columnFilterValue";
+  elements.columnFilterValueWrap.append(first);
+  populateColumnValueOptions(first, field);
+  if (columnFilterDraft.operator === "between") {
+    const second = makeValueInput(field, columnFilterDraft.value2, "value2");
+    second.id = "columnFilterValue2";
+    elements.columnFilterValueWrap.append(second);
+  }
+}
+
+function openColumnFilter(fieldKey, anchor) {
+  const field = fieldMap().get(fieldKey);
+  if (!field?.filterable) return;
+  const operators = operatorsFor(field);
+  const preferred = field.suggestValues ? "eq" : field.dataType === "text" ? "contains" : "eq";
+  const operator = operators.some((item) => item.id === preferred) ? preferred : operators[0]?.id || "eq";
+  columnFilterDraft = { field: field.key, operator, value: "", value2: "", anchor };
+  elements.columnFilterTitle.textContent = field.label;
+  elements.columnFilterOperator.innerHTML = operators.map((item) =>
+    `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`
+  ).join("");
+  elements.columnFilterOperator.value = operator;
+  const existingCount = state.filters.filter((item) => item.field === field.key).length;
+  elements.columnFilterExisting.textContent = existingCount
+    ? `该字段已有 ${existingCount} 条筛选规则；确认后继续追加。`
+    : "确认后自动加入正式筛选规则。";
+  elements.clearColumnFilter.disabled = existingCount === 0;
+  setPanel("none", false);
+  elements.columnFilterPopover.hidden = false;
+  renderColumnFilterValue();
+  positionColumnFilterPopover(anchor);
+  setTimeout(() => elements.columnFilterValueWrap.querySelector("input")?.focus(), 0);
+}
+
+function applyColumnFilter() {
+  if (!columnFilterDraft) return;
+  const first = elements.columnFilterValueWrap.querySelector('[data-role="value"]');
+  const second = elements.columnFilterValueWrap.querySelector('[data-role="value2"]');
+  columnFilterDraft.value = first?.value ?? "";
+  columnFilterDraft.value2 = second?.value ?? "";
+  if (!NO_VALUE_OPERATORS.has(columnFilterDraft.operator)) {
+    if (!String(columnFilterDraft.value).trim()
+        || (columnFilterDraft.operator === "between" && !String(columnFilterDraft.value2).trim())) {
+      showToast("请先填写筛选值");
+      first?.focus();
+      return;
+    }
+  }
+  const fieldKey = columnFilterDraft.field;
+  state.filters.push({
+    id: crypto.randomUUID(), field: fieldKey, operator: columnFilterDraft.operator,
+    value: columnFilterDraft.value, value2: columnFilterDraft.value2,
+  });
+  closeColumnFilterPopover();
+  renderFilters();
+  setPanel("filters", true);
+  scheduleQuery(0);
+  showToast("已加入筛选规则");
+}
+
+function clearColumnFilters() {
+  if (!columnFilterDraft) return;
+  const fieldKey = columnFilterDraft.field;
+  state.filters = state.filters.filter((item) => item.field !== fieldKey);
+  closeColumnFilterPopover();
+  renderFilters();
+  scheduleQuery(0);
+}
+
+function updateHeaderFilterState() {
+  for (const header of elements.tableHead.querySelectorAll("th[data-field]")) {
+    const count = state.filters.filter((item) => item.field === header.dataset.field).length;
+    header.dataset.filtered = String(count > 0);
+    const badge = header.querySelector("i");
+    if (badge) badge.textContent = count ? String(count) : "⌄";
+  }
+}
+
 function renderFilters() {
   const map = fieldMap();
   elements.filterRows.replaceChildren();
@@ -303,6 +440,7 @@ function renderFilters() {
   elements.filterLogic.value = state.filterLogic;
   elements.filterCount.textContent = String(state.filters.length);
   elements.filterCount.hidden = state.filters.length === 0;
+  updateHeaderFilterState();
 }
 
 function makeValueInput(field, value, role) {
@@ -533,9 +671,15 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     for (const key of fields) {
       const field = map.get(key);
       const th = document.createElement("th");
-      th.textContent = field?.label || key;
-      th.title = key;
+      th.className = "filterable-header";
+      th.tabIndex = 0;
+      th.dataset.field = key;
+      th.title = `${field?.label || key} · 点击筛选`;
       th.dataset.type = field?.dataType || "text";
+      const wrap = document.createElement("span");
+      const name = document.createElement("b"); name.textContent = field?.label || key;
+      const filterIcon = document.createElement("i"); filterIcon.textContent = "⌄"; filterIcon.setAttribute("aria-hidden", "true");
+      wrap.append(name, filterIcon); th.append(wrap);
       elements.tableHead.append(th);
     }
     elements.tableBody.replaceChildren();
@@ -586,6 +730,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   }
   elements.exportCurrent.disabled = state.rows.length === 0;
   elements.snapshotCode.textContent = state.snapshotToken.slice(0, 14).toUpperCase();
+  updateHeaderFilterState();
   renderInfiniteState();
   refreshFindMatches(false);
 }
@@ -720,6 +865,7 @@ function initializeInfiniteScroll() {
     observer.observe(elements.infiniteSentinel);
   }
   elements.tableViewport.addEventListener("scroll", () => {
+    if (!elements.columnFilterPopover.hidden) closeColumnFilterPopover();
     const remaining = elements.tableViewport.scrollHeight - elements.tableViewport.scrollTop - elements.tableViewport.clientHeight;
     if (remaining < 240) loadNextBatch();
   }, { passive: true });
@@ -849,6 +995,7 @@ function bindEvents() {
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); elements.globalSearch.focus(); }
     if (event.key === "Escape") {
+      if (!elements.columnFilterPopover.hidden) { closeColumnFilterPopover(); return; }
       if (!elements.pageFind.hidden) { closePageFind(); return; }
       setPanel("none", false); elements.recordDrawer.hidden = true;
     }
@@ -865,6 +1012,31 @@ function bindEvents() {
   elements.pageFindPrevious.addEventListener("click", () => navigateFind(-1));
   elements.pageFindNext.addEventListener("click", () => navigateFind(1));
   elements.closePageFind.addEventListener("click", closePageFind);
+  elements.tableHead.addEventListener("click", (event) => {
+    const header = event.target.closest("th[data-field]");
+    if (header) openColumnFilter(header.dataset.field, header);
+  });
+  elements.tableHead.addEventListener("keydown", (event) => {
+    if (!['Enter', ' '].includes(event.key)) return;
+    const header = event.target.closest("th[data-field]");
+    if (!header) return;
+    event.preventDefault();
+    openColumnFilter(header.dataset.field, header);
+  });
+  elements.columnFilterOperator.addEventListener("change", () => {
+    if (!columnFilterDraft) return;
+    columnFilterDraft.operator = elements.columnFilterOperator.value;
+    columnFilterDraft.value = "";
+    columnFilterDraft.value2 = "";
+    renderColumnFilterValue();
+    positionColumnFilterPopover(columnFilterDraft.anchor);
+  });
+  elements.columnFilterValueWrap.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); applyColumnFilter(); }
+  });
+  elements.applyColumnFilter.addEventListener("click", applyColumnFilter);
+  elements.clearColumnFilter.addEventListener("click", clearColumnFilters);
+  elements.closeColumnFilter.addEventListener("click", closeColumnFilterPopover);
   elements.toggleFilters.addEventListener("click", () => setPanel("filters"));
   elements.toggleFields.addEventListener("click", () => { renderFieldOptions(); setPanel("fields"); });
   elements.toggleSort.addEventListener("click", () => setPanel("sort"));
@@ -918,6 +1090,9 @@ function bindEvents() {
   elements.openRecordLink.addEventListener("click", () => sendRuntime({ type: "openDataOverviewRecord", url: elements.openRecordLink.dataset.url }).catch((error) => showToast(error.message)));
   document.addEventListener("click", (event) => {
     if (!elements.fieldPanel.hidden && !elements.fieldPanel.contains(event.target) && !elements.toggleFields.contains(event.target)) setPanel("none", false);
+    if (!elements.columnFilterPopover.hidden
+        && !elements.columnFilterPopover.contains(event.target)
+        && !event.target.closest("th[data-field]")) closeColumnFilterPopover();
   });
 }
 

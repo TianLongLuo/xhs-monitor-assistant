@@ -98,6 +98,20 @@
           <button id="closePageFind" type="button" title="关闭查找" aria-label="关闭查找">×</button>
         </section>
 
+        <section id="columnFilterPopover" class="column-filter-popover" hidden aria-label="列筛选">
+          <header>
+            <div><small>FILTER FIELD</small><strong id="columnFilterTitle">字段筛选</strong></div>
+            <button id="closeColumnFilter" type="button" aria-label="关闭列筛选">×</button>
+          </header>
+          <label class="column-filter-control"><span>条件</span><select id="columnFilterOperator"></select></label>
+          <div id="columnFilterValueWrap" class="column-filter-value"></div>
+          <p id="columnFilterExisting">该字段暂无筛选条件</p>
+          <footer>
+            <button id="clearColumnFilter" class="column-filter-clear" type="button">清除此列筛选</button>
+            <button id="applyColumnFilter" class="column-filter-apply" type="button">加入筛选</button>
+          </footer>
+        </section>
+
         <section id="filterPanel" class="builder-panel" hidden>
           <header>
             <div><strong>条件筛选</strong><span>满足</span><select id="filterLogic"><option value="and">全部条件</option><option value="or">任一条件</option></select></div>

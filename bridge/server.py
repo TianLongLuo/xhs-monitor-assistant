@@ -45,7 +45,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.28.0"
+VERSION = "0.29.0"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",

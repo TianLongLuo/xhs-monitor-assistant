@@ -138,6 +138,23 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .page-find > button { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--muted); }
 .page-find > button:hover { border-color: #aeb4bd; color: var(--ink); }
 
+.column-filter-popover { position: fixed; z-index: 65; width: min(330px, calc(100vw - 24px)); padding: 13px; border: 1px solid var(--line-strong); border-radius: 13px; background: rgba(255,255,255,.98); box-shadow: 0 20px 58px rgba(24,31,43,.18); backdrop-filter: blur(20px); }
+.column-filter-popover > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.column-filter-popover > header div { display: grid; gap: 2px; min-width: 0; }
+.column-filter-popover > header small { color: var(--blue); font-family: var(--data-font); font-size: 8px; font-weight: 700; letter-spacing: .08em; }
+.column-filter-popover > header strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.column-filter-popover > header button { width: 27px; height: 27px; border: 0; border-radius: 50%; background: var(--surface-soft); color: var(--muted); }
+.column-filter-control { display: grid; grid-template-columns: 48px 1fr; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--muted); font-size: 10px; }
+.column-filter-control select, .column-filter-value input { width: 100%; height: 36px; border: 1px solid var(--line); border-radius: 9px; background: #fafbfc; padding: 0 10px; font-size: 11px; }
+.column-filter-value.range-values { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.column-filter-no-value { display: grid; place-items: center; min-height: 36px; border: 1px dashed var(--line); border-radius: 9px; color: var(--quiet); font-size: 10px; }
+.column-filter-popover > p { margin: 9px 0 11px; color: var(--quiet); font-size: 9px; }
+.column-filter-popover > footer { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.column-filter-popover > footer button { min-height: 35px; border-radius: 9px; font-size: 10px; font-weight: 650; }
+.column-filter-clear { border: 1px solid var(--line); background: #fff; color: var(--muted); }
+.column-filter-clear:disabled { cursor: default; opacity: .4; }
+.column-filter-apply { border: 1px solid var(--blue); background: var(--blue); color: #fff; }
+
 .builder-panel, .popover-panel {
   position: relative; z-index: 11; max-width: 1500px; margin: 0 auto 10px; padding: 12px;
   border: 1px solid var(--line); border-radius: var(--radius); background: #fff; box-shadow: var(--shadow);
@@ -183,6 +200,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 table { width: max-content; min-width: 100%; border-spacing: 0; border-collapse: separate; table-layout: fixed; }
 thead { position: sticky; top: 0; z-index: 8; }
 th { min-width: 130px; max-width: 280px; height: 38px; padding: 0 10px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line-strong); background: #f7f8fa; color: #555a63; font-size: 10px; font-weight: 650; text-align: left; white-space: nowrap; }
+th.filterable-header { cursor: pointer; user-select: none; transition: background .14s ease, color .14s ease; }
+th.filterable-header:hover { background: #edf5ff; color: #075fbe; }
+th.filterable-header > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+th.filterable-header i { display: grid; place-items: center; min-width: 17px; height: 17px; border-radius: 6px; color: var(--quiet); font-size: 8px; font-style: normal; }
+th.filterable-header:hover i { background: #dcecff; color: var(--blue); }
+th.filterable-header[data-filtered="true"] { background: var(--blue-soft); color: #075fbe; }
+th.filterable-header[data-filtered="true"] i { background: var(--blue); color: #fff; }
 th:first-child { position: sticky; left: 0; z-index: 9; min-width: 46px; width: 46px; background: #f1f3f6; text-align: center; }
 th[data-type="number"], td[data-type="number"] { text-align: right; }
 tbody tr { --row-bg: #fff; }
