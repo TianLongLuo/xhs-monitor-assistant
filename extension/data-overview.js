@@ -657,13 +657,13 @@ async function performPermanentDelete() {
     elements.recordDrawer.hidden = true;
     if (elements.deleteDialog.open) elements.deleteDialog.close();
     clearSelection();
-    await loadSchema({ preserveQuery: false });
+    await loadSchema({ preserveQuery: true });
     const cascaded = Number(result.cascadeDeletedCount || result.deletedCommentCount || 0);
     const failureText = Number(result.failureCount || 0) ? `，${result.failureCount} 条失败` : "";
     showToast(`已永久删除 ${Number(result.deletedCount || 0)} 条${cascaded ? `，级联清理 ${cascaded} 条评论` : ""}${failureText}`);
   } catch (error) {
     if (elements.deleteDialog.open) elements.deleteDialog.close();
-    await loadSchema({ preserveQuery: false }).catch(() => {});
+    await loadSchema({ preserveQuery: true }).catch(() => {});
     showToast(error.message || "删除没有完成");
   } finally {
     state.deletePending = false;

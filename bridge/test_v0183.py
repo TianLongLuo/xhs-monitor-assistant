@@ -1805,6 +1805,66 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("已忽略", next(row["ignore_status"] for row in result["rows"]
                                           if row["note_id"] == ignored["noteId"]))
 
+    def test_purge_untracked_discoveries_preserves_formal_and_ignored_records(self):
+        self._configure_csv("data-overview-purge")
+        business = {
+            "noteId": "purge-business-1", "url": "https://www.xiaohongshu.com/explore/purge-business-1",
+            "title": "正式记录", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        ignored = {
+            "noteId": "purge-ignored-1", "url": "https://www.xiaohongshu.com/explore/purge-ignored-1",
+            "title": "忽略记录", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        discovery = {
+            "noteId": "purge-discovery-1", "url": "https://www.xiaohongshu.com/explore/purge-discovery-1",
+            "title": "仅发现记录", "content": "正文", "author": "作者",
+        }
+        self.store.confirm(business)
+        self.store._sync_pull_to_xlsx(business, [], {"folder": "", "files": []})
+        self.store.confirm(ignored)
+        self.store.ignore({"noteId": ignored["noteId"]})
+        self.store.confirm(discovery)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced',status='known' WHERE note_id=?",
+                       (business["noteId"],))
+            db.execute("UPDATE notes SET source='dom',pull_status='not_started',status='new' WHERE note_id=?",
+                       (discovery["noteId"],))
+            db.execute("""INSERT INTO ai_jobs
+                       (target_type,target_id,priority,status,attempts,available_at,created_at,updated_at)
+                       VALUES ('relevance',?,50,'queued',0,0,'2026-09-02','2026-09-02')""",
+                       (discovery["noteId"],))
+            db.execute("""INSERT INTO ai_analysis_records(target_type,target_id,status,created_at)
+                       VALUES ('relevance',?,'completed','2026-09-02')""", (discovery["noteId"],))
+
+        schema = self.store.data_overview_schema()
+        self.assertTrue(schema["queryReady"])
+        preview = self.store.purge_untracked_discoveries({
+            "snapshotToken": schema["snapshotToken"], "dryRun": True,
+        })
+        self.assertEqual(1, preview["candidateCount"])
+        self.assertEqual({"new": 1}, preview["byStatus"])
+        result = self.store.purge_untracked_discoveries({
+            "snapshotToken": schema["snapshotToken"], "hardDeleteConfirmed": True,
+            "confirmation": preview["confirmation"],
+        })
+        self.assertEqual(1, result["deletedCount"])
+        self.assertEqual(2, result["deletedLinkedDatabaseRecords"])
+        with self.store._session() as db:
+            self.assertEqual(
+                {business["noteId"], ignored["noteId"]},
+                {row[0] for row in db.execute("SELECT note_id FROM notes").fetchall()},
+            )
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM ai_jobs WHERE target_id=?", (discovery["noteId"],)
+            ).fetchone()[0])
+            self.assertEqual(0, db.execute(
+                "SELECT COUNT(*) FROM ai_analysis_records WHERE target_id=?", (discovery["noteId"],)
+            ).fetchone()[0])
+        refreshed = self.store.data_overview_schema()
+        self.assertEqual(2, refreshed["datasets"]["notes"]["recordTotal"])
+        self.assertEqual(2, refreshed["datasets"]["notes"]["total"])
+        self.assertEqual(0, refreshed["datasets"]["notes"]["excludedDiscoveryTotal"])
+
     def test_data_overview_permanent_delete_cascades_every_local_store(self):
         notes_path, comments_path = self._configure_csv("data-overview-delete")
         note = {
@@ -1917,6 +1977,7 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("applyColumnFilter", script)
         self.assertIn("performPermanentDelete", script)
         self.assertIn('type: "deleteDataOverviewRecords"', script)
+        self.assertGreaterEqual(script.count("await loadSchema({ preserveQuery: true })"), 2)
         self.assertIn('message.type === "queryDataOverview"', worker)
         self.assertIn('message.type === "getDataOverviewValues"', worker)
         self.assertIn('message.type === "deleteDataOverviewRecords"', worker)

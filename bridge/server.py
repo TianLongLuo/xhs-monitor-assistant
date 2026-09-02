@@ -45,7 +45,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.30.0"
+VERSION = "0.30.1"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )
@@ -5146,6 +5146,161 @@ class MonitorStore:
                 "partial": bool(failures), "csvVerified": True, "databaseVerified": True,
             }
 
+    def purge_untracked_discoveries(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Remove discovery-only rows without touching synchronized, confirmed or ignored records."""
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请刷新后重试")
+        dry_run = bool(payload.get("dryRun"))
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验后再清理")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再清理")
+
+            db = self._connect()
+            tombstones: list[tuple[Path, Path]] = []
+            committed = False
+            try:
+                candidates = [dict(row) for row in db.execute(
+                    f"SELECT n.note_id,n.status,n.source,n.pull_status,n.media_dir FROM notes n "
+                    f"WHERE NOT {DATA_OVERVIEW_NOTE_SCOPE} ORDER BY n.note_id"
+                ).fetchall()]
+                candidate_ids = [str(row["note_id"]) for row in candidates]
+                by_status = dict(Counter(str(row["status"] or "") for row in candidates))
+                if dry_run:
+                    return {
+                        "ok": True, "dryRun": True, "candidateCount": len(candidate_ids),
+                        "candidateIds": candidate_ids, "byStatus": by_status,
+                        "confirmation": f"PURGE_UNTRACKED_DISCOVERIES:{len(candidate_ids)}",
+                    }
+                confirmation = f"PURGE_UNTRACKED_DISCOVERIES:{len(candidate_ids)}"
+                if not bool(payload.get("hardDeleteConfirmed")) or text(
+                    payload.get("confirmation"), 128
+                ) != confirmation:
+                    raise ValueError("仅发现未入库记录的永久清理确认不完整")
+                if not candidate_ids:
+                    return {
+                        "ok": True, "dryRun": False, "deletedCount": 0,
+                        "deletedCommentCount": 0, "deletedLinkedDatabaseRecords": 0,
+                        "deletedMaterialDirectoryCount": 0, "byStatus": {},
+                    }
+
+                notes_path, comments_path = self._csv_paths()
+                _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+                candidate_set = set(candidate_ids)
+                csv_note_overlap = sorted(
+                    valid_note_id(row.get("笔记ID")) for row in note_rows
+                    if valid_note_id(row.get("笔记ID")) in candidate_set
+                )
+                csv_comment_overlap = sorted(
+                    text(row.get("笔记评论ID"), 256) for row in comment_rows
+                    if csv_comment_note_id(row) in candidate_set
+                )
+                if csv_note_overlap or csv_comment_overlap:
+                    raise ValueError("候选记录已进入业务 CSV，已停止清理以保护正式数据")
+
+                placeholders = ",".join("?" for _ in candidate_ids)
+                comment_rows_db = db.execute(
+                    f"SELECT comment_id FROM comments WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).fetchall()
+                comment_ids = [str(row[0]) for row in comment_rows_db]
+
+                media_root = self._media_root().resolve()
+                managed_dirs: list[Path] = []
+                for row in candidates:
+                    media_value = text(row.get("media_dir"), 4000)
+                    if not media_value:
+                        continue
+                    folder = Path(media_value).expanduser()
+                    if not folder.exists():
+                        continue
+                    folder = folder.resolve()
+                    if folder.parent != media_root:
+                        raise ValueError("仅发现记录的素材目录不在受管目录内，已停止清理")
+                    if folder not in managed_dirs:
+                        managed_dirs.append(folder)
+                if media_root.exists():
+                    candidate_suffixes = {f"__{note_id}" for note_id in candidate_ids}
+                    for folder in media_root.iterdir():
+                        if not folder.is_dir() or not any(folder.name.endswith(suffix) for suffix in candidate_suffixes):
+                            continue
+                        resolved = folder.resolve()
+                        if resolved not in managed_dirs:
+                            managed_dirs.append(resolved)
+                for index, folder in enumerate(managed_dirs, 1):
+                    tombstone = folder.with_name(
+                        f".{folder.name}.purging-{os.getpid()}-{time.time_ns()}-{index}"
+                    )
+                    folder.rename(tombstone)
+                    tombstones.append((folder, tombstone))
+
+                db.execute("BEGIN IMMEDIATE")
+                linked_records = 0
+                if comment_ids:
+                    comment_placeholders = ",".join("?" for _ in comment_ids)
+                    linked_records += db.execute(
+                        f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({comment_placeholders})",
+                        tuple(comment_ids),
+                    ).rowcount
+                    linked_records += db.execute(
+                        f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({comment_placeholders})",
+                        tuple(comment_ids),
+                    ).rowcount
+                linked_records += db.execute(
+                    f"DELETE FROM ai_jobs WHERE target_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                linked_records += db.execute(
+                    f"DELETE FROM ai_analysis_records WHERE target_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                for table in ("note_summaries", "reply_generation_history", "comment_collection_jobs", "change_events", "watchlist"):
+                    linked_records += db.execute(
+                        f"DELETE FROM {table} WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                    ).rowcount
+                deleted_comments = db.execute(
+                    f"DELETE FROM comments WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                deleted_notes = db.execute(
+                    f"DELETE FROM notes WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                if deleted_notes != len(candidate_ids):
+                    raise ValueError("仅发现记录的 SQLite 删除数量校验失败")
+                if db.execute(
+                    f"SELECT COUNT(*) FROM notes WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).fetchone()[0]:
+                    raise ValueError("仅发现记录清理后仍存在 SQLite 残留")
+                db.commit()
+                committed = True
+
+                cleanup_errors: list[str] = []
+                for _original, tombstone in tombstones:
+                    try:
+                        if tombstone.exists():
+                            shutil.rmtree(tombstone)
+                    except OSError as exc:
+                        cleanup_errors.append(f"{tombstone.name}: {text(exc, 220)}")
+                return {
+                    "ok": True, "dryRun": False, "deletedCount": deleted_notes,
+                    "deletedCommentCount": deleted_comments,
+                    "deletedLinkedDatabaseRecords": linked_records,
+                    "deletedMaterialDirectoryCount": len(tombstones) - len(cleanup_errors),
+                    "byStatus": by_status, "databaseVerified": True, "csvProtected": True,
+                    "materialCleanupWarning": "；".join(cleanup_errors),
+                }
+            except Exception:
+                if not committed:
+                    db.rollback()
+                    for original, tombstone in reversed(tombstones):
+                        if tombstone.exists() and not original.exists():
+                            tombstone.rename(original)
+                raise
+            finally:
+                db.close()
+
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_type = text(payload.get("runType"), 40) or "single"
         if run_type not in {"single", "batch", "repair"}:
@@ -9754,6 +9909,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.data_overview_values(payload)
             elif self.path == "/api/data-overview/delete":
                 result = self.store.delete_data_overview_records(payload)
+            elif self.path == "/api/data-overview/discoveries/purge":
+                result = self.store.purge_untracked_discoveries(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":
