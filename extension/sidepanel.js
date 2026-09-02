@@ -96,6 +96,8 @@ const elements = {
   pendingList: document.getElementById("pendingList"),
   pendingEmpty: document.getElementById("pendingEmpty"),
   operationsCenter: document.getElementById("operationsCenter"),
+  openDataOverview: document.getElementById("openDataOverview"),
+  dataOverviewSummary: document.getElementById("dataOverviewSummary"),
   ignoredOperations: document.getElementById("ignoredOperations"),
   ignoredOperationsCount: document.getElementById("ignoredOperationsCount"),
   ignoredOperationsList: document.getElementById("ignoredOperationsList"),
@@ -827,6 +829,11 @@ function renderDataHealth(result) {
     return;
   }
   const summary = result.summary || {};
+  if (elements.dataOverviewSummary) {
+    elements.dataOverviewSummary.textContent = summary.relationshipsConsistent
+      ? `${summary.csvNotes || 0} 篇帖子 · ${summary.csvComments || 0} 条评论 · 一致性已通过`
+      : "数据一致性未通过，数据总览将保持只读锁定";
+  }
   elements.healthScore.textContent = String(result.score ?? "—");
   elements.healthScore.dataset.state = result.status || "healthy";
   const statusLabel = { healthy: "数据结构健康", warning: "发现可处理问题", critical: "发现关键一致性问题" }[result.status] || "体检完成";
@@ -2006,6 +2013,17 @@ elements.syncAllPulled?.addEventListener("click", () => {
   startAllPulledSync().catch((error) => setStatus(error.message || "批量同步启动失败", "error"));
 });
 
+elements.openDataOverview?.addEventListener("click", async () => {
+  elements.openDataOverview.disabled = true;
+  try {
+    const result = await sendRuntime({ type: "openDataOverview" });
+    if (!result?.ok) throw new Error(result?.error || "数据总览打开失败");
+  } catch (error) {
+    setStatus(error.message || "数据总览打开失败", "error");
+  } finally {
+    elements.openDataOverview.disabled = false;
+  }
+});
 elements.overviewTab?.addEventListener("click", () => setPanelView("overview"));
 elements.postsTab?.addEventListener("click", () => setPanelView("posts"));
 elements.toolsTab?.addEventListener("click", () => {

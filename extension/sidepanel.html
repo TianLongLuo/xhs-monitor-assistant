@@ -160,6 +160,16 @@
           <button id="refreshOperations" class="operations-refresh" type="button" aria-label="刷新运营数据">↻</button>
         </div>
 
+        <article class="operations-card data-overview-launcher">
+          <div class="data-overview-launcher__visual" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="data-overview-launcher__copy">
+            <span>LOCAL DATABASE</span>
+            <h3>本地数据总览</h3>
+            <p id="dataOverviewSummary">按任意字段组合条件，查询全部帖子与评论。</p>
+          </div>
+          <button id="openDataOverview" type="button"><span>打开数据总览</span><b>↗</b></button>
+        </article>
+
         <details id="ignoredOperations" class="operations-ignored">
           <summary><span>已忽略帖子</span><strong id="ignoredOperationsCount">0</strong><small>点击展开</small></summary>
           <div id="ignoredOperationsList" class="operations-list operations-list--ignored"></div>

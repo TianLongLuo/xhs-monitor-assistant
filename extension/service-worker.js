@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.25.7";
+const CONTENT_SCRIPT_VERSION = "0.26.0";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -2042,6 +2042,12 @@ async function restoreNote(note) {
   return result;
 }
 
+async function openDataOverviewPage() {
+  const url = chrome.runtime.getURL("data-overview.html");
+  const tab = await chrome.tabs.create({ url, active: true });
+  return { ok: true, tabId: tab?.id || null, url };
+}
+
 async function getStats() {
   const config = await getConfig();
   try {
@@ -2188,6 +2194,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getBridgeState") return checkBridgeHealth();
     if (message.type === "getStats") return getStats();
     if (message.type === "getDataHealth") return bridgeApi("/api/data-health", { timeoutMs: 60000 });
+    if (message.type === "openDataOverview") return openDataOverviewPage();
+    if (message.type === "getDataOverviewSchema") return bridgeApi("/api/data-overview/schema", { timeoutMs: 120000 });
+    if (message.type === "queryDataOverview") {
+      return bridgeApi("/api/data-overview/query", {
+        method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 60000
+      });
+    }
+    if (message.type === "openDataOverviewRecord") {
+      const url = String(message.url || "");
+      if (!/^https:\/\//i.test(url)) throw new Error("记录中没有可打开的链接");
+      const tab = await chrome.tabs.create({ url, active: true });
+      return { ok: true, tabId: tab?.id || null };
+    }
     if (message.type === "repairDataHealth") {
       return bridgeApi("/api/data-health/repair", { method: "POST", body: "{}", timeoutMs: 180000 });
     }

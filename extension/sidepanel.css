@@ -3848,3 +3848,62 @@ body.apple-utility-ui.is-ball .ball-widget__ball {
     color: #30d158;
   }
 }
+
+
+/* Local database launcher — a compact preview of the full-width data workspace. */
+.data-overview-launcher {
+  background: linear-gradient(145deg, #f8fbff 0%, #ffffff 68%);
+  border-color: rgba(0, 122, 255, .24);
+  display: grid;
+  gap: 11px;
+  grid-template-columns: 54px minmax(0, 1fr);
+  overflow: hidden;
+  position: relative;
+}
+.data-overview-launcher::after {
+  background: linear-gradient(90deg, #007aff, #49a5ff);
+  content: "";
+  height: 2px;
+  left: 0;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+.data-overview-launcher__visual {
+  align-content: center;
+  background: #eef6ff;
+  border: 1px solid #d5e8ff;
+  border-radius: 12px;
+  display: grid;
+  gap: 3px;
+  grid-template-columns: repeat(2, 1fr);
+  height: 54px;
+  padding: 8px;
+}
+.data-overview-launcher__visual i { background: #80bfff; border-radius: 2px; min-height: 8px; }
+.data-overview-launcher__visual i:nth-child(3n + 1) { background: #007aff; }
+.data-overview-launcher__copy { min-width: 0; }
+.data-overview-launcher__copy > span { color: var(--apple-blue); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; font-weight: 700; letter-spacing: .08em; }
+.data-overview-launcher__copy h3 { font-size: 15px; margin: 3px 0; }
+.data-overview-launcher__copy p { color: var(--apple-secondary); font-size: 10px; line-height: 1.45; margin: 0; }
+.data-overview-launcher > button {
+  align-items: center;
+  background: var(--apple-blue);
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  font-size: 11px;
+  font-weight: 650;
+  grid-column: 1 / -1;
+  justify-content: space-between;
+  min-height: 36px;
+  padding: 0 12px;
+}
+.data-overview-launcher > button:disabled { cursor: default; opacity: .55; }
+.data-overview-launcher > button b { font-size: 15px; font-weight: 500; }
+@media (prefers-color-scheme: dark) {
+  .data-overview-launcher { background: linear-gradient(145deg, #172536, #2c2c2e 70%); }
+  .data-overview-launcher__visual { background: #102d4f; border-color: #234f7c; }
+}

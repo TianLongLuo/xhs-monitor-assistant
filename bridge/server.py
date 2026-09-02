@@ -38,12 +38,14 @@ from urllib.request import Request, urlopen
 try:
     from .ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from .data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
+    from .data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 except ImportError:  # Native Host runs this module as a top-level script.
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
+    from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.25.7"
+VERSION = "0.26.0"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -707,6 +709,9 @@ class MonitorStore:
         self._csv_managed_hashes: dict[str, str] = {}
         self._active_csv_checkpoint: dict[str, Any] | None = None
         self._persistent_checkpoints_recovered = False
+        # Tokens are issued only after a full CSV/SQLite/material health pass.
+        # Complex overview queries must present one of these short-lived tokens.
+        self._data_overview_approved_tokens: dict[str, float] = {}
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
         self.ai_client = ai_client or DeepSeekClient()
         self.ai_wakeup = threading.Event()
@@ -2671,7 +2676,12 @@ class MonitorStore:
                     # Keep Excel as the canonical comparison source. Search
                     # cards often contain truncated titles/captions and must
                     # not replace the fields imported from the workbook.
-                    preserve_excel = str(existing["source"]) == "existing_xlsx"
+                    # Every successfully/partially pulled note already has a
+                    # canonical row in the business CSV, even when it was first
+                    # discovered from DOM and therefore keeps source='dom'.
+                    # Search-card text is often truncated and must never drift
+                    # SQLite away from that CSV/material snapshot.
+                    preserve_excel = in_excel
                     update_title = "" if preserve_excel else title
                     update_author = "" if preserve_excel else author
                     update_content = "" if preserve_excel else content
@@ -4643,6 +4653,155 @@ class MonitorStore:
                 f"SELECT * FROM notes{where} ORDER BY first_seen_at DESC LIMIT ?", (*params, limit)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def _data_overview_snapshot_token(self) -> str:
+        """Fingerprint every canonical store that can change query results."""
+        with self.lock:
+            notes_path, comments_path = self._csv_paths()
+            paths = [self.db_path, self.db_path.with_name(self.db_path.name + "-wal"), notes_path, comments_path]
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                counters = {
+                    "notes": int(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]),
+                    "comments": int(db.execute("SELECT COUNT(*) FROM comments").fetchone()[0]),
+                    "noteMaxSeen": str(db.execute("SELECT COALESCE(MAX(last_seen_at),'') FROM notes").fetchone()[0]),
+                    "commentMaxSeen": str(db.execute("SELECT COALESCE(MAX(last_seen_at),'') FROM comments").fetchone()[0]),
+                }
+                material_dirs = [
+                    text(row[0], 4000) for row in db.execute(
+                        "SELECT DISTINCT media_dir FROM notes WHERE TRIM(COALESCE(media_dir,''))<>'' ORDER BY media_dir"
+                    ).fetchall() if text(row[0], 4000)
+                ]
+            finally:
+                db.close()
+            for folder in material_dirs:
+                material_root = Path(folder)
+                paths.extend(material_root / name for name in ("note.json", "comments.json", "帖子正文.txt"))
+            files: list[dict[str, Any]] = []
+            for path in paths:
+                try:
+                    stat = path.stat()
+                    files.append({"path": str(path.resolve()).casefold(), "size": stat.st_size, "mtime": stat.st_mtime_ns})
+                except OSError:
+                    files.append({"path": str(path).casefold(), "size": -1, "mtime": -1})
+        raw = json.dumps({"files": files, "counters": counters}, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def data_overview_schema(self) -> dict[str, Any]:
+        """Return every filterable field only after full cross-store verification."""
+        # Use the same lock order as write transactions. This makes the health
+        # verdict, the field catalogue and the issued token one atomic view.
+        with self.pull_lock, self.lock:
+            health = self.data_health()
+            relationships_ok = health.get("summary", {}).get("relationshipsConsistent") is True
+            critical = [item for item in health.get("issues", []) if item.get("severity") == "critical"]
+            query_ready = relationships_ok and not critical
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                note_fields = build_field_specs(db, "notes")
+                comment_fields = build_field_specs(db, "comments")
+                note_total = int(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+                comment_total = int(db.execute("SELECT COUNT(*) FROM comments").fetchone()[0])
+                business_notes = int(db.execute(
+                    "SELECT COUNT(*) FROM notes WHERE source='existing_xlsx' OR pull_status IN ('synced','partial')"
+                ).fetchone()[0])
+                active_comments = int(db.execute("SELECT COUNT(*) FROM comments WHERE is_deleted=0").fetchone()[0])
+            finally:
+                db.close()
+            token = self._data_overview_snapshot_token()
+            now = time.time()
+            self._data_overview_approved_tokens = {
+                key: issued for key, issued in self._data_overview_approved_tokens.items() if now - issued < 1800
+            }
+            if query_ready:
+                self._data_overview_approved_tokens[token] = now
+            return {
+                "ok": True, "version": VERSION, "queryReady": query_ready,
+                "snapshotToken": token if query_ready else "", "health": health,
+                "operators": DATA_OVERVIEW_OPERATORS,
+                "datasets": {
+                    "notes": {
+                        "label": "帖子数据库", "total": note_total, "businessTotal": business_notes,
+                        "fields": [field.public() for field in note_fields],
+                    },
+                    "comments": {
+                        "label": "评论数据库", "total": comment_total, "activeTotal": active_comments,
+                        "fields": [field.public() for field in comment_fields],
+                    },
+                },
+            }
+
+    def query_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one parameterized, read-only query against an approved consistent snapshot."""
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请重新校验数据总览")
+        # Hold both write locks from token validation through SELECT completion;
+        # no sync or background AI write can move the underlying snapshot.
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验数据总览")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再查询")
+
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                field_specs = build_field_specs(db, dataset)
+                by_key = {field.key: field for field in field_specs}
+                requested_fields = list(dict.fromkeys(
+                    text(item, 160) for item in (payload.get("fields") or []) if text(item, 160) in by_key
+                ))
+                if not requested_fields:
+                    requested_fields = [field.key for field in field_specs if field.default_visible]
+                if not requested_fields:
+                    requested_fields = [field_specs[0].key]
+                if len(requested_fields) > 180:
+                    raise ValueError("单次最多显示 180 个字段")
+
+                filter_sql, filter_params, condition_count = compile_filter_group(
+                    payload.get("filter") if isinstance(payload.get("filter"), dict) else None, by_key
+                )
+                search_sql, search_params = search_clause(text(payload.get("search"), 500), dataset)
+                clauses = [item for item in (filter_sql, search_sql) if item]
+                where = " WHERE " + " AND ".join(clauses) if clauses else ""
+                parameters = [*filter_params, *search_params]
+                base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
+                total = int(db.execute(f"SELECT COUNT(*) FROM {base}{where}", parameters).fetchone()[0])
+                page_size = max(1, min(int(payload.get("pageSize") or 50), 200))
+                page_count = max(1, (total + page_size - 1) // page_size)
+                page = max(1, min(int(payload.get("page") or 1), page_count))
+                order_by = compile_sort(payload.get("sort") if isinstance(payload.get("sort"), list) else [], by_key, dataset)
+                select_sql = ", ".join(
+                    f"{by_key[key].expression} AS {json.dumps(key)}" for key in requested_fields
+                )
+                rows = [dict(row) for row in db.execute(
+                    f"SELECT {select_sql} FROM {base}{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                    (*parameters, page_size, (page - 1) * page_size),
+                ).fetchall()]
+                db.rollback()
+            finally:
+                db.close()
+            query_hash = hashlib.sha256(json.dumps({
+                "dataset": dataset, "fields": requested_fields, "search": payload.get("search") or "",
+                "filter": payload.get("filter") or {}, "sort": payload.get("sort") or [],
+                "page": page, "pageSize": page_size,
+            }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            return {
+                "ok": True, "dataset": dataset, "rows": rows, "fields": requested_fields,
+                "total": total, "page": page, "pageSize": page_size, "pageCount": page_count,
+                "filterConditionCount": condition_count, "snapshotToken": current_token,
+                "queryHash": query_hash, "consistentSnapshot": True,
+            }
 
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_type = text(payload.get("runType"), 40) or "single"
@@ -9156,6 +9315,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "count": len(notes), "notes": notes})
             elif parsed.path == "/api/data-health":
                 self._send_json(200, self.store.data_health())
+            elif parsed.path == "/api/data-overview/schema":
+                self._send_json(200, self.store.data_overview_schema())
             elif parsed.path == "/api/changes":
                 query = parse_qs(parsed.query)
                 limit = int(query.get("limit", [100])[0])
@@ -9244,6 +9405,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.repair_data_health(payload)
             elif self.path == "/api/data-health/repair-relations":
                 result = self.store.repair_csv_relationships(payload)
+            elif self.path == "/api/data-overview/query":
+                result = self.store.query_data_overview(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":

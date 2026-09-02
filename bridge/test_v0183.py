@@ -115,6 +115,45 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("known", result["statuses"][0]["status"])
         self.assertEqual("帖子ID", result["statuses"][0]["matchLabel"])
 
+    def test_title_only_scan_never_overwrites_dom_sourced_pulled_note(self):
+        timestamp = "2026-08-21T12:00:00+08:00"
+        canonical_payload = {
+            "noteId": "dompulled123456", "url": "https://www.xiaohongshu.com/explore/dompulled123456",
+            "title": "总表完整标题", "author": "总表作者", "content": "总表完整正文",
+        }
+        with self.store._session() as db:
+            db.execute("""
+                INSERT INTO notes
+                (note_id,url,title,author,content,tags,keyword,first_seen_at,last_seen_at,status,
+                 is_relevant,source,title_key,content_key,title_content_key,pull_status,payload_json)
+                VALUES(?,?,?,?,?,?,?,?,?,'known',1,'dom',?,?,?,'synced',?)
+            """, (
+                canonical_payload["noteId"], canonical_payload["url"], canonical_payload["title"],
+                canonical_payload["author"], canonical_payload["content"], "完整话题", "来源词",
+                timestamp, timestamp, "总表完整标题", "总表完整正文", "总表完整标题总表完整正文",
+                json.dumps(canonical_payload, ensure_ascii=False),
+            ))
+        result = self.store.scan({
+            "titleOnly": True, "returnAllStatuses": True, "keyword": "samplebrand",
+            "notes": [{
+                "noteId": canonical_payload["noteId"], "url": canonical_payload["url"],
+                "title": "卡片截断标题", "author": "卡片作者", "content": "卡片截断正文",
+                "tags": ["卡片话题"],
+            }],
+        })
+        self.assertTrue(result["statuses"][0]["inExcel"])
+        with self.store._session() as db:
+            stored = dict(db.execute(
+                "SELECT title,author,content,tags,keyword,payload_json FROM notes WHERE note_id=?",
+                (canonical_payload["noteId"],),
+            ).fetchone())
+        self.assertEqual("总表完整标题", stored["title"])
+        self.assertEqual("总表作者", stored["author"])
+        self.assertEqual("总表完整正文", stored["content"])
+        self.assertEqual("完整话题", stored["tags"])
+        self.assertEqual("来源词", stored["keyword"])
+        self.assertEqual(canonical_payload, json.loads(stored["payload_json"]))
+
     def test_same_title_different_note_id_is_never_marked_as_pulled(self):
         timestamp = "2026-08-27T15:00:00+08:00"
         original_payload = {
@@ -1618,6 +1657,88 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("ok", db_states["accessopen123"])
         self.assertEqual("check_failed", db_states["accessreview123"])
         self.assertEqual("unreachable", db_states["accessgone123"])
+
+    def test_data_overview_filters_all_note_and_comment_fields_on_verified_snapshot(self):
+        notes_path, _comments_path = self._configure_csv("data-overview")
+        notes = [
+            {"noteId": "overviewnote123", "url": "https://www.xiaohongshu.com/explore/overviewnote123",
+             "title": "价格反馈", "content": "正文甲", "author": "作者甲", "detailRead": True},
+            {"noteId": "overviewnote456", "url": "https://www.xiaohongshu.com/explore/overviewnote456",
+             "title": "使用体验", "content": "正文乙", "author": "作者乙", "detailRead": True},
+        ]
+        comments = [
+            {"commentId": "overview-comment-a", "author": "用户甲", "content": "价格太贵", "likeCount": 8},
+            {"commentId": "overview-comment-b", "author": "用户乙", "content": "体验不错", "likeCount": 2},
+        ]
+        for note, comment in zip(notes, comments):
+            self.store.confirm(note)
+            self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "likely_complete"})
+            self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+        schema = self.store.data_overview_schema()
+        self.assertTrue(schema["queryReady"])
+        self.assertTrue(schema["health"]["summary"]["relationshipsConsistent"])
+        note_fields = {item["key"] for item in schema["datasets"]["notes"]["fields"]}
+        comment_fields = {item["key"] for item in schema["datasets"]["comments"]["fields"]}
+        self.assertTrue({"note_id", "payload_json", "active_comment_count", "source_like_count"}.issubset(note_fields))
+        self.assertTrue({"comment_id", "content", "post__title", "post__payload_json"}.issubset(comment_fields))
+
+        note_result = self.store.query_data_overview({
+            "dataset": "notes", "snapshotToken": schema["snapshotToken"],
+            "fields": ["note_id", "title", "active_comment_count"],
+            "filter": {"logic": "and", "children": [
+                {"field": "title", "operator": "contains", "value": "价格"},
+                {"field": "active_comment_count", "operator": "gte", "value": 1},
+            ]},
+        })
+        self.assertEqual(1, note_result["total"])
+        self.assertEqual("overviewnote123", note_result["rows"][0]["note_id"])
+        comment_result = self.store.query_data_overview({
+            "dataset": "comments", "snapshotToken": schema["snapshotToken"],
+            "fields": ["comment_id", "content", "post__title"],
+            "filter": {"logic": "and", "children": [
+                {"field": "like_count", "operator": "gt", "value": 5},
+                {"field": "post__author", "operator": "eq", "value": "作者甲"},
+            ]},
+        })
+        self.assertEqual(1, comment_result["total"])
+        self.assertEqual("价格反馈", comment_result["rows"][0]["post__title"])
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET last_seen_at=? WHERE note_id=?", ("2099-01-01", notes[0]["noteId"]))
+        with self.assertRaisesRegex(ValueError, "数据已变化"):
+            self.store.query_data_overview({"dataset": "notes", "snapshotToken": schema["snapshotToken"]})
+
+    def test_data_overview_snapshot_tracks_material_json_changes(self):
+        self._configure_csv("data-overview-material-token")
+        note = {
+            "noteId": "overviewmaterial123", "url": "https://www.xiaohongshu.com/explore/overviewmaterial123",
+            "title": "素材快照", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        self.store.confirm(note)
+        folder = Path(self.tmp.name) / "materials" / note["noteId"]
+        folder.mkdir(parents=True)
+        (folder / "note.json").write_text('{"revision":1}', encoding="utf-8")
+        (folder / "comments.json").write_text('[]', encoding="utf-8")
+        (folder / "帖子正文.txt").write_text("正文", encoding="utf-8")
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET media_dir=? WHERE note_id=?", (str(folder), note["noteId"]))
+        first = self.store._data_overview_snapshot_token()
+        (folder / "note.json").write_text('{"revision":222}', encoding="utf-8")
+        second = self.store._data_overview_snapshot_token()
+        self.assertNotEqual(first, second)
+
+    def test_data_overview_extension_page_and_workbench_launcher_exist(self):
+        extension = Path(__file__).resolve().parent.parent / "extension"
+        page = (extension / "data-overview.html").read_text(encoding="utf-8")
+        script = (extension / "data-overview.js").read_text(encoding="utf-8")
+        worker = (extension / "service-worker.js").read_text(encoding="utf-8")
+        panel = (extension / "sidepanel.html").read_text(encoding="utf-8")
+        self.assertIn('id="openDataOverview"', panel)
+        self.assertIn('id="filterRows"', page)
+        self.assertIn('id="fieldOptions"', page)
+        self.assertIn('type: "getDataOverviewSchema"', script)
+        self.assertIn('message.type === "queryDataOverview"', worker)
+        self.assertIn("relationshipsConsistent", script)
+        self.assertIn("queryPending", script)
 
     def test_summary_combines_note_and_comments(self):
         settings = self.store.ai_settings._raw()

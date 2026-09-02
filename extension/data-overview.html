@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>本地数据总览 · 舆情雷达</title>
+    <link rel="stylesheet" href="data-overview.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="database-rail" aria-label="数据表切换">
+        <div class="rail-brand" aria-label="舆情雷达">
+          <span class="rail-brand__mark">X</span>
+          <span class="rail-brand__copy"><small>XHS MONITOR</small><strong>数据总览</strong></span>
+        </div>
+        <nav class="dataset-nav">
+          <button class="dataset-button is-active" type="button" data-dataset="notes">
+            <span class="dataset-button__icon">帖</span>
+            <span><strong>帖子数据库</strong><small>本地全部帖子记录</small></span>
+            <i id="notesCount">—</i>
+          </button>
+          <button class="dataset-button" type="button" data-dataset="comments">
+            <span class="dataset-button__icon">评</span>
+            <span><strong>评论数据库</strong><small>一级与全部回复</small></span>
+            <i id="commentsCount">—</i>
+          </button>
+        </nav>
+
+        <section class="saved-views" aria-label="快捷视图">
+          <header><span>快捷视图</span><small>LOCAL</small></header>
+          <button type="button" data-quick-view="all"><i></i>全部记录</button>
+          <button type="button" data-quick-view="active"><i></i>当前存在</button>
+          <button type="button" data-quick-view="deleted"><i></i>已删除历史</button>
+          <button type="button" data-quick-view="negative"><i></i>语义差评</button>
+          <button type="button" data-quick-view="unanalyzed"><i></i>尚未语义分析</button>
+        </section>
+
+        <div class="rail-footnote">
+          <span id="railHealthDot" data-state="checking"></span>
+          <p><strong id="railHealthText">正在校验数据</strong><small id="railHealthMeta">CSV · SQLite · 素材快照</small></p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <span class="workspace-kicker">LOCAL DATABASE VIEW</span>
+            <h1 id="datasetTitle">帖子数据库</h1>
+            <p id="datasetSubtitle">从本地业务总表、SQLite 与素材快照读取一致的数据。</p>
+          </div>
+          <div class="header-actions">
+            <button id="exportCurrent" class="quiet-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
+              导出当前页
+            </button>
+            <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section id="lineageRibbon" class="lineage-ribbon" data-state="checking" aria-live="polite">
+          <div class="lineage-node"><i></i><span><small>来源</small><strong>业务 CSV</strong></span></div>
+          <b></b>
+          <div class="lineage-node"><i></i><span><small>查询</small><strong>SQLite 快照</strong></span></div>
+          <b></b>
+          <div class="lineage-node"><i></i><span><small>核验</small><strong>素材 JSON</strong></span></div>
+          <p><strong id="consistencyTitle">正在建立一致性快照</strong><small id="consistencyMeta">查询将在校验通过后开放</small></p>
+          <code id="snapshotCode">CHECKING</code>
+        </section>
+
+        <section class="query-toolbar" aria-label="数据筛选工具">
+          <label class="search-control">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.2 16.2 4 4"/></svg>
+            <input id="globalSearch" type="search" placeholder="搜索标题、正文、作者或 ID" autocomplete="off">
+            <kbd>⌘ K</kbd>
+          </label>
+          <button id="toggleFilters" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+            筛选 <i id="filterCount" hidden>0</i>
+          </button>
+          <button id="toggleFields" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9 5v14m6-14v14"/></svg>
+            字段 <i id="fieldCount">0</i>
+          </button>
+          <button id="toggleSort" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h8M8 18h4M4 5v14"/></svg>
+            排序 <i id="sortCount" hidden>0</i>
+          </button>
+          <div class="result-counter"><strong id="resultCount">—</strong><span>条结果</span></div>
+        </section>
+
+        <section id="filterPanel" class="builder-panel" hidden>
+          <header>
+            <div><strong>条件筛选</strong><span>满足</span><select id="filterLogic"><option value="and">全部条件</option><option value="or">任一条件</option></select></div>
+            <button id="clearFilters" type="button">清空</button>
+          </header>
+          <div id="filterRows" class="builder-rows"></div>
+          <button id="addFilter" class="builder-add" type="button">＋ 添加筛选条件</button>
+        </section>
+
+        <section id="fieldPanel" class="popover-panel field-panel" hidden>
+          <label><span>查找字段</span><input id="fieldSearch" type="search" placeholder="输入字段名称"></label>
+          <div class="field-panel__actions"><button id="selectDefaultFields" type="button">恢复默认</button><button id="selectAllFields" type="button">显示全部</button></div>
+          <div id="fieldOptions" class="field-options"></div>
+        </section>
+
+        <section id="sortPanel" class="builder-panel sort-panel" hidden>
+          <header><strong>排序规则</strong><button id="clearSorts" type="button">清空</button></header>
+          <div id="sortRows" class="builder-rows"></div>
+          <button id="addSort" class="builder-add" type="button">＋ 添加排序</button>
+        </section>
+
+        <section id="queryBlocked" class="query-blocked" hidden>
+          <span>!</span>
+          <div><strong>数据一致性校验尚未通过</strong><p id="blockedReason">请先刷新校验，再进行筛选查询。</p></div>
+          <button id="retryHealth" type="button">重新校验</button>
+        </section>
+
+        <section id="dataSurface" class="data-surface" aria-busy="false">
+          <div id="tableViewport" class="table-viewport">
+            <table id="dataTable">
+              <thead><tr id="tableHead"></tr></thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+            <div id="tableEmpty" class="table-empty" hidden>
+              <span>⌕</span><strong>没有符合当前条件的数据</strong><p>调整筛选条件或切换快捷视图。</p>
+            </div>
+            <div id="tableLoading" class="table-loading"><i></i><span>正在读取一致性快照…</span></div>
+          </div>
+          <footer class="table-footer">
+            <span id="pageMeta">第 1 页</span>
+            <label>每页<select id="pageSize"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
+            <div><button id="previousPage" type="button" disabled>上一页</button><button id="nextPage" type="button" disabled>下一页</button></div>
+          </footer>
+        </section>
+      </main>
+
+      <aside id="recordDrawer" class="record-drawer" hidden aria-label="记录详情">
+        <header><div><span id="drawerType">帖子记录</span><strong id="drawerTitle">记录详情</strong></div><button id="closeDrawer" type="button" aria-label="关闭详情">×</button></header>
+        <div id="drawerFields" class="drawer-fields"></div>
+        <footer><button id="copyRecord" type="button">复制 JSON</button><button id="openRecordLink" type="button" hidden>打开原链接</button></footer>
+      </aside>
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+    <script src="data-overview.js"></script>
+  </body>
+</html>
