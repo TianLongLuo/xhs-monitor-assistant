@@ -34,7 +34,8 @@ FIELD_LABELS = {
     "semantic_analysis_count": "语义分析次数", "analysis_is_negative": "语义差评结论",
     "negative_type": "差评类型", "negative_subtype": "差评子类型",
     "payload_json": "原始结构化数据", "content_hash": "内容指纹",
-    "business_record": "是否业务总表记录", "active_comment_count": "当前评论数",
+    "business_record": "是否业务总表记录", "ignore_status": "忽略状态",
+    "active_comment_count": "当前评论数",
     "deleted_comment_count": "已删除评论数", "comment_type": "评论角色",
     "thread_root_id": "一级评论 ID", "thread_root_content": "一级评论",
     "thread_root_author": "一级评论作者",
@@ -49,7 +50,7 @@ FIELD_LABELS = {
 
 DEFAULT_VISIBLE = {
     "notes": [
-        "note_id", "title", "author", "business_record", "post_status", "access_status",
+        "note_id", "title", "author", "business_record", "ignore_status", "post_status", "access_status",
         "pull_status", "source_like_count", "source_collect_count", "active_comment_count",
         "deleted_comment_count", "source_published_at", "last_seen_at", "url",
     ],
@@ -64,7 +65,7 @@ DEFAULT_VISIBLE = {
 NOTE_PRIMARY_ORDER = [
     "note_id", "url", "title", "content", "author", "published_at", "updated_at", "tags", "keyword",
     "source_like_count", "source_collect_count", "source_comment_count", "source_share_count",
-    "post_status", "access_status", "pull_status", "business_record", "active_comment_count",
+    "post_status", "access_status", "pull_status", "business_record", "ignore_status", "active_comment_count",
     "deleted_comment_count", "media_dir", "last_seen_at",
 ]
 COMMENT_PRIMARY_ORDER = [
@@ -79,7 +80,8 @@ VALUE_OPTION_FIELDS = {
     "access_status", "access_check_result", "media_status", "ai_analysis_status", "post_sentiment",
     "sentiment", "analysis_is_negative", "negative_type", "negative_subtype", "review_status",
     "comment_level", "comment_type", "is_post_author", "is_deleted", "is_relevant", "manual_negative",
-    "risk_level", "source_ip_location", "post__author", "post__keyword", "post__tags", "post__source",
+    "risk_level", "source_ip_location", "ignore_status", "post__ignore_status",
+    "post__author", "post__keyword", "post__tags", "post__source",
     "post__pull_status", "post__post_status", "post__access_status", "post__media_status",
     "post__analysis_is_negative", "post__negative_type", "post__negative_subtype",
 }
@@ -202,6 +204,9 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
             _field_spec(dataset, "business_record", _label("business_record"), "boolean",
                         "CASE WHEN n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') THEN 1 ELSE 0 END",
                         "衍生字段", "business_record" in defaults),
+            _field_spec(dataset, "ignore_status", _label("ignore_status"), "text",
+                        "CASE WHEN n.status='ignored' THEN '已忽略' ELSE '未忽略' END",
+                        "衍生字段", "ignore_status" in defaults),
             _field_spec(dataset, "active_comment_count", _label("active_comment_count"), "number",
                         "(SELECT COUNT(*) FROM comments ac WHERE ac.note_id=n.note_id AND ac.is_deleted=0)",
                         "衍生字段", "active_comment_count" in defaults),
@@ -251,6 +256,9 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
             _field_spec(dataset, "is_post_author", _label("is_post_author"), "boolean",
                         "CASE WHEN json_valid(c.payload_json) AND json_extract(c.payload_json, '$.isAuthor') THEN 1 ELSE 0 END",
                         "衍生字段", "is_post_author" in defaults),
+            _field_spec(dataset, "post__ignore_status", _label("post__ignore_status"), "text",
+                        "CASE WHEN n.status='ignored' THEN '已忽略' ELSE '未忽略' END",
+                        "原帖 SQLite 字段", "post__ignore_status" in defaults),
         ])
         for name, declared in _columns(db, "notes"):
             key = f"post__{name}"

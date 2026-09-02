@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.29.0";
+const CONTENT_SCRIPT_VERSION = "0.30.0";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -2205,6 +2205,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return bridgeApi("/api/data-overview/values", {
         method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 60000
       });
+    }
+    if (message.type === "deleteDataOverviewRecords") {
+      const result = await bridgeApi("/api/data-overview/delete", {
+        method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 300000
+      });
+      for (const noteId of result.deletedNoteIds || []) {
+        await broadcastLocalNoteState(noteId, {
+          deleted: true, found: false, inExcel: false, status: "new",
+          pullStatus: "not_started", relevanceStatus: "unknown"
+        });
+      }
+      return result;
     }
     if (message.type === "openDataOverviewRecord") {
       const url = String(message.url || "");

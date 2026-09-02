@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1701,6 +1702,8 @@ class V0183Tests(unittest.TestCase):
         note_fields = {item["key"] for item in schema["datasets"]["notes"]["fields"]}
         comment_fields = {item["key"] for item in schema["datasets"]["comments"]["fields"]}
         self.assertTrue({"note_id", "payload_json", "active_comment_count", "source_like_count"}.issubset(note_fields))
+        self.assertTrue(next(item for item in schema["datasets"]["notes"]["fields"]
+                             if item["key"] == "ignore_status")["defaultVisible"])
         self.assertTrue({"comment_id", "content", "post__title", "post__payload_json"}.issubset(comment_fields))
         comment_field_rows = schema["datasets"]["comments"]["fields"]
         self.assertEqual(
@@ -1755,6 +1758,124 @@ class V0183Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "数据已变化"):
             self.store.query_data_overview({"dataset": "notes", "snapshotToken": schema["snapshotToken"]})
 
+    def test_data_overview_note_scope_excludes_discovery_and_includes_ignored(self):
+        self._configure_csv("data-overview-scope")
+        business = {
+            "noteId": "overview-business-1", "url": "https://www.xiaohongshu.com/explore/overview-business-1",
+            "title": "业务总表帖子", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        confirmed = {
+            "noteId": "overview-confirmed-1", "url": "https://www.xiaohongshu.com/explore/overview-confirmed-1",
+            "title": "待同步帖子", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        ignored = {
+            "noteId": "overview-ignored-1", "url": "https://www.xiaohongshu.com/explore/overview-ignored-1",
+            "title": "已忽略帖子", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        discovery = {
+            "noteId": "overview-discovery-1", "url": "https://www.xiaohongshu.com/explore/overview-discovery-1",
+            "title": "仅发现未入库", "content": "正文", "author": "作者",
+        }
+        self.store.confirm(business)
+        self.store._sync_pull_to_xlsx(business, [], {"folder": "", "files": []})
+        self.store.confirm(confirmed)
+        self.store.confirm(ignored)
+        self.store.ignore({"noteId": ignored["noteId"]})
+        self.store.confirm(discovery)
+        with self.store._session() as db:
+            db.execute("UPDATE notes SET source='existing_xlsx',pull_status='synced',status='known' WHERE note_id=?",
+                       (business["noteId"],))
+            db.execute("UPDATE notes SET source='dom',pull_status='not_started',status='new' WHERE note_id=?",
+                       (discovery["noteId"],))
+
+        schema = self.store.data_overview_schema()
+        self.assertTrue(schema["queryReady"])
+        self.assertEqual(3, schema["datasets"]["notes"]["total"])
+        self.assertEqual(4, schema["datasets"]["notes"]["recordTotal"])
+        self.assertEqual(1, schema["datasets"]["notes"]["ignoredTotal"])
+        self.assertEqual(1, schema["datasets"]["notes"]["excludedDiscoveryTotal"])
+        result = self.store.query_data_overview({
+            "dataset": "notes", "snapshotToken": schema["snapshotToken"],
+            "fields": ["note_id", "ignore_status"], "pageSize": 20,
+        })
+        self.assertEqual(
+            {business["noteId"], confirmed["noteId"], ignored["noteId"]},
+            {row["note_id"] for row in result["rows"]},
+        )
+        self.assertEqual("已忽略", next(row["ignore_status"] for row in result["rows"]
+                                          if row["note_id"] == ignored["noteId"]))
+
+    def test_data_overview_permanent_delete_cascades_every_local_store(self):
+        notes_path, comments_path = self._configure_csv("data-overview-delete")
+        note = {
+            "noteId": "overview-delete-1", "url": "https://www.xiaohongshu.com/explore/overview-delete-1",
+            "title": "永久删除测试", "content": "正文", "author": "作者", "detailRead": True,
+        }
+        comments = [
+            {"commentId": "overview-delete-root", "author": "一级用户", "content": "一级评论", "commentLevel": 1},
+            {"commentId": "overview-delete-reply", "parentCommentId": "overview-delete-root",
+             "author": "回复用户", "content": "二级回复", "commentLevel": 2},
+            {"commentId": "overview-delete-keep", "author": "保留用户", "content": "保留评论", "commentLevel": 1},
+        ]
+        self.store.confirm(note)
+        self.store.upsert_comments({"noteId": note["noteId"], "comments": comments,
+                                    "expectedCount": 3, "status": "likely_complete"})
+        folder = self.store._media_root() / f"永久删除测试__{note['noteId']}"
+        folder.mkdir(parents=True)
+        (folder / "image-01.jpg").write_bytes(b"image")
+        (folder / "note.json").write_text(json.dumps({
+            **note, "postStatus": "存在", "isDeleted": False, "accessStatus": "ok"
+        }, ensure_ascii=False), encoding="utf-8")
+        (folder / "帖子正文.txt").write_text("永久删除测试\n\n正文", encoding="utf-8")
+        media_comments = self.store._comments_as_api(note["noteId"])
+        (folder / "comments.json").write_text(json.dumps(media_comments, ensure_ascii=False), encoding="utf-8")
+        media = {"folder": str(folder), "files": ["image-01.jpg", "note.json", "comments.json", "帖子正文.txt"]}
+        self.store._sync_pull_to_xlsx(note, comments, media)
+        with self.store._session() as db:
+            db.execute("""UPDATE notes SET source='existing_xlsx',pull_status='synced',status='known',
+                       media_dir=?,media_file_count=4,access_status='ok' WHERE note_id=?""",
+                       (str(folder), note["noteId"]))
+
+        token = self.store._data_overview_snapshot_token()
+        self.store._data_overview_approved_tokens[token] = time.time()
+        deleted_comments = self.store.delete_data_overview_records({
+            "dataset": "comments", "ids": ["overview-delete-root"], "snapshotToken": token,
+            "hardDeleteConfirmed": True, "confirmation": "DELETE:comments:1",
+        })
+        self.assertEqual(2, deleted_comments["deletedCount"])
+        self.assertEqual(1, deleted_comments["cascadeDeletedCount"])
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(["overview-delete-keep"], [
+            item["commentId"] for item in json.loads((folder / "comments.json").read_text(encoding="utf-8"))
+        ])
+        self.assertEqual(["overview-delete-keep"], [
+            row["笔记评论ID"] for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)
+        ])
+        with self.store._session() as db:
+            self.assertEqual(["overview-delete-keep"], [row[0] for row in db.execute(
+                "SELECT comment_id FROM comments WHERE note_id=? ORDER BY comment_id", (note["noteId"],)
+            ).fetchall()])
+            self.assertEqual(1, db.execute(
+                "SELECT comment_count_collected FROM notes WHERE note_id=?", (note["noteId"],)
+            ).fetchone()[0])
+
+        token = self.store._data_overview_snapshot_token()
+        self.store._data_overview_approved_tokens[token] = time.time()
+        deleted_note = self.store.delete_data_overview_records({
+            "dataset": "notes", "ids": [note["noteId"]], "snapshotToken": token,
+            "hardDeleteConfirmed": True, "confirmation": "DELETE:notes:1",
+        })
+        self.assertEqual(1, deleted_note["deletedCount"])
+        self.assertEqual(1, deleted_note["deletedCommentCount"])
+        self.assertFalse(folder.exists())
+        self.assertFalse(any(row["笔记ID"] == note["noteId"]
+                             for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)))
+        self.assertFalse(any(row["笔记ID"] == note["noteId"]
+                             for row in self._csv_rows(comments_path, COMMENT_CSV_HEADERS)))
+        with self.store._session() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM notes WHERE note_id=?", (note["noteId"],)).fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note["noteId"],)).fetchone()[0])
+
     def test_data_overview_snapshot_tracks_material_json_changes(self):
         self._configure_csv("data-overview-material-token")
         note = {
@@ -1786,14 +1907,19 @@ class V0183Tests(unittest.TestCase):
         self.assertIn('id="infiniteSentinel"', page)
         self.assertIn('id="pageFindInput"', page)
         self.assertIn('id="columnFilterPopover"', page)
+        self.assertIn('id="deleteSelected"', page)
+        self.assertIn('id="deleteDialog"', page)
         self.assertNotIn('id="previousPage"', page)
         self.assertIn('type: "getDataOverviewSchema"', script)
         self.assertIn("IntersectionObserver", script)
         self.assertIn("loadNextBatch", script)
         self.assertIn("openColumnFilter", script)
         self.assertIn("applyColumnFilter", script)
+        self.assertIn("performPermanentDelete", script)
+        self.assertIn('type: "deleteDataOverviewRecords"', script)
         self.assertIn('message.type === "queryDataOverview"', worker)
         self.assertIn('message.type === "getDataOverviewValues"', worker)
+        self.assertIn('message.type === "deleteDataOverviewRecords"', worker)
         self.assertIn("relationshipsConsistent", script)
         self.assertIn("queryPending", script)
 

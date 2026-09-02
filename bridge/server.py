@@ -45,7 +45,10 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.29.0"
+VERSION = "0.30.0"
+DATA_OVERVIEW_NOTE_SCOPE = (
+    "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
+)
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -4703,12 +4706,25 @@ class MonitorStore:
                 db.execute("PRAGMA query_only=ON")
                 note_fields = build_field_specs(db, "notes")
                 comment_fields = build_field_specs(db, "comments")
-                note_total = int(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
-                comment_total = int(db.execute("SELECT COUNT(*) FROM comments").fetchone()[0])
+                record_total = int(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+                note_total = int(db.execute(
+                    f"SELECT COUNT(*) FROM notes n WHERE {DATA_OVERVIEW_NOTE_SCOPE}"
+                ).fetchone()[0])
+                comment_total = int(db.execute(
+                    f"SELECT COUNT(*) FROM comments c JOIN notes n ON n.note_id=c.note_id "
+                    f"WHERE {DATA_OVERVIEW_NOTE_SCOPE}"
+                ).fetchone()[0])
                 business_notes = int(db.execute(
                     "SELECT COUNT(*) FROM notes WHERE source='existing_xlsx' OR pull_status IN ('synced','partial')"
                 ).fetchone()[0])
-                active_comments = int(db.execute("SELECT COUNT(*) FROM comments WHERE is_deleted=0").fetchone()[0])
+                synchronized_notes = int(db.execute(
+                    f"SELECT COUNT(*) FROM notes n WHERE {DATA_OVERVIEW_NOTE_SCOPE} AND n.status<>'ignored'"
+                ).fetchone()[0])
+                ignored_notes = int(db.execute("SELECT COUNT(*) FROM notes WHERE status='ignored'").fetchone()[0])
+                active_comments = int(db.execute(
+                    f"SELECT COUNT(*) FROM comments c JOIN notes n ON n.note_id=c.note_id "
+                    f"WHERE {DATA_OVERVIEW_NOTE_SCOPE} AND c.is_deleted=0"
+                ).fetchone()[0])
             finally:
                 db.close()
             token = self._data_overview_snapshot_token()
@@ -4725,6 +4741,8 @@ class MonitorStore:
                 "datasets": {
                     "notes": {
                         "label": "帖子数据库", "total": note_total, "businessTotal": business_notes,
+                        "synchronizedTotal": synchronized_notes, "ignoredTotal": ignored_notes,
+                        "recordTotal": record_total, "excludedDiscoveryTotal": max(0, record_total - note_total),
                         "fields": [field.public() for field in note_fields],
                     },
                     "comments": {
@@ -4773,7 +4791,7 @@ class MonitorStore:
                     payload.get("filter") if isinstance(payload.get("filter"), dict) else None, by_key
                 )
                 search_sql, search_params = search_clause(text(payload.get("search"), 500), dataset)
-                clauses = [item for item in (filter_sql, search_sql) if item]
+                clauses = [DATA_OVERVIEW_NOTE_SCOPE, *[item for item in (filter_sql, search_sql) if item]]
                 where = " WHERE " + " AND ".join(clauses) if clauses else ""
                 parameters = [*filter_params, *search_params]
                 base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
@@ -4838,7 +4856,7 @@ class MonitorStore:
                     raise ValueError(f"未知筛选字段：{field_key}")
                 base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
                 value_text = f"TRIM(COALESCE(CAST({spec.expression} AS TEXT),''))"
-                clauses = [f"{value_text}<>''"]
+                clauses = [DATA_OVERVIEW_NOTE_SCOPE, f"{value_text}<>''"]
                 parameters: list[Any] = []
                 if search:
                     clauses.append(f"{value_text} LIKE ? ESCAPE '\\' COLLATE NOCASE")
@@ -4865,6 +4883,267 @@ class MonitorStore:
                 "ok": True, "dataset": dataset, "field": field_key, "values": values,
                 "distinctCount": distinct_count, "truncated": distinct_count > len(values),
                 "snapshotToken": current_token, "consistentSnapshot": True,
+            }
+
+    def _delete_data_overview_comments(self, requested_ids: list[str]) -> dict[str, Any]:
+        """Permanently remove comments and descendants from every canonical local store."""
+        _notes_path, comments_path = self._csv_paths()
+        comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        original_csv = comments_path.read_bytes() if comments_path.is_file() else None
+        material_backups: dict[Path, bytes] = {}
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            requested = set(requested_ids)
+            placeholders = ",".join("?" for _ in requested)
+            initial_rows = db.execute(
+                f"SELECT comment_id,note_id,parent_comment_id FROM comments "
+                f"WHERE comment_id IN ({placeholders})", tuple(requested)
+            ).fetchall()
+            found = {str(row["comment_id"]) for row in initial_rows}
+            missing = sorted(requested - found)
+            if missing:
+                raise ValueError("部分评论已不存在，请刷新后重试：" + "、".join(missing[:5]))
+
+            delete_ids = set(found)
+            frontier = set(found)
+            while frontier:
+                child_placeholders = ",".join("?" for _ in frontier)
+                children = {
+                    str(row[0]) for row in db.execute(
+                        f"SELECT comment_id FROM comments WHERE parent_comment_id IN ({child_placeholders})",
+                        tuple(frontier),
+                    ).fetchall()
+                } - delete_ids
+                if not children:
+                    break
+                delete_ids.update(children)
+                frontier = children
+
+            delete_placeholders = ",".join("?" for _ in delete_ids)
+            selected_rows = [dict(row) for row in db.execute(
+                f"SELECT comment_id,note_id,parent_comment_id FROM comments "
+                f"WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).fetchall()]
+            note_ids = sorted({str(row["note_id"]) for row in selected_rows})
+            delete_by_note = {
+                note_id: {str(row["comment_id"]) for row in selected_rows if str(row["note_id"]) == note_id}
+                for note_id in note_ids
+            }
+
+            kept_comments = [
+                row for row in comment_rows if text(row.get("笔记评论ID"), 256) not in delete_ids
+            ]
+            removed_csv_ids = {
+                text(row.get("笔记评论ID"), 256) for row in comment_rows
+                if text(row.get("笔记评论ID"), 256) in delete_ids
+            }
+            if removed_csv_ids != delete_ids:
+                raise ValueError(
+                    f"评论 CSV 删除前校验失败：SQLite={len(delete_ids)}，CSV={len(removed_csv_ids)}"
+                )
+
+            media_root = self._media_root().resolve()
+            material_payloads: dict[str, tuple[Path, list[dict[str, Any]]]] = {}
+            if note_ids:
+                note_placeholders = ",".join("?" for _ in note_ids)
+                note_rows = db.execute(
+                    f"SELECT note_id,media_dir FROM notes WHERE note_id IN ({note_placeholders})",
+                    tuple(note_ids),
+                ).fetchall()
+                if len(note_rows) != len(note_ids):
+                    raise ValueError("评论关联帖子不完整，已停止删除")
+                for note_row in note_rows:
+                    note_id = str(note_row["note_id"])
+                    media_value = text(note_row["media_dir"], 4000)
+                    if not media_value:
+                        continue
+                    folder = Path(media_value).expanduser()
+                    if not folder.is_dir():
+                        raise ValueError(f"素材目录不存在，已停止删除：{note_id}")
+                    folder = folder.resolve()
+                    if folder.parent != media_root:
+                        raise ValueError("素材目录不在受管 posts_materials 目录内，已停止删除")
+                    material_path = folder / "comments.json"
+                    if not material_path.is_file():
+                        raise ValueError(f"素材 comments.json 缺失，已停止删除：{note_id}")
+                    loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(loaded, list):
+                        raise ValueError(f"素材 comments.json 格式错误：{note_id}")
+                    material_ids = {
+                        text(item.get("commentId"), 256) for item in loaded
+                        if isinstance(item, dict) and text(item.get("commentId"), 256)
+                    }
+                    if not delete_by_note[note_id].issubset(material_ids):
+                        raise ValueError(f"素材评论与 SQLite 不一致，已停止删除：{note_id}")
+                    filtered = [
+                        dict(item) for item in loaded
+                        if isinstance(item, dict) and text(item.get("commentId"), 256) not in delete_ids
+                    ]
+                    child_counts: dict[str, int] = {}
+                    for item in filtered:
+                        parent_id = text(item.get("parentCommentId"), 256)
+                        if parent_id:
+                            child_counts[parent_id] = child_counts.get(parent_id, 0) + 1
+                    for item in filtered:
+                        comment_id = text(item.get("commentId"), 256)
+                        if comment_id and not text(item.get("parentCommentId"), 256):
+                            item["replyCount"] = child_counts.get(comment_id, 0)
+                    material_backups[material_path] = material_path.read_bytes()
+                    material_payloads[note_id] = (material_path, filtered)
+
+            self._replace_csv_table(comments_path, comment_headers, kept_comments, "overview-comment-delete")
+            for material_path, filtered in material_payloads.values():
+                self._write_json_atomic(material_path, filtered)
+
+            linked_records = 0
+            linked_records += db.execute(
+                f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM reply_generation_history WHERE comment_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM change_events WHERE target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            deleted_database_comments = db.execute(
+                f"DELETE FROM comments WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).rowcount
+            if deleted_database_comments != len(delete_ids):
+                raise ValueError("SQLite 评论删除数量校验失败")
+
+            for note_id in note_ids:
+                db.execute(
+                    """UPDATE comments SET reply_count=(
+                           SELECT COUNT(*) FROM comments child
+                           WHERE child.note_id=comments.note_id
+                             AND child.parent_comment_id=comments.comment_id
+                             AND child.is_deleted=0
+                       ) WHERE note_id=?""",
+                    (note_id,),
+                )
+                counts = db.execute(
+                    """SELECT COUNT(*) active_count,
+                              SUM(CASE WHEN is_deleted=0 AND analysis_is_negative='是' THEN 1 ELSE 0 END) negative_count
+                       FROM comments WHERE note_id=? AND is_deleted=0""",
+                    (note_id,),
+                ).fetchone()
+                db.execute(
+                    "UPDATE notes SET comment_count_collected=?,negative_comment_count=? WHERE note_id=?",
+                    (int(counts["active_count"] or 0), int(counts["negative_count"] or 0), note_id),
+                )
+                linked_records += db.execute("DELETE FROM note_summaries WHERE note_id=?", (note_id,)).rowcount
+
+            if db.execute(
+                f"SELECT COUNT(*) FROM comments WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).fetchone()[0]:
+                raise ValueError("SQLite 评论删除后仍存在残留")
+            if any(text(row.get("笔记评论ID"), 256) in delete_ids for row in kept_comments):
+                raise ValueError("评论 CSV 删除后仍存在残留")
+
+            for note_id in note_ids:
+                database_status = {
+                    str(row["comment_id"]): comment_status_label(row["comment_status"], row["is_deleted"])
+                    for row in db.execute(
+                        "SELECT comment_id,comment_status,is_deleted FROM comments WHERE note_id=?", (note_id,)
+                    ).fetchall()
+                }
+                csv_status = {
+                    text(row.get("笔记评论ID"), 256): comment_status_label(row.get("评论状态"))
+                    for row in kept_comments if csv_comment_note_id(row) == note_id
+                }
+                if database_status != csv_status:
+                    raise ValueError(f"删除后评论 CSV 与 SQLite 不一致：{note_id}")
+                if note_id in material_payloads:
+                    material_status = {
+                        text(item.get("commentId"), 256): comment_status_label(
+                            item.get("commentStatus"), item.get("isDeleted")
+                        ) for item in material_payloads[note_id][1]
+                        if text(item.get("commentId"), 256)
+                    }
+                    if database_status != material_status:
+                        raise ValueError(f"删除后素材评论与 SQLite 不一致：{note_id}")
+
+            db.commit()
+            return {
+                "ok": True, "dataset": "comments", "requestedCount": len(requested_ids),
+                "deletedCount": len(delete_ids), "deletedCommentIds": sorted(delete_ids),
+                "cascadeDeletedCount": max(0, len(delete_ids) - len(requested_ids)),
+                "affectedNoteIds": note_ids, "deletedCsvRows": len(removed_csv_ids),
+                "deletedDatabaseComments": deleted_database_comments,
+                "deletedLinkedDatabaseRecords": linked_records,
+                "materialSnapshotsUpdated": len(material_payloads),
+                "csvVerified": True, "databaseVerified": True, "materialsVerified": True,
+            }
+        except Exception:
+            db.rollback()
+            self._restore_file_bytes(comments_path, original_csv)
+            if comments_path.is_file():
+                self._remember_managed_csv(comments_path)
+            for material_path, original in material_backups.items():
+                self._restore_file_bytes(material_path, original)
+            raise
+        finally:
+            db.close()
+
+    def delete_data_overview_records(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Delete selected overview records only after snapshot and explicit confirmation checks."""
+        dataset = text(payload.get("dataset"), 30).lower()
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        raw_ids = payload.get("ids") if isinstance(payload.get("ids"), list) else []
+        ids = list(dict.fromkeys(text(item, 256) for item in raw_ids if text(item, 256)))
+        if not ids:
+            raise ValueError("请至少选择一条要删除的数据")
+        if len(ids) > 100:
+            raise ValueError("单次最多永久删除 100 条记录")
+        if dataset == "notes" and any(not valid_note_id(item) for item in ids):
+            raise ValueError("选择中包含无效的笔记 ID")
+        confirmation = f"DELETE:{dataset}:{len(ids)}"
+        if not bool(payload.get("hardDeleteConfirmed")) or text(payload.get("confirmation"), 128) != confirmation:
+            raise ValueError("永久删除确认不完整")
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请刷新后重试")
+
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验后再删除")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再删除")
+
+            if dataset == "comments":
+                return self._delete_data_overview_comments(ids)
+
+            deleted: list[dict[str, Any]] = []
+            failures: list[dict[str, str]] = []
+            for note_id in ids:
+                try:
+                    deleted.append(self.delete_pulled_note({"noteId": note_id}))
+                except Exception as exc:
+                    failures.append({"noteId": note_id, "error": text(exc, 1000)})
+            if not deleted:
+                detail = "；".join(f"{item['noteId']}：{item['error']}" for item in failures[:3])
+                raise ValueError("帖子删除失败：" + detail)
+            return {
+                "ok": True, "dataset": "notes", "requestedCount": len(ids),
+                "deletedCount": len(deleted), "deletedNoteIds": [item["noteId"] for item in deleted],
+                "deletedCommentCount": sum(int(item.get("deletedDatabaseComments") or 0) for item in deleted),
+                "deletedCsvNoteRows": sum(int(item.get("deletedNoteRows") or 0) for item in deleted),
+                "deletedCsvCommentRows": sum(int(item.get("deletedCommentRows") or 0) for item in deleted),
+                "deletedMaterialDirectoryCount": sum(bool(item.get("mediaDeleted")) for item in deleted),
+                "failureCount": len(failures), "failures": failures,
+                "partial": bool(failures), "csvVerified": True, "databaseVerified": True,
             }
 
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -9473,6 +9752,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.query_data_overview(payload)
             elif self.path == "/api/data-overview/values":
                 result = self.store.data_overview_values(payload)
+            elif self.path == "/api/data-overview/delete":
+                result = self.store.delete_data_overview_records(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":

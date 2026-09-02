@@ -6,6 +6,7 @@ const elements = {
   railHealthDot: byId("railHealthDot"), railHealthText: byId("railHealthText"), railHealthMeta: byId("railHealthMeta"),
   datasetTitle: byId("datasetTitle"), datasetSubtitle: byId("datasetSubtitle"),
   refreshSchema: byId("refreshSchema"), exportCurrent: byId("exportCurrent"),
+  deleteSelected: byId("deleteSelected"), selectedCount: byId("selectedCount"),
   lineageRibbon: byId("lineageRibbon"), consistencyTitle: byId("consistencyTitle"),
   consistencyMeta: byId("consistencyMeta"), snapshotCode: byId("snapshotCode"),
   globalSearch: byId("globalSearch"), toggleFilters: byId("toggleFilters"), filterCount: byId("filterCount"),
@@ -30,17 +31,22 @@ const elements = {
   clearColumnFilter: byId("clearColumnFilter"), applyColumnFilter: byId("applyColumnFilter"),
   recordDrawer: byId("recordDrawer"), drawerType: byId("drawerType"), drawerTitle: byId("drawerTitle"),
   drawerFields: byId("drawerFields"), closeDrawer: byId("closeDrawer"), copyRecord: byId("copyRecord"),
-  openRecordLink: byId("openRecordLink"), toast: byId("toast")
+  openRecordLink: byId("openRecordLink"), deleteDrawerRecord: byId("deleteDrawerRecord"),
+  deleteDialog: byId("deleteDialog"), deleteDialogTitle: byId("deleteDialogTitle"),
+  deleteDialogSummary: byId("deleteDialogSummary"), deleteDialogDetails: byId("deleteDialogDetails"),
+  deleteAcknowledgement: byId("deleteAcknowledgement"), cancelDelete: byId("cancelDelete"),
+  confirmDelete: byId("confirmDelete"), toast: byId("toast")
 };
 
 const TITLES = {
   notes: ["帖子数据库", "本地全部帖子、业务状态、素材与评论计数。"],
   comments: ["评论数据库", "全部一级评论与回复，并联原帖的每一个字段。"]
 };
-const STATUS_FIELDS = new Set(["status", "pull_status", "post_status", "comment_status", "access_status", "review_status", "analysis_is_negative"]);
+const STATUS_FIELDS = new Set(["status", "pull_status", "post_status", "comment_status", "access_status", "review_status", "analysis_is_negative", "ignore_status", "post__ignore_status"]);
 const LONG_FIELD_HINTS = ["content", "summary", "reason", "json", "error", "categories", "note"];
 const MONO_FIELD_HINTS = ["_id", "url", "path", "dir", "hash", "json"];
 const NO_VALUE_OPERATORS = new Set(["is_empty", "not_empty", "is_true", "is_false"]);
+const REQUIRED_NOTE_FIELDS = new Set(["note_id", "ignore_status"]);
 const REQUIRED_COMMENT_FIELDS = new Set(["comment_id", "note_id", "thread_root_content"]);
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
 const INFINITE_BATCH_SIZE = 100;
@@ -68,7 +74,10 @@ const state = {
   findQuery: "",
   findMatches: [],
   findIndex: -1,
-  findLoading: false
+  findLoading: false,
+  selectedIds: new Set(),
+  pendingDeleteIds: [],
+  deletePending: false
 };
 
 let queryTimer = 0;
@@ -142,6 +151,9 @@ function currentVisibleFields() {
   if (!selected.size) {
     for (const field of orderedDatasetFields()) if (field.defaultVisible) selected.add(field.key);
   }
+  if (state.dataset === "notes") {
+    for (const key of REQUIRED_NOTE_FIELDS) if (available.has(key)) selected.add(key);
+  }
   if (state.dataset === "comments") {
     for (const key of REQUIRED_COMMENT_FIELDS) if (available.has(key)) selected.add(key);
   }
@@ -161,7 +173,8 @@ function healthIssueText(health) {
 function renderSchemaState() {
   const health = state.schema?.health || {};
   const summary = health.summary || {};
-  elements.notesCount.textContent = Number(state.schema?.datasets?.notes?.total || 0).toLocaleString("zh-CN");
+  const noteDataset = state.schema?.datasets?.notes || {};
+  elements.notesCount.textContent = Number(noteDataset.total || 0).toLocaleString("zh-CN");
   elements.commentsCount.textContent = Number(state.schema?.datasets?.comments?.total || 0).toLocaleString("zh-CN");
   state.queryReady = state.schema?.queryReady === true;
   elements.lineageRibbon.dataset.state = state.queryReady ? "ready" : "blocked";
@@ -180,7 +193,9 @@ function renderSchemaState() {
   elements.dataSurface.hidden = !state.queryReady;
   document.querySelectorAll(".dataset-button").forEach((button) => button.classList.toggle("is-active", button.dataset.dataset === state.dataset));
   elements.datasetTitle.textContent = TITLES[state.dataset][0];
-  elements.datasetSubtitle.textContent = TITLES[state.dataset][1];
+  elements.datasetSubtitle.textContent = state.dataset === "notes"
+    ? `同步记录 ${Number(noteDataset.synchronizedTotal || 0).toLocaleString("zh-CN")} · 已忽略 ${Number(noteDataset.ignoredTotal || 0).toLocaleString("zh-CN")} · 已排除仅发现未入库 ${Number(noteDataset.excludedDiscoveryTotal || 0).toLocaleString("zh-CN")}`
+    : TITLES[state.dataset][1];
 }
 
 function renderFieldOptions() {
@@ -206,7 +221,8 @@ function renderFieldOptions() {
       input.type = "checkbox";
       input.checked = selected.has(field.key);
       input.dataset.field = field.key;
-      input.disabled = state.dataset === "comments" && REQUIRED_COMMENT_FIELDS.has(field.key);
+      input.disabled = (state.dataset === "notes" && REQUIRED_NOTE_FIELDS.has(field.key))
+        || (state.dataset === "comments" && REQUIRED_COMMENT_FIELDS.has(field.key));
       const name = document.createElement("span");
       name.textContent = field.label;
       const type = document.createElement("small");
@@ -553,7 +569,114 @@ async function loadSchema({ preserveQuery = false } = {}) {
   }
 }
 
+function recordIdentity(record, dataset = state.dataset) {
+  return String(dataset === "notes" ? record?.note_id || "" : record?.comment_id || "").trim();
+}
+
+function updateSelectionUi() {
+  const count = state.selectedIds.size;
+  elements.selectedCount.textContent = String(count);
+  elements.deleteSelected.disabled = count === 0 || state.deletePending;
+  elements.deleteSelected.title = count
+    ? `永久删除选中的 ${count} 条本地记录`
+    : "先勾选要删除的数据";
+  const loadedIds = state.rows.map((record) => recordIdentity(record)).filter(Boolean);
+  const selectedLoaded = loadedIds.filter((id) => state.selectedIds.has(id)).length;
+  const selectAll = elements.tableHead.querySelector('[data-role="select-loaded"]');
+  if (selectAll) {
+    selectAll.checked = loadedIds.length > 0 && selectedLoaded === loadedIds.length;
+    selectAll.indeterminate = selectedLoaded > 0 && selectedLoaded < loadedIds.length;
+    selectAll.disabled = loadedIds.length === 0 || state.deletePending;
+  }
+  for (const row of elements.tableBody.querySelectorAll("tr[data-record-id]")) {
+    const selected = state.selectedIds.has(row.dataset.recordId);
+    row.dataset.selected = String(selected);
+    const input = row.querySelector('[data-role="select-row"]');
+    if (input) { input.checked = selected; input.disabled = state.deletePending; }
+  }
+}
+
+function clearSelection() {
+  state.selectedIds.clear();
+  state.pendingDeleteIds = [];
+  updateSelectionUi();
+}
+
+function closeDeleteDialog() {
+  if (state.deletePending) return;
+  state.pendingDeleteIds = [];
+  elements.deleteAcknowledgement.checked = false;
+  elements.confirmDelete.disabled = true;
+  if (elements.deleteDialog.open) elements.deleteDialog.close();
+}
+
+function openDeleteDialog(ids = [...state.selectedIds]) {
+  const uniqueIds = [...new Set(ids.map((item) => String(item || "").trim()).filter(Boolean))];
+  if (!uniqueIds.length) { showToast("请先勾选要删除的数据"); return; }
+  state.pendingDeleteIds = uniqueIds;
+  elements.deleteAcknowledgement.checked = false;
+  elements.confirmDelete.disabled = true;
+  elements.deleteDialogTitle.textContent = state.dataset === "notes"
+    ? `彻底删除 ${uniqueIds.length} 篇帖子`
+    : `彻底删除 ${uniqueIds.length} 条评论`;
+  elements.deleteDialogSummary.textContent = state.dataset === "notes"
+    ? "所选帖子会从本地业务 CSV、SQLite 和素材目录中永久移除。"
+    : "所选评论会从评论 CSV、SQLite 与素材 comments.json 中永久移除。";
+  const details = state.dataset === "notes" ? [
+    "级联删除帖子下的全部一级评论与回复",
+    "删除图片、视频、正文和 JSON 素材目录",
+    "清理关联的 AI 记录、回复历史、观察与变更记录",
+  ] : [
+    "选中一级评论时，其下所有回复会一并删除",
+    "同步清理 AI 记录、回复建议历史与变更记录",
+    "保留原帖及其图片、视频；仅更新该帖 comments.json",
+  ];
+  elements.deleteDialogDetails.replaceChildren(...details.map((value) => {
+    const item = document.createElement("li"); item.textContent = value; return item;
+  }));
+  if (!elements.deleteDialog.open) elements.deleteDialog.showModal();
+}
+
+async function performPermanentDelete() {
+  if (state.deletePending || !elements.deleteAcknowledgement.checked) return;
+  const ids = [...state.pendingDeleteIds];
+  if (!ids.length) return;
+  state.deletePending = true;
+  elements.confirmDelete.disabled = true;
+  elements.confirmDelete.textContent = "正在校验并删除…";
+  updateSelectionUi();
+  let result = null;
+  try {
+    result = await sendRuntime({
+      type: "deleteDataOverviewRecords",
+      payload: {
+        dataset: state.dataset, ids, snapshotToken: state.snapshotToken,
+        hardDeleteConfirmed: true, confirmation: `DELETE:${state.dataset}:${ids.length}`,
+      },
+    });
+    elements.recordDrawer.hidden = true;
+    if (elements.deleteDialog.open) elements.deleteDialog.close();
+    clearSelection();
+    await loadSchema({ preserveQuery: false });
+    const cascaded = Number(result.cascadeDeletedCount || result.deletedCommentCount || 0);
+    const failureText = Number(result.failureCount || 0) ? `，${result.failureCount} 条失败` : "";
+    showToast(`已永久删除 ${Number(result.deletedCount || 0)} 条${cascaded ? `，级联清理 ${cascaded} 条评论` : ""}${failureText}`);
+  } catch (error) {
+    if (elements.deleteDialog.open) elements.deleteDialog.close();
+    await loadSchema({ preserveQuery: false }).catch(() => {});
+    showToast(error.message || "删除没有完成");
+  } finally {
+    state.deletePending = false;
+    state.pendingDeleteIds = [];
+    elements.confirmDelete.textContent = "永久删除";
+    elements.deleteAcknowledgement.checked = false;
+    elements.confirmDelete.disabled = true;
+    updateSelectionUi();
+  }
+}
+
 function resetLoadedRows() {
+  clearSelection();
   threadMergeCell = null;
   state.page = 0;
   state.total = 0;
@@ -667,7 +790,14 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   if (!append) {
     threadMergeCell = null;
     elements.tableHead.replaceChildren();
-    const rowNumber = document.createElement("th"); rowNumber.textContent = "#"; elements.tableHead.append(rowNumber);
+    const selectColumn = document.createElement("th");
+    selectColumn.className = "select-column";
+    const selectLoaded = document.createElement("input");
+    selectLoaded.type = "checkbox"; selectLoaded.dataset.role = "select-loaded";
+    selectLoaded.setAttribute("aria-label", "选择当前已加载的全部记录");
+    selectColumn.append(selectLoaded); elements.tableHead.append(selectColumn);
+    const rowNumber = document.createElement("th");
+    rowNumber.className = "row-number-column"; rowNumber.textContent = "#"; elements.tableHead.append(rowNumber);
     for (const key of fields) {
       const field = map.get(key);
       const th = document.createElement("th");
@@ -692,7 +822,15 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.dataset.index = String(absoluteIndex);
+    tr.dataset.recordId = recordIdentity(record);
+    const selectCell = document.createElement("td");
+    selectCell.className = "select-column";
+    const selectRow = document.createElement("input");
+    selectRow.type = "checkbox"; selectRow.dataset.role = "select-row";
+    selectRow.setAttribute("aria-label", `选择第 ${absoluteIndex + 1} 条记录`);
+    selectCell.append(selectRow); tr.append(selectCell);
     const number = document.createElement("td");
+    number.className = "row-number-column";
     number.textContent = String(absoluteIndex + 1);
     tr.append(number);
     for (const key of fields) {
@@ -731,6 +869,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   elements.exportCurrent.disabled = state.rows.length === 0;
   elements.snapshotCode.textContent = state.snapshotToken.slice(0, 14).toUpperCase();
   updateHeaderFilterState();
+  updateSelectionUi();
   renderInfiniteState();
   refreshFindMatches(false);
 }
@@ -762,7 +901,8 @@ function renderCell(td, value, key, dataType) {
     span.className = "cell-pill";
     span.textContent = String(value);
     span.dataset.state = /已删除|unreachable|failed|差评/.test(String(value)) ? "deleted"
-      : /存在|known|synced|ok|是/.test(String(value)) ? "active" : "pending";
+      : /已忽略|ignored/.test(String(value)) ? "ignored"
+      : /存在|known|synced|ok|未忽略|是/.test(String(value)) ? "active" : "pending";
     td.append(span); return;
   }
   if (/url$/i.test(key) && /^https?:\/\//i.test(String(value))) {
@@ -827,6 +967,10 @@ function applyQuickView(name) {
   state.filters = [];
   if (name === "active") state.filters.push({ id: crypto.randomUUID(), field: deletionField, operator: "is_false", value: "", value2: "" });
   if (name === "deleted") state.filters.push({ id: crypto.randomUUID(), field: deletionField, operator: "is_true", value: "", value2: "" });
+  if (name === "ignored") state.filters.push({
+    id: crypto.randomUUID(), field: state.dataset === "notes" ? "ignore_status" : "post__ignore_status",
+    operator: "eq", value: "已忽略", value2: ""
+  });
   if (name === "negative") state.filters.push({ id: crypto.randomUUID(), field: analysisField, operator: "eq", value: "是", value2: "" });
   if (name === "unanalyzed") state.filters.push({ id: crypto.randomUUID(), field: countField, operator: "eq", value: "0", value2: "" });
   document.querySelectorAll("[data-quick-view]").forEach((button) => button.classList.toggle("is-active", button.dataset.quickView === name));
@@ -978,6 +1122,7 @@ function bindEvents() {
   document.querySelectorAll(".dataset-button").forEach((button) => button.addEventListener("click", () => {
     if (button.dataset.dataset === state.dataset) return;
     state.dataset = button.dataset.dataset;
+    clearSelection();
     state.page = 0; state.filters = []; state.sorts = []; state.search = ""; elements.globalSearch.value = "";
     document.querySelectorAll("[data-quick-view]").forEach((item) => item.classList.remove("is-active"));
     renderSchemaState(); renderFieldOptions(); renderFilters(); renderSorts(); savePreferences(); runQuery({ append: false });
@@ -995,6 +1140,7 @@ function bindEvents() {
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); elements.globalSearch.focus(); }
     if (event.key === "Escape") {
+      if (elements.deleteDialog.open) return;
       if (!elements.columnFilterPopover.hidden) { closeColumnFilterPopover(); return; }
       if (!elements.pageFind.hidden) { closePageFind(); return; }
       setPanel("none", false); elements.recordDrawer.hidden = true;
@@ -1015,6 +1161,15 @@ function bindEvents() {
   elements.tableHead.addEventListener("click", (event) => {
     const header = event.target.closest("th[data-field]");
     if (header) openColumnFilter(header.dataset.field, header);
+  });
+  elements.tableHead.addEventListener("change", (event) => {
+    if (event.target.dataset.role !== "select-loaded") return;
+    for (const record of state.rows) {
+      const id = recordIdentity(record);
+      if (!id) continue;
+      if (event.target.checked) state.selectedIds.add(id); else state.selectedIds.delete(id);
+    }
+    updateSelectionUi();
   });
   elements.tableHead.addEventListener("keydown", (event) => {
     if (!['Enter', ' '].includes(event.key)) return;
@@ -1077,17 +1232,37 @@ function bindEvents() {
     const row = event.target.closest("[data-sort-id]"); state.sorts = state.sorts.filter((item) => item.id !== row.dataset.sortId); renderSorts(); scheduleQuery(0);
   });
   elements.tableBody.addEventListener("dblclick", (event) => {
+    if (event.target.closest('[data-role="select-row"]')) return;
     const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
+  });
+  elements.tableBody.addEventListener("change", (event) => {
+    if (event.target.dataset.role !== "select-row") return;
+    const row = event.target.closest("tr[data-record-id]");
+    if (!row?.dataset.recordId) return;
+    if (event.target.checked) state.selectedIds.add(row.dataset.recordId);
+    else state.selectedIds.delete(row.dataset.recordId);
+    updateSelectionUi();
   });
   elements.tableBody.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return; const row = event.target.closest("tr[data-index]"); if (row) openDrawer(state.rows[Number(row.dataset.index)]);
   });
   elements.exportCurrent.addEventListener("click", exportCurrentPage);
+  elements.deleteSelected.addEventListener("click", () => openDeleteDialog());
   elements.closeDrawer.addEventListener("click", () => { elements.recordDrawer.hidden = true; });
+  elements.deleteDrawerRecord.addEventListener("click", () => {
+    const id = recordIdentity(state.currentRecord);
+    if (id) openDeleteDialog([id]);
+  });
   elements.copyRecord.addEventListener("click", async () => {
     if (!state.currentRecord) return; await navigator.clipboard.writeText(JSON.stringify(state.currentRecord, null, 2)); showToast("当前记录 JSON 已复制");
   });
   elements.openRecordLink.addEventListener("click", () => sendRuntime({ type: "openDataOverviewRecord", url: elements.openRecordLink.dataset.url }).catch((error) => showToast(error.message)));
+  elements.deleteAcknowledgement.addEventListener("change", () => {
+    elements.confirmDelete.disabled = !elements.deleteAcknowledgement.checked || state.deletePending;
+  });
+  elements.cancelDelete.addEventListener("click", closeDeleteDialog);
+  elements.confirmDelete.addEventListener("click", performPermanentDelete);
+  elements.deleteDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeDeleteDialog(); });
   document.addEventListener("click", (event) => {
     if (!elements.fieldPanel.hidden && !elements.fieldPanel.contains(event.target) && !elements.toggleFields.contains(event.target)) setPanel("none", false);
     if (!elements.columnFilterPopover.hidden

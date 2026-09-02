@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-  const CONTENT_VERSION = "0.29.0";
+const CONTENT_VERSION = "0.30.0";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
