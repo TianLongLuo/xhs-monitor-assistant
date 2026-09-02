@@ -1677,6 +1677,24 @@ class V0183Tests(unittest.TestCase):
             self.store.confirm(note)
             self.store.upsert_comments({"noteId": note["noteId"], "comments": [comment], "status": "likely_complete"})
             self.store._sync_pull_to_xlsx(note, [comment], {"folder": "", "files": []})
+        thread_note = {
+            "noteId": "overviewthread123", "url": "https://www.xiaohongshu.com/explore/overviewthread123",
+            "title": "评论线程", "content": "线程正文", "author": "线程作者", "detailRead": True,
+        }
+        thread_comments = [
+            {"commentId": "overview-thread-reply-b", "parentCommentId": "overview-thread-root",
+             "author": "回复乙", "content": "第二条回复", "publishedAt": "09-02", "likeCount": 2},
+            {"commentId": "overview-thread-root", "author": "一级用户", "content": "一级评论正文",
+             "publishedAt": "09-01", "likeCount": 5},
+            {"commentId": "overview-thread-reply-a", "parentCommentId": "overview-thread-root",
+             "author": "回复甲", "content": "第一条回复", "publishedAt": "09-01", "likeCount": 3},
+        ]
+        self.store.confirm(thread_note)
+        self.store.upsert_comments({
+            "noteId": thread_note["noteId"], "comments": thread_comments,
+            "expectedCount": 3, "status": "likely_complete",
+        })
+        self.store._sync_pull_to_xlsx(thread_note, thread_comments, {"folder": "", "files": []})
         schema = self.store.data_overview_schema()
         self.assertTrue(schema["queryReady"])
         self.assertTrue(schema["health"]["summary"]["relationshipsConsistent"])
@@ -1684,6 +1702,14 @@ class V0183Tests(unittest.TestCase):
         comment_fields = {item["key"] for item in schema["datasets"]["comments"]["fields"]}
         self.assertTrue({"note_id", "payload_json", "active_comment_count", "source_like_count"}.issubset(note_fields))
         self.assertTrue({"comment_id", "content", "post__title", "post__payload_json"}.issubset(comment_fields))
+        comment_field_rows = schema["datasets"]["comments"]["fields"]
+        self.assertEqual(
+            ["comment_id", "note_id", "thread_root_content", "content", "author", "published_at", "like_count",
+             "comment_level", "analysis_is_negative", "negative_type", "comment_status", "comment_type",
+             "post__url", "post__title", "post__post_status"],
+            [item["key"] for item in comment_field_rows if item["defaultVisible"]],
+        )
+        self.assertTrue(next(item for item in comment_field_rows if item["key"] == "comment_status")["suggestValues"])
 
         note_result = self.store.query_data_overview({
             "dataset": "notes", "snapshotToken": schema["snapshotToken"],
@@ -1705,6 +1731,25 @@ class V0183Tests(unittest.TestCase):
         })
         self.assertEqual(1, comment_result["total"])
         self.assertEqual("价格反馈", comment_result["rows"][0]["post__title"])
+        thread_result = self.store.query_data_overview({
+            "dataset": "comments", "snapshotToken": schema["snapshotToken"], "groupThreads": True,
+            "fields": ["comment_id", "thread_root_id", "thread_root_content", "thread_root_author", "content"],
+            "filter": {"logic": "and", "children": [
+                {"field": "note_id", "operator": "eq", "value": thread_note["noteId"]},
+            ]},
+            "pageSize": 10,
+        })
+        self.assertEqual(
+            ["overview-thread-root", "overview-thread-reply-a", "overview-thread-reply-b"],
+            [row["comment_id"] for row in thread_result["rows"]],
+        )
+        self.assertEqual({"一级评论正文"}, {row["thread_root_content"] for row in thread_result["rows"]})
+        value_result = self.store.data_overview_values({
+            "dataset": "comments", "snapshotToken": schema["snapshotToken"],
+            "field": "comment_type", "limit": 20,
+        })
+        self.assertTrue(value_result["consistentSnapshot"])
+        self.assertTrue({"一级评论", "二级回复"}.issubset({item["value"] for item in value_result["values"]}))
         with self.store._session() as db:
             db.execute("UPDATE notes SET last_seen_at=? WHERE note_id=?", ("2099-01-01", notes[0]["noteId"]))
         with self.assertRaisesRegex(ValueError, "数据已变化"):
@@ -1739,11 +1784,13 @@ class V0183Tests(unittest.TestCase):
         self.assertIn('id="filterRows"', page)
         self.assertIn('id="fieldOptions"', page)
         self.assertIn('id="infiniteSentinel"', page)
+        self.assertIn('id="pageFindInput"', page)
         self.assertNotIn('id="previousPage"', page)
         self.assertIn('type: "getDataOverviewSchema"', script)
         self.assertIn("IntersectionObserver", script)
         self.assertIn("loadNextBatch", script)
         self.assertIn('message.type === "queryDataOverview"', worker)
+        self.assertIn('message.type === "getDataOverviewValues"', worker)
         self.assertIn("relationshipsConsistent", script)
         self.assertIn("queryPending", script)
 

@@ -36,6 +36,8 @@ FIELD_LABELS = {
     "payload_json": "原始结构化数据", "content_hash": "内容指纹",
     "business_record": "是否业务总表记录", "active_comment_count": "当前评论数",
     "deleted_comment_count": "已删除评论数", "comment_type": "评论角色",
+    "thread_root_id": "一级评论 ID", "thread_root_content": "一级评论",
+    "thread_root_author": "一级评论作者",
     "is_post_author": "是否帖主评论", "source_author_url": "用户主页",
     "source_author_id": "用户 ID", "source_like_count": "页面点赞量",
     "source_collect_count": "页面收藏量", "source_comment_count": "页面评论量",
@@ -52,10 +54,34 @@ DEFAULT_VISIBLE = {
         "deleted_comment_count", "source_published_at", "last_seen_at", "url",
     ],
     "comments": [
-        "comment_id", "note_id", "author", "content", "comment_type", "comment_level",
-        "like_count", "comment_status", "analysis_is_negative", "negative_type",
-        "published_at", "post__title", "post__post_status", "post__url",
+        "comment_id", "note_id", "thread_root_content", "content", "author", "published_at",
+        "like_count", "comment_level", "analysis_is_negative", "negative_type",
+        "comment_status", "comment_type", "post__url", "post__title", "post__post_status",
     ],
+}
+
+
+NOTE_PRIMARY_ORDER = [
+    "note_id", "url", "title", "content", "author", "published_at", "updated_at", "tags", "keyword",
+    "source_like_count", "source_collect_count", "source_comment_count", "source_share_count",
+    "post_status", "access_status", "pull_status", "business_record", "active_comment_count",
+    "deleted_comment_count", "media_dir", "last_seen_at",
+]
+COMMENT_PRIMARY_ORDER = [
+    "comment_id", "note_id", "thread_root_content", "content", "author", "published_at", "like_count",
+    "comment_level", "analysis_is_negative", "negative_type", "comment_status", "comment_type",
+    "post__url", "post__title", "post__post_status", "thread_root_id", "thread_root_author",
+    "parent_comment_id", "author_url", "comment_url", "is_post_author", "sentiment", "negative_subtype",
+    "review_status", "last_seen_at",
+]
+VALUE_OPTION_FIELDS = {
+    "author", "keyword", "tags", "status", "source", "pull_status", "post_status", "comment_status",
+    "access_status", "access_check_result", "media_status", "ai_analysis_status", "post_sentiment",
+    "sentiment", "analysis_is_negative", "negative_type", "negative_subtype", "review_status",
+    "comment_level", "comment_type", "is_post_author", "is_deleted", "is_relevant", "manual_negative",
+    "risk_level", "source_ip_location", "post__author", "post__keyword", "post__tags", "post__source",
+    "post__pull_status", "post__post_status", "post__access_status", "post__media_status",
+    "post__analysis_is_negative", "post__negative_type", "post__negative_subtype",
 }
 
 
@@ -88,6 +114,8 @@ class FieldSpec:
     expression: str
     source: str
     default_visible: bool = False
+    display_order: int = 10000
+    suggest_values: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -96,6 +124,8 @@ class FieldSpec:
             "dataType": self.data_type,
             "source": self.source,
             "defaultVisible": self.default_visible,
+            "displayOrder": self.display_order,
+            "suggestValues": self.suggest_values,
             "filterable": True,
             "sortable": True,
         }
@@ -132,6 +162,33 @@ def _json_expr(alias: str, path: str) -> str:
     return f"CASE WHEN json_valid({payload}) THEN json_extract({payload}, '$.{path}') ELSE NULL END"
 
 
+def _display_order(dataset: str, key: str) -> int:
+    order = COMMENT_PRIMARY_ORDER if dataset == "comments" else NOTE_PRIMARY_ORDER
+    try:
+        return order.index(key)
+    except ValueError:
+        if key.startswith("post__"):
+            return 5000
+        return 1000 + len(order)
+
+
+def _source_group(dataset: str, key: str, fallback: str) -> str:
+    primary = COMMENT_PRIMARY_ORDER if dataset == "comments" else NOTE_PRIMARY_ORDER
+    if key in primary:
+        return "常用字段（CSV 对齐）"
+    if key.startswith("post__"):
+        return "原帖 SQLite 字段"
+    return fallback
+
+
+def _field_spec(dataset: str, key: str, label: str, data_type: str, expression: str,
+                source: str, default_visible: bool = False) -> FieldSpec:
+    return FieldSpec(
+        key, label, data_type, expression, _source_group(dataset, key, source), default_visible,
+        _display_order(dataset, key), key in VALUE_OPTION_FIELDS,
+    )
+
+
 def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
     if dataset not in {"notes", "comments"}:
         raise ValueError("dataset must be notes or comments")
@@ -139,17 +196,18 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
     fields: list[FieldSpec] = []
     if dataset == "notes":
         for name, declared in _columns(db, "notes"):
-            fields.append(FieldSpec(name, _label(name), _data_type(name, declared), f"n.{_quote(name)}", "帖子", name in defaults))
+            fields.append(_field_spec(dataset, name, _label(name), _data_type(name, declared),
+                                      f"n.{_quote(name)}", "SQLite 扩展", name in defaults))
         fields.extend([
-            FieldSpec("business_record", _label("business_record"), "boolean",
-                      "CASE WHEN n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') THEN 1 ELSE 0 END",
-                      "衍生", "business_record" in defaults),
-            FieldSpec("active_comment_count", _label("active_comment_count"), "number",
-                      "(SELECT COUNT(*) FROM comments ac WHERE ac.note_id=n.note_id AND ac.is_deleted=0)",
-                      "衍生", "active_comment_count" in defaults),
-            FieldSpec("deleted_comment_count", _label("deleted_comment_count"), "number",
-                      "(SELECT COUNT(*) FROM comments dc WHERE dc.note_id=n.note_id AND dc.is_deleted=1)",
-                      "衍生", "deleted_comment_count" in defaults),
+            _field_spec(dataset, "business_record", _label("business_record"), "boolean",
+                        "CASE WHEN n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') THEN 1 ELSE 0 END",
+                        "衍生字段", "business_record" in defaults),
+            _field_spec(dataset, "active_comment_count", _label("active_comment_count"), "number",
+                        "(SELECT COUNT(*) FROM comments ac WHERE ac.note_id=n.note_id AND ac.is_deleted=0)",
+                        "衍生字段", "active_comment_count" in defaults),
+            _field_spec(dataset, "deleted_comment_count", _label("deleted_comment_count"), "number",
+                        "(SELECT COUNT(*) FROM comments dc WHERE dc.note_id=n.note_id AND dc.is_deleted=1)",
+                        "衍生字段", "deleted_comment_count" in defaults),
         ])
         json_fields = [
             ("source_author_url", "authorUrl", "text"), ("source_author_id", "authorId", "text"),
@@ -160,29 +218,53 @@ def build_field_specs(db: Any, dataset: str) -> list[FieldSpec]:
             ("source_video_count", "videoCount", "number"),
         ]
         for key, path, kind in json_fields:
-            fields.append(FieldSpec(key, _label(key), kind, _json_expr("n", path), "页面快照", key in defaults))
+            fields.append(_field_spec(dataset, key, _label(key), kind, _json_expr("n", path),
+                                      "页面快照", key in defaults))
     else:
         for name, declared in _columns(db, "comments"):
-            fields.append(FieldSpec(name, _label(name), _data_type(name, declared), f"c.{_quote(name)}", "评论", name in defaults))
+            fields.append(_field_spec(dataset, name, _label(name), _data_type(name, declared),
+                                      f"c.{_quote(name)}", "SQLite 扩展", name in defaults))
+        reply_predicate = "(c.comment_level>=2 OR TRIM(COALESCE(c.parent_comment_id,''))<>'')"
+        root_id = (
+            f"CASE WHEN {reply_predicate} THEN COALESCE(NULLIF(TRIM(c.parent_comment_id),''),c.comment_id) "
+            "ELSE c.comment_id END"
+        )
         fields.extend([
-            FieldSpec("comment_type", _label("comment_type"), "text",
-                      "CASE WHEN c.comment_level>=2 OR c.parent_comment_id<>'' THEN '二级回复' ELSE '一级评论' END",
-                      "衍生", "comment_type" in defaults),
-            FieldSpec("is_post_author", _label("is_post_author"), "boolean",
-                      "CASE WHEN json_valid(c.payload_json) AND json_extract(c.payload_json, '$.isAuthor') THEN 1 ELSE 0 END",
-                      "衍生", "is_post_author" in defaults),
+            _field_spec(dataset, "thread_root_id", _label("thread_root_id"), "text", root_id,
+                        "评论线程", "thread_root_id" in defaults),
+            _field_spec(
+                dataset, "thread_root_content", _label("thread_root_content"), "text",
+                f"CASE WHEN {reply_predicate} THEN COALESCE((SELECT pc.content FROM comments pc "
+                "WHERE pc.note_id=c.note_id AND pc.comment_id=c.parent_comment_id LIMIT 1),'（一级评论未采集）') "
+                "ELSE c.content END",
+                "评论线程", "thread_root_content" in defaults,
+            ),
+            _field_spec(
+                dataset, "thread_root_author", _label("thread_root_author"), "text",
+                f"CASE WHEN {reply_predicate} THEN COALESCE((SELECT pc.author FROM comments pc "
+                "WHERE pc.note_id=c.note_id AND pc.comment_id=c.parent_comment_id LIMIT 1),'') ELSE c.author END",
+                "评论线程", "thread_root_author" in defaults,
+            ),
+            _field_spec(dataset, "comment_type", _label("comment_type"), "text",
+                        "CASE WHEN c.comment_level>=2 OR c.parent_comment_id<>'' THEN '二级回复' ELSE '一级评论' END",
+                        "衍生字段", "comment_type" in defaults),
+            _field_spec(dataset, "is_post_author", _label("is_post_author"), "boolean",
+                        "CASE WHEN json_valid(c.payload_json) AND json_extract(c.payload_json, '$.isAuthor') THEN 1 ELSE 0 END",
+                        "衍生字段", "is_post_author" in defaults),
         ])
         for name, declared in _columns(db, "notes"):
             key = f"post__{name}"
-            fields.append(FieldSpec(key, _label(key), _data_type(name, declared), f"n.{_quote(name)}", "原帖", key in defaults))
+            fields.append(_field_spec(dataset, key, _label(key), _data_type(name, declared),
+                                      f"n.{_quote(name)}", "原帖 SQLite 字段", key in defaults))
         for key, path, kind in [
             ("source_like_count", "likeCount", "number"), ("source_collect_count", "collectCount", "number"),
             ("source_comment_count", "commentCount", "number"), ("source_share_count", "shareCount", "number"),
             ("source_published_at", "publishedAt", "datetime"), ("source_ip_location", "ipLocation", "text"),
         ]:
             full_key = f"post__{key}"
-            fields.append(FieldSpec(full_key, _label(full_key), kind, _json_expr("n", path), "原帖页面快照", full_key in defaults))
-    return fields
+            fields.append(_field_spec(dataset, full_key, _label(full_key), kind, _json_expr("n", path),
+                                      "原帖页面快照", full_key in defaults))
+    return sorted(fields, key=lambda field: (field.display_order, field.label.casefold(), field.key))
 
 
 def _escape_like(value: Any) -> str:
@@ -286,7 +368,8 @@ def compile_filter_group(group: dict[str, Any] | None, specs: dict[str, FieldSpe
     return group_sql(group or {"logic": "and", "children": []}, 0), parameters, condition_count
 
 
-def compile_sort(sort_items: list[dict[str, Any]] | None, specs: dict[str, FieldSpec], dataset: str) -> str:
+def compile_sort(sort_items: list[dict[str, Any]] | None, specs: dict[str, FieldSpec], dataset: str,
+                 group_threads: bool = False) -> str:
     output = []
     for item in (sort_items or [])[:4]:
         field = str(item.get("field") or "")
@@ -295,6 +378,27 @@ def compile_sort(sort_items: list[dict[str, Any]] | None, specs: dict[str, Field
             continue
         direction = "ASC" if str(item.get("direction") or "desc").lower() == "asc" else "DESC"
         output.append(f"{spec.expression} {direction}")
+    if dataset == "comments" and group_threads:
+        reply_predicate = "(c.comment_level>=2 OR TRIM(COALESCE(c.parent_comment_id,''))<>'')"
+        root_id = (
+            f"CASE WHEN {reply_predicate} THEN COALESCE(NULLIF(TRIM(c.parent_comment_id),''),c.comment_id) "
+            "ELSE c.comment_id END"
+        )
+        root_seen = (
+            f"CASE WHEN {reply_predicate} THEN COALESCE("
+            "(SELECT rc.first_seen_at FROM comments rc WHERE rc.note_id=c.note_id "
+            "AND rc.comment_id=c.parent_comment_id LIMIT 1),"
+            "(SELECT MIN(gc.first_seen_at) FROM comments gc WHERE gc.note_id=c.note_id "
+            "AND gc.parent_comment_id=c.parent_comment_id),c.first_seen_at) ELSE c.first_seen_at END"
+        )
+        thread_order = [
+            f"{root_seen} DESC", "c.note_id ASC", f"{root_id} ASC",
+            f"CASE WHEN c.comment_id={root_id} THEN 0 ELSE 1 END ASC",
+        ]
+        return ", ".join([
+            *thread_order, *output,
+            "COALESCE(NULLIF(c.published_at,''),c.first_seen_at) ASC", "c.first_seen_at ASC", "c.comment_id ASC",
+        ])
     if not output:
         default_key = "first_seen_at" if "first_seen_at" in specs else ("note_id" if dataset == "notes" else "comment_id")
         output.append(f"{specs[default_key].expression} DESC")

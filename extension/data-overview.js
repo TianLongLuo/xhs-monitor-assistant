@@ -11,6 +11,7 @@ const elements = {
   globalSearch: byId("globalSearch"), toggleFilters: byId("toggleFilters"), filterCount: byId("filterCount"),
   toggleFields: byId("toggleFields"), fieldCount: byId("fieldCount"),
   toggleSort: byId("toggleSort"), sortCount: byId("sortCount"), resultCount: byId("resultCount"),
+  resultLabel: byId("resultLabel"),
   filterPanel: byId("filterPanel"), filterLogic: byId("filterLogic"), filterRows: byId("filterRows"),
   addFilter: byId("addFilter"), clearFilters: byId("clearFilters"),
   fieldPanel: byId("fieldPanel"), fieldSearch: byId("fieldSearch"), fieldOptions: byId("fieldOptions"),
@@ -21,6 +22,8 @@ const elements = {
   tableHead: byId("tableHead"), tableBody: byId("tableBody"),
   tableEmpty: byId("tableEmpty"), tableLoading: byId("tableLoading"), pageMeta: byId("pageMeta"),
   infiniteSentinel: byId("infiniteSentinel"), loadMoreText: byId("loadMoreText"),
+  pageFind: byId("pageFind"), pageFindInput: byId("pageFindInput"), pageFindCount: byId("pageFindCount"),
+  pageFindPrevious: byId("pageFindPrevious"), pageFindNext: byId("pageFindNext"), closePageFind: byId("closePageFind"),
   recordDrawer: byId("recordDrawer"), drawerType: byId("drawerType"), drawerTitle: byId("drawerTitle"),
   drawerFields: byId("drawerFields"), closeDrawer: byId("closeDrawer"), copyRecord: byId("copyRecord"),
   openRecordLink: byId("openRecordLink"), toast: byId("toast")
@@ -34,6 +37,7 @@ const STATUS_FIELDS = new Set(["status", "pull_status", "post_status", "comment_
 const LONG_FIELD_HINTS = ["content", "summary", "reason", "json", "error", "categories", "note"];
 const MONO_FIELD_HINTS = ["_id", "url", "path", "dir", "hash", "json"];
 const NO_VALUE_OPERATORS = new Set(["is_empty", "not_empty", "is_true", "is_false"]);
+const REQUIRED_COMMENT_FIELDS = new Set(["comment_id", "note_id", "thread_root_content"]);
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
 const INFINITE_BATCH_SIZE = 100;
 
@@ -56,11 +60,18 @@ const state = {
   currentRecord: null,
   querySerial: 0,
   queryPending: false,
-  resetScheduled: false
+  resetScheduled: false,
+  findQuery: "",
+  findMatches: [],
+  findIndex: -1,
+  findLoading: false
 };
 
 let queryTimer = 0;
 let toastTimer = 0;
+let findTimer = 0;
+let threadMergeCell = null;
+const valueOptionsCache = new Map();
 
 function sendRuntime(message) {
   return new Promise((resolve, reject) => {
@@ -111,11 +122,25 @@ function fieldMap() {
   return new Map(datasetSchema().fields.map((field) => [field.key, field]));
 }
 
+function orderedDatasetFields() {
+  const order = (field) => Number.isFinite(Number(field.displayOrder)) ? Number(field.displayOrder) : 10000;
+  return [...datasetSchema().fields].sort((left, right) =>
+    order(left) - order(right)
+    || String(left.label).localeCompare(String(right.label), "zh-CN")
+    || String(left.key).localeCompare(String(right.key))
+  );
+}
+
 function currentVisibleFields() {
   const available = fieldMap();
-  const selected = state.visibleFields[state.dataset].filter((key) => available.has(key));
-  if (selected.length) return selected;
-  return datasetSchema().fields.filter((field) => field.defaultVisible).map((field) => field.key).slice(0, 18);
+  const selected = new Set(state.visibleFields[state.dataset].filter((key) => available.has(key)));
+  if (!selected.size) {
+    for (const field of orderedDatasetFields()) if (field.defaultVisible) selected.add(field.key);
+  }
+  if (state.dataset === "comments") {
+    for (const key of REQUIRED_COMMENT_FIELDS) if (available.has(key)) selected.add(key);
+  }
+  return orderedDatasetFields().filter((field) => selected.has(field.key)).map((field) => field.key).slice(0, 180);
 }
 
 function operatorsFor(field) {
@@ -157,7 +182,7 @@ function renderFieldOptions() {
   const query = elements.fieldSearch.value.trim().toLowerCase();
   const selected = new Set(currentVisibleFields());
   const groups = new Map();
-  for (const field of datasetSchema().fields) {
+  for (const field of orderedDatasetFields()) {
     if (query && !`${field.label} ${field.key}`.toLowerCase().includes(query)) continue;
     if (!groups.has(field.source)) groups.set(field.source, []);
     groups.get(field.source).push(field);
@@ -176,10 +201,11 @@ function renderFieldOptions() {
       input.type = "checkbox";
       input.checked = selected.has(field.key);
       input.dataset.field = field.key;
+      input.disabled = state.dataset === "comments" && REQUIRED_COMMENT_FIELDS.has(field.key);
       const name = document.createElement("span");
       name.textContent = field.label;
       const type = document.createElement("small");
-      type.textContent = field.dataType;
+      type.textContent = input.disabled ? "固定" : field.dataType;
       label.append(input, name, type);
       group.append(label);
     }
@@ -190,7 +216,7 @@ function renderFieldOptions() {
 
 function fieldOptionsHtml(selectedKey = "") {
   const groups = new Map();
-  for (const field of datasetSchema().fields) {
+  for (const field of orderedDatasetFields()) {
     if (!groups.has(field.source)) groups.set(field.source, []);
     groups.get(field.source).push(field);
   }
@@ -200,11 +226,46 @@ function fieldOptionsHtml(selectedKey = "") {
   }).join("");
 }
 
+async function getFieldValueOptions(field) {
+  const cacheKey = `${state.snapshotToken}:${state.dataset}:${field.key}`;
+  if (!valueOptionsCache.has(cacheKey)) {
+    const request = sendRuntime({
+      type: "getDataOverviewValues",
+      payload: { dataset: state.dataset, snapshotToken: state.snapshotToken, field: field.key, limit: 160 }
+    }).catch((error) => {
+      valueOptionsCache.delete(cacheKey);
+      throw error;
+    });
+    valueOptionsCache.set(cacheKey, request);
+  }
+  return valueOptionsCache.get(cacheKey);
+}
+
+function attachValueOptions(container, input, field, operator, filterId, role) {
+  if (!field.suggestValues || !["eq", "neq", "in", "contains", "not_contains"].includes(operator)) return;
+  const list = document.createElement("datalist");
+  list.id = `field-values-${filterId}-${role}`;
+  input.setAttribute("list", list.id);
+  input.placeholder = operator === "in" ? "选择已有值；多项用逗号" : "选择或输入已有值";
+  container.append(list);
+  getFieldValueOptions(field).then((result) => {
+    if (!list.isConnected || field.key !== input.closest("[data-filter-id]")?.querySelector('[data-role="field"]')?.value) return;
+    const fragment = document.createDocumentFragment();
+    for (const item of result.values || []) {
+      const option = document.createElement("option");
+      option.value = field.dataType === "boolean" ? String(item.label) : String(item.value ?? "");
+      option.label = `${item.label ?? item.value} · ${Number(item.count || 0).toLocaleString("zh-CN")} 条`;
+      fragment.append(option);
+    }
+    list.replaceChildren(fragment);
+  }).catch(() => {});
+}
+
 function renderFilters() {
   const map = fieldMap();
   elements.filterRows.replaceChildren();
   for (const filter of state.filters) {
-    const field = map.get(filter.field) || datasetSchema().fields[0];
+    const field = map.get(filter.field) || orderedDatasetFields()[0];
     if (!field) continue;
     filter.field = field.key;
     const row = document.createElement("div");
@@ -222,8 +283,14 @@ function renderFilters() {
     const valueWrap = document.createElement("div");
     valueWrap.className = filter.operator === "between" ? "range-values" : "";
     if (!NO_VALUE_OPERATORS.has(filter.operator)) {
-      valueWrap.append(makeValueInput(field, filter.value, "value"));
-      if (filter.operator === "between") valueWrap.append(makeValueInput(field, filter.value2, "value2"));
+      const firstInput = makeValueInput(field, filter.value, "value");
+      valueWrap.append(firstInput);
+      attachValueOptions(valueWrap, firstInput, field, filter.operator, filter.id, "value");
+      if (filter.operator === "between") {
+        const secondInput = makeValueInput(field, filter.value2, "value2");
+        valueWrap.append(secondInput);
+        attachValueOptions(valueWrap, secondInput, field, filter.operator, filter.id, "value2");
+      }
     }
     const remove = document.createElement("button");
     remove.type = "button";
@@ -289,13 +356,20 @@ function scheduleQuery(delay = 220) {
 }
 
 function queryPayload(page = 1) {
+  const fields = currentVisibleFields();
+  if (state.dataset === "comments") {
+    for (const key of ["thread_root_id", "thread_root_author"]) {
+      if (fieldMap().has(key) && !fields.includes(key)) fields.push(key);
+    }
+  }
   return {
     dataset: state.dataset,
     snapshotToken: state.snapshotToken,
-    fields: currentVisibleFields(),
+    fields,
     search: state.search,
     filter: { logic: state.filterLogic, children: state.filters.map(({ id, ...filter }) => filter) },
     sort: state.sorts.map(({ id, ...sort }) => sort),
+    groupThreads: state.dataset === "comments",
     page,
     pageSize: state.pageSize
   };
@@ -311,6 +385,7 @@ async function loadSchema({ preserveQuery = false } = {}) {
     const result = await sendRuntime({ type: "getDataOverviewSchema" });
     state.schema = result;
     state.snapshotToken = result.snapshotToken || "";
+    valueOptionsCache.clear();
     for (const dataset of ["notes", "comments"]) {
       const valid = new Set((result.datasets?.[dataset]?.fields || []).map((field) => field.key));
       state.visibleFields[dataset] = state.visibleFields[dataset].filter((key) => valid.has(key));
@@ -341,6 +416,7 @@ async function loadSchema({ preserveQuery = false } = {}) {
 }
 
 function resetLoadedRows() {
+  threadMergeCell = null;
   state.page = 0;
   state.total = 0;
   state.rows = [];
@@ -451,6 +527,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   const fields = currentVisibleFields();
   const map = fieldMap();
   if (!append) {
+    threadMergeCell = null;
     elements.tableHead.replaceChildren();
     const rowNumber = document.createElement("th"); rowNumber.textContent = "#"; elements.tableHead.append(rowNumber);
     for (const key of fields) {
@@ -467,6 +544,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   for (let index = 0; index < incomingRows.length; index += 1) {
     const record = incomingRows[index];
     const absoluteIndex = rowOffset + index;
+    const threadKey = state.dataset === "comments" ? `${record.note_id || ""}::${record.thread_root_id || record.comment_id || absoluteIndex}` : "";
     const tr = document.createElement("tr");
     tr.tabIndex = 0;
     tr.dataset.index = String(absoluteIndex);
@@ -475,6 +553,21 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     tr.append(number);
     for (const key of fields) {
       const field = map.get(key) || { dataType: "text" };
+      if (state.dataset === "comments" && key === "thread_root_content") {
+        if (threadMergeCell?.key === threadKey) {
+          threadMergeCell.span += 1;
+          threadMergeCell.cell.rowSpan = threadMergeCell.span;
+          continue;
+        }
+        const rootCell = document.createElement("td");
+        rootCell.dataset.type = "text";
+        rootCell.dataset.long = "true";
+        rootCell.className = "thread-root-cell";
+        renderThreadRootCell(rootCell, record);
+        tr.append(rootCell);
+        threadMergeCell = { key: threadKey, cell: rootCell, span: 1 };
+        continue;
+      }
       const td = document.createElement("td");
       td.dataset.type = field.dataType;
       td.dataset.long = String(LONG_FIELD_HINTS.some((hint) => key.includes(hint)));
@@ -485,6 +578,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     elements.tableBody.append(tr);
   }
   elements.resultCount.textContent = state.total.toLocaleString("zh-CN");
+  elements.resultLabel.textContent = state.filters.length || state.search ? "条筛选结果" : "条结果";
   elements.tableEmpty.hidden = state.rows.length > 0;
   if (!state.rows.length) {
     elements.tableEmpty.querySelector("strong").textContent = "没有符合当前条件的数据";
@@ -493,6 +587,17 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   elements.exportCurrent.disabled = state.rows.length === 0;
   elements.snapshotCode.textContent = state.snapshotToken.slice(0, 14).toUpperCase();
   renderInfiniteState();
+  refreshFindMatches(false);
+}
+
+function renderThreadRootCell(cell, record) {
+  const author = document.createElement("strong");
+  author.textContent = record.thread_root_author || "一级评论";
+  const content = document.createElement("p");
+  content.textContent = record.thread_root_content || "（一级评论未采集）";
+  const id = document.createElement("code");
+  id.textContent = record.thread_root_id || record.comment_id || "";
+  cell.append(author, content, id);
 }
 
 function renderCell(td, value, key, dataType) {
@@ -562,7 +667,7 @@ function formatFullValue(value) {
 }
 
 function addFilter(fieldKey = "") {
-  const field = fieldMap().get(fieldKey) || datasetSchema().fields.find((item) => item.key === (state.dataset === "notes" ? "title" : "content")) || datasetSchema().fields[0];
+  const field = fieldMap().get(fieldKey) || orderedDatasetFields().find((item) => item.key === (state.dataset === "notes" ? "title" : "content")) || orderedDatasetFields()[0];
   if (!field) return;
   const operator = operatorsFor(field)[0]?.id || "eq";
   state.filters.push({ id: crypto.randomUUID(), field: field.key, operator, value: "", value2: "" });
@@ -621,6 +726,108 @@ function initializeInfiniteScroll() {
   elements.infiniteSentinel.addEventListener("click", loadNextBatch);
 }
 
+function clearFindMarks() {
+  elements.tableBody.querySelectorAll(".find-match,.find-current").forEach((cell) => cell.classList.remove("find-match", "find-current"));
+  elements.tableBody.querySelectorAll(".find-row").forEach((row) => row.classList.remove("find-row"));
+}
+
+function updateFindCount() {
+  const total = state.findMatches.length;
+  const current = total && state.findIndex >= 0 ? state.findIndex + 1 : 0;
+  elements.pageFindCount.textContent = `${current} / ${total}${state.hasMore ? "+" : ""}`;
+}
+
+function refreshFindMatches(focusCurrent = false) {
+  clearFindMarks();
+  const query = state.findQuery.trim().toLocaleLowerCase("zh-CN");
+  state.findMatches = [];
+  if (!query) {
+    state.findIndex = -1;
+    updateFindCount();
+    return;
+  }
+  for (const row of elements.tableBody.querySelectorAll("tr[data-index]")) {
+    let rowMatched = false;
+    for (const cell of row.querySelectorAll("td")) {
+      if (!cell.textContent.toLocaleLowerCase("zh-CN").includes(query)) continue;
+      cell.classList.add("find-match");
+      state.findMatches.push(cell);
+      rowMatched = true;
+    }
+    if (rowMatched) row.classList.add("find-row");
+  }
+  if (!state.findMatches.length) state.findIndex = -1;
+  else if (state.findIndex < 0 || state.findIndex >= state.findMatches.length) state.findIndex = 0;
+  updateFindCount();
+  if (focusCurrent && state.findIndex >= 0) focusFindMatch(state.findIndex);
+}
+
+function focusFindMatch(index) {
+  if (!state.findMatches.length) return;
+  state.findMatches.forEach((cell) => cell.classList.remove("find-current"));
+  state.findIndex = (index + state.findMatches.length) % state.findMatches.length;
+  const cell = state.findMatches[state.findIndex];
+  cell.classList.add("find-current");
+  cell.scrollIntoView({ behavior: "auto", block: "center", inline: "center" });
+  updateFindCount();
+}
+
+function openPageFind() {
+  elements.pageFind.hidden = false;
+  elements.pageFindInput.focus();
+  elements.pageFindInput.select();
+  state.findQuery = elements.pageFindInput.value;
+  refreshFindMatches(false);
+}
+
+function closePageFind() {
+  elements.pageFind.hidden = true;
+  clearTimeout(findTimer);
+  state.findQuery = "";
+  state.findMatches = [];
+  state.findIndex = -1;
+  clearFindMarks();
+}
+
+async function findFromInput() {
+  const requestedQuery = elements.pageFindInput.value.trim();
+  state.findQuery = requestedQuery;
+  state.findIndex = -1;
+  refreshFindMatches(false);
+  if (!requestedQuery || state.findLoading) return;
+  state.findLoading = true;
+  try {
+    while (!state.findMatches.length && state.hasMore && state.findQuery === requestedQuery) {
+      const before = state.rows.length;
+      await runQuery({ append: true });
+      refreshFindMatches(false);
+      if (state.rows.length <= before) break;
+    }
+    if (state.findQuery === requestedQuery && state.findMatches.length) focusFindMatch(0);
+  } finally {
+    state.findLoading = false;
+    if (elements.pageFindInput.value.trim() !== requestedQuery) queueMicrotask(findFromInput);
+  }
+}
+
+async function navigateFind(direction) {
+  state.findQuery = elements.pageFindInput.value.trim();
+  refreshFindMatches(false);
+  if (!state.findMatches.length) {
+    await findFromInput();
+    return;
+  }
+  let nextIndex = state.findIndex + direction;
+  if (direction > 0 && nextIndex >= state.findMatches.length && state.hasMore) {
+    const previousCount = state.findMatches.length;
+    const before = state.rows.length;
+    await runQuery({ append: true });
+    refreshFindMatches(false);
+    if (state.rows.length > before && state.findMatches.length > previousCount) nextIndex = previousCount;
+  }
+  focusFindMatch(nextIndex);
+}
+
 function bindEvents() {
   document.querySelectorAll(".dataset-button").forEach((button) => button.addEventListener("click", () => {
     if (button.dataset.dataset === state.dataset) return;
@@ -635,9 +842,29 @@ function bindEvents() {
   elements.globalSearch.addEventListener("input", () => { state.search = elements.globalSearch.value.trim(); scheduleQuery(320); });
   elements.globalSearch.addEventListener("keydown", (event) => { if (event.key === "Enter") { clearTimeout(queryTimer); scheduleQuery(0); } });
   window.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      openPageFind();
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); elements.globalSearch.focus(); }
-    if (event.key === "Escape") { setPanel("none", false); elements.recordDrawer.hidden = true; }
+    if (event.key === "Escape") {
+      if (!elements.pageFind.hidden) { closePageFind(); return; }
+      setPanel("none", false); elements.recordDrawer.hidden = true;
+    }
   });
+  elements.pageFindInput.addEventListener("input", () => {
+    clearTimeout(findTimer);
+    findTimer = setTimeout(findFromInput, 220);
+  });
+  elements.pageFindInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    navigateFind(event.shiftKey ? -1 : 1);
+  });
+  elements.pageFindPrevious.addEventListener("click", () => navigateFind(-1));
+  elements.pageFindNext.addEventListener("click", () => navigateFind(1));
+  elements.closePageFind.addEventListener("click", closePageFind);
   elements.toggleFilters.addEventListener("click", () => setPanel("filters"));
   elements.toggleFields.addEventListener("click", () => { renderFieldOptions(); setPanel("fields"); });
   elements.toggleSort.addEventListener("click", () => setPanel("sort"));
@@ -656,15 +883,15 @@ function bindEvents() {
     state.visibleFields[state.dataset] = [...selected]; savePreferences(); renderFieldOptions(); scheduleQuery(0);
   });
   elements.selectDefaultFields.addEventListener("click", () => {
-    state.visibleFields[state.dataset] = datasetSchema().fields.filter((field) => field.defaultVisible).map((field) => field.key);
+    state.visibleFields[state.dataset] = orderedDatasetFields().filter((field) => field.defaultVisible).map((field) => field.key);
     savePreferences(); renderFieldOptions(); scheduleQuery(0);
   });
   elements.selectAllFields.addEventListener("click", () => {
-    state.visibleFields[state.dataset] = datasetSchema().fields.map((field) => field.key);
+    state.visibleFields[state.dataset] = orderedDatasetFields().map((field) => field.key);
     savePreferences(); renderFieldOptions(); scheduleQuery(0);
   });
   elements.addSort.addEventListener("click", () => {
-    const field = datasetSchema().fields.find((item) => item.key.endsWith("last_seen_at")) || datasetSchema().fields[0];
+    const field = orderedDatasetFields().find((item) => item.key.endsWith("last_seen_at")) || orderedDatasetFields()[0];
     if (!field) return; state.sorts.push({ id: crypto.randomUUID(), field: field.key, direction: "desc" }); renderSorts();
   });
   elements.clearSorts.addEventListener("click", () => { state.sorts = []; renderSorts(); scheduleQuery(0); });

@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "comment-utils.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.27.0";
+const CONTENT_SCRIPT_VERSION = "0.28.0";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const CONTENT_STYLE_FILES = ["content.css"];
 const contentInjectionTasks = new Map();
@@ -2198,6 +2198,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getDataOverviewSchema") return bridgeApi("/api/data-overview/schema", { timeoutMs: 120000 });
     if (message.type === "queryDataOverview") {
       return bridgeApi("/api/data-overview/query", {
+        method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 60000
+      });
+    }
+    if (message.type === "getDataOverviewValues") {
+      return bridgeApi("/api/data-overview/values", {
         method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 60000
       });
     }

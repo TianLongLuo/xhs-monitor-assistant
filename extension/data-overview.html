@@ -87,7 +87,15 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h8M8 18h4M4 5v14"/></svg>
             排序 <i id="sortCount" hidden>0</i>
           </button>
-          <div class="result-counter"><strong id="resultCount">—</strong><span>条结果</span></div>
+          <div class="result-counter"><strong id="resultCount">—</strong><span id="resultLabel">条结果</span></div>
+        </section>
+
+        <section id="pageFind" class="page-find" hidden aria-label="在筛选结果中查找">
+          <label><span>查找</span><input id="pageFindInput" type="search" placeholder="在筛选结果中定位内容" autocomplete="off"></label>
+          <strong id="pageFindCount">0 / 0</strong>
+          <button id="pageFindPrevious" type="button" title="上一个匹配" aria-label="上一个匹配">↑</button>
+          <button id="pageFindNext" type="button" title="下一个匹配" aria-label="下一个匹配">↓</button>
+          <button id="closePageFind" type="button" title="关闭查找" aria-label="关闭查找">×</button>
         </section>
 
         <section id="filterPanel" class="builder-panel" hidden>

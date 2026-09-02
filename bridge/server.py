@@ -45,7 +45,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, search_clause
 
 
-VERSION = "0.27.0"
+VERSION = "0.28.0"
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
@@ -4781,7 +4781,11 @@ class MonitorStore:
                 page_size = max(1, min(int(payload.get("pageSize") or 50), 200))
                 page_count = max(1, (total + page_size - 1) // page_size)
                 page = max(1, min(int(payload.get("page") or 1), page_count))
-                order_by = compile_sort(payload.get("sort") if isinstance(payload.get("sort"), list) else [], by_key, dataset)
+                group_threads = dataset == "comments" and bool(payload.get("groupThreads"))
+                order_by = compile_sort(
+                    payload.get("sort") if isinstance(payload.get("sort"), list) else [],
+                    by_key, dataset, group_threads=group_threads,
+                )
                 select_sql = ", ".join(
                     f"{by_key[key].expression} AS {json.dumps(key)}" for key in requested_fields
                 )
@@ -4795,6 +4799,7 @@ class MonitorStore:
             query_hash = hashlib.sha256(json.dumps({
                 "dataset": dataset, "fields": requested_fields, "search": payload.get("search") or "",
                 "filter": payload.get("filter") or {}, "sort": payload.get("sort") or [],
+                "groupThreads": group_threads,
                 "page": page, "pageSize": page_size,
             }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
             return {
@@ -4802,6 +4807,64 @@ class MonitorStore:
                 "total": total, "page": page, "pageSize": page_size, "pageCount": page_count,
                 "filterConditionCount": condition_count, "snapshotToken": current_token,
                 "queryHash": query_hash, "consistentSnapshot": True,
+            }
+
+    def data_overview_values(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return distinct canonical values for one whitelisted field and approved snapshot."""
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请重新校验数据总览")
+        field_key = text(payload.get("field"), 160)
+        search = text(payload.get("search"), 500)
+        limit = max(1, min(int(payload.get("limit") or 120), 200))
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验数据总览")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再读取筛选选项")
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                specs = {field.key: field for field in build_field_specs(db, dataset)}
+                spec = specs.get(field_key)
+                if not spec:
+                    raise ValueError(f"未知筛选字段：{field_key}")
+                base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
+                value_text = f"TRIM(COALESCE(CAST({spec.expression} AS TEXT),''))"
+                clauses = [f"{value_text}<>''"]
+                parameters: list[Any] = []
+                if search:
+                    clauses.append(f"{value_text} LIKE ? ESCAPE '\\' COLLATE NOCASE")
+                    escaped_search = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    parameters.append(f"%{escaped_search}%")
+                where = " WHERE " + " AND ".join(clauses)
+                distinct_count = int(db.execute(
+                    f"SELECT COUNT(DISTINCT {value_text}) FROM {base}{where}", parameters
+                ).fetchone()[0])
+                rows = db.execute(
+                    f"SELECT {spec.expression} value,COUNT(*) count FROM {base}{where} "
+                    f"GROUP BY {spec.expression} ORDER BY count DESC,{value_text} ASC LIMIT ?",
+                    (*parameters, limit),
+                ).fetchall()
+                db.rollback()
+            finally:
+                db.close()
+            values = []
+            for row in rows:
+                value = row["value"]
+                label = ("是" if bool(value) else "否") if spec.data_type == "boolean" else str(value)
+                values.append({"value": value, "label": label, "count": int(row["count"] or 0)})
+            return {
+                "ok": True, "dataset": dataset, "field": field_key, "values": values,
+                "distinctCount": distinct_count, "truncated": distinct_count > len(values),
+                "snapshotToken": current_token, "consistentSnapshot": True,
             }
 
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -9408,6 +9471,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.repair_csv_relationships(payload)
             elif self.path == "/api/data-overview/query":
                 result = self.store.query_data_overview(payload)
+            elif self.path == "/api/data-overview/values":
+                result = self.store.data_overview_values(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":
