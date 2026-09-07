@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+<title>原生风格合成帖子</title><link rel="stylesheet" href="../content.css">
+<style>
+*{box-sizing:border-box}body{margin:0;font:16px/1.6 system-ui;background:#c4c4c7;color:#1d1d1f}.note-detail-mask{position:fixed;inset:0;display:flex;justify-content:center;align-items:center}.note-container{width:1270px;max-width:calc(100vw - 64px);height:calc(100vh - 64px);display:flex;background:white;border-radius:24px;overflow:hidden;position:relative}.note-container.center-transform{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}.note-container.left-transform{position:absolute;left:104px;top:32px;transform:translateX(0)}.media-container{width:830px;height:100%;flex:1 1 0;min-width:0;background:#ede6d6;display:flex;align-items:center;justify-content:center}.media-container img{width:100%;height:100%;object-fit:contain}.interaction-container{width:440px;height:100%;flex:0 0 440px;display:flex;flex-direction:column}.note-scroller{height:calc(100% - 72px);overflow-y:auto;padding:24px;min-height:0}.author{font-weight:650;border-bottom:1px solid #eee;padding:4px 0 20px}.note-title{font-size:20px;line-height:1.4;margin:22px 0 10px}.content{margin:12px 0}.date{font-size:12px;color:#8e8e93}.bottom-container{height:72px;flex:0 0 72px;display:flex;align-items:center;padding:12px;border-top:1px solid #eee}textarea{width:100%;resize:none;border:0;background:#f5f5f7;border-radius:12px;padding:8px;font:14px system-ui}.comments-container{margin-top:30px;border-top:1px solid #eee}.comment-item{padding:18px 0;border-bottom:1px solid #eee}.comment-item-sub{margin-left:24px}.name{font-weight:600;font-size:14px}.fixture-toolbar{position:fixed;left:8px;top:8px;z-index:2147483647;background:#fff;padding:3px 8px;border-radius:8px;font:11px system-ui}
+</style>
+<div class="fixture-toolbar">合成素材 · 不连接业务数据</div>
+<div class="note-detail-mask"><article id="noteContainer" class="note-container center-transform" note-id="fixture-note-one">
+<div class="media-container"><img alt="本地合成的素材预览" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='1000' viewBox='0 0 800 1000'%3E%3Crect width='800' height='1000' fill='%23ebe4d3'/%3E%3Cpath d='M0 620H800V1000H0Z' fill='%23d5c9b2'/%3E%3Crect x='195' y='270' width='170' height='440' rx='24' fill='%23485f55'/%3E%3Crect x='217' y='218' width='126' height='65' rx='9' fill='%23af9273'/%3E%3Crect x='435' y='465' width='215' height='245' rx='32' fill='%23f9f7ee'/%3E%3Crect x='435' y='437' width='215' height='45' rx='11' fill='%23b2a08b'/%3E%3Ctext x='400' y='145' text-anchor='middle' font-family='Georgia' font-size='36' fill='%23726452'%3EMATERIAL PREVIEW%3C/text%3E%3C/svg%3E"></div>
+<div class="interaction-container"><div class="note-scroller">
+<div class="author">示例作者</div><h1 id="detail-title" class="note-title">素材与评论，并排查看</h1>
+<div id="detail-desc" class="note-text">这是用于布局回归的合成帖子。照片保持比例，正文使用原字号。右侧磁吸窗口应有独立的空间，不遮住作者、正文、评论或输入框。调整浏览器窗口尺寸、折叠面板或切换帖子后，布局仍应保持稳定。</div>
+<p class="date">2026-09-04 广东</p>
+<div class="comments-container comments-el"><div class="total">共 12 条评论</div><div id="fixture-comments"></div></div>
+</div><div class="bottom-container"><textarea aria-label="评论草稿">未发送的本地草稿</textarea></div></div>
+</article></div>
+<script src="process-layout.mock.js"></script>
+<script src="../relevance.js"></script><script src="../page-context.js"></script><script src="../note-utils.js"></script><script src="../detail-store.js"></script><script src="../location-utils.js"></script><script src="../comment-utils.js"></script><script src="../comment-collector.js"></script><script src="../process-layout.js"></script><script src="../content.js"></script>
+<script src="process-layout.driver.js"></script></html>

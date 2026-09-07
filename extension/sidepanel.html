@@ -109,7 +109,7 @@
           <span class="batch-sync-button__glyph" aria-hidden="true">↻</span>
           <span class="batch-sync-button__copy">
             <strong id="syncAllPulledLabel">同步全部已拉取帖子</strong>
-            <small>后台逐篇打开并自动更新评论</small>
+            <small>逐篇同步帖子、评论及存在/已删除状态</small>
           </span>
           <span aria-hidden="true">→</span>
         </button>
@@ -121,24 +121,29 @@
           <div class="batch-sync-progress__track"><i id="batchSyncBar"></i></div>
           <p id="batchSyncCurrent">正在读取已拉取帖子列表…</p>
           <p id="batchSyncStats" class="batch-sync-progress__stats">有变化 0 · 无变化 0 · 打不开 0 · 其他失败 0</p>
-          <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="同步失败帖子">
+          <section id="batchSyncFailures" class="batch-sync-failures" hidden aria-label="未忽略的同步告警与错误">
             <div class="batch-sync-failures__head">
               <strong>未完成帖子诊断</strong>
               <span class="batch-sync-failures__head-actions">
-                <span id="batchSyncFailureCount">0 篇</span>
-                <button id="ignoreAllBatchFailures" type="button">一键忽略</button>
+                <span id="batchSyncFailureCount">0 项</span>
+                <button id="ignoreAllBatchFailures" type="button">忽略整个帖子（停止同步）</button>
               </span>
             </div>
             <ol id="batchSyncFailureList" class="batch-sync-failures__list"></ol>
           </section>
+          <details id="batchSyncMutedFailures" class="batch-sync-muted" hidden>
+            <summary><span>已忽略告警（仍同步）</span><strong id="batchSyncMutedCount">0 条</strong></summary>
+            <p class="sync-alert-hint">仅关闭相应提醒，采集完整性和历史数据状态保持不变。</p>
+            <ol id="batchSyncMutedList" class="batch-sync-failures__list"></ol>
+          </details>
           <button id="cancelBatchSync" class="batch-sync-progress__cancel" type="button">停止同步</button>
           <button id="retryBatchFailures" class="batch-sync-progress__retry" type="button" hidden>重新核验失败项</button>
         </section>
         <button id="deleteUnreachable" class="unreachable-delete-button" type="button" disabled>
-          <span class="unreachable-delete-button__glyph" aria-hidden="true">×</span>
+          <span class="unreachable-delete-button__glyph" aria-hidden="true">✓</span>
           <span class="unreachable-delete-button__copy">
-            <strong id="deleteUnreachableLabel">删除打不开帖子</strong>
-            <small id="unreachableHint">仅删除经双重证据确认失效的帖子及关联数据</small>
+            <strong id="deleteUnreachableLabel">标记已删除帖子</strong>
+            <small id="unreachableHint">只更新帖子状态，保留 CSV、SQLite、评论和素材</small>
           </span>
           <span id="unreachableCount" class="unreachable-delete-button__count">0</span>
         </button>
@@ -160,9 +165,27 @@
           <button id="refreshOperations" class="operations-refresh" type="button" aria-label="刷新运营数据">↻</button>
         </div>
 
+        <article class="operations-card data-overview-launcher">
+          <div class="data-overview-launcher__visual" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+          <div class="data-overview-launcher__copy">
+            <span>LOCAL DATABASE</span>
+            <h3>本地数据总览</h3>
+            <p id="dataOverviewSummary">按任意字段组合条件，查询全部帖子与评论。</p>
+          </div>
+          <button id="openDataOverview" type="button"><span>打开数据总览</span><b>↗</b></button>
+        </article>
+
         <details id="ignoredOperations" class="operations-ignored">
           <summary><span>已忽略帖子</span><strong id="ignoredOperationsCount">0</strong><small>点击展开</small></summary>
           <div id="ignoredOperationsList" class="operations-list operations-list--ignored"></div>
+        </details>
+
+        <details id="syncAlertRules" class="operations-ignored sync-alert-rules">
+          <summary><span>告警忽略规则（仍同步）</span><strong id="syncAlertRulesCount">0</strong><small>点击展开</small></summary>
+          <p id="syncAlertRulesHint" class="sync-alert-hint" role="status">仅忽略此帖的同类评论告警；不停止同步，不改变数据状态。</p>
+          <div id="syncAlertRulesList" class="operations-list operations-list--ignored">
+            <div class="operations-empty">当前没有持续忽略规则</div>
+          </div>
         </details>
 
         <article class="operations-card health-card">
@@ -372,6 +395,7 @@
       <div id="commentsError" class="summary-error" hidden></div>
       <div id="commentsList" class="comments-list"></div>
     </section>
+    <script src="sync-alerts.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>
