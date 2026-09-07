@@ -2,7 +2,7 @@
 
 一个面向品牌舆情监控的 Chrome Manifest V3 扩展与 Windows 本地 Bridge。扩展读取当前小红书页面已加载的 DOM，采集帖子、评论、图片和视频，并幂等写入本地 UTF-8 CSV 与 SQLite。
 
-公开版版本：`0.25.2`
+公开版版本：`0.34.0`
 
 ## 公开版说明
 
@@ -90,7 +90,7 @@ powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 -Extensi
 ```powershell
 powershell -ExecutionPolicy Bypass -File bridge/install_native_host.ps1 \
   -ExtensionId "你的32位插件ID" \
-  -SeedCsv "D:\path\to\小红书_笔记总表.csv"
+  -SeedCsv (Join-Path $PWD "data/notes.csv")
 ```
 
 评论 CSV 会在同目录自动创建。旧版 `-SeedXlsx` 可用于一次性迁移。
@@ -128,3 +128,43 @@ POST /api/data-health/repair-relations
 ```powershell
 powershell -ExecutionPolicy Bypass -File bridge/uninstall_native_host.ps1
 ```
+
+## 0.34.0：本地语义检索与数据总览
+
+帖子与评论数据库新增语义检索、四个快捷主题、原文证据及历史删除状态。普通关键词搜索保持默认；快捷主题仅填入查询，点击“搜索”或按 Enter 才提交，切换表或刷新后不会自动执行语义查询。
+
+### 安装可选的本地模型
+
+基础安装仍使用 `bridge/requirements.txt` 与原 Native Host 安装流程。语义检索另需 Python 3.10+（建议 3.11）及其可用的 PyTorch 环境。在仓库根目录使用同一个 Python 执行：
+
+```powershell
+python -m pip install -r bridge/requirements-semantic.txt
+python bridge/setup_semantic.py
+```
+
+安装器下载固定修订的公开模型至 `bridge/models/` 并在 `bridge/semantic_runtime.json` 写入本机解释器路径。它们由本机生成，均不提交。运行时离线编码、不额外开放端口；Native Host 不打包 Torch，通过管道调用 `bridge/semantic_worker.py`。迁移电脑或 Python 环境后重新安装，不复制别人的运行时配置。完整流程见 [本地语义检索说明](bridge/SEMANTIC_SEARCH.md)。
+
+升级时重新构建并注册 Native Host，重新加载扩展。旧后端未返回 `semantic.mode=embedding` 时，前端明确要求升级并重启 0.34.0，不把关键词命中冒充语义结果。模型、exe、CSV、数据库、索引与缓存均不在源码包内。
+
+### 使用与分数解释
+
+- 一致性校验通过后，选择数据库，打开“语义检索”，输入查询或选择“差评 / 强硬销售 / 价格差异 / 过敏”，然后提交。
+- 默认综合相关度阈值 0.50，最多 200 条；界面按后端实际返回值显示阈值与上限。这是截断后的命中数，不是全库命中总量。
+- 综合排序分以 0–100 刻度显示，不是百分比或置信度；原始 cosine 在分数的悬停提示中单独显示。快捷主题结合已有情绪标签重排，自定义查询使用向量分数。系统不据此新增情绪标签或认定产品致敏。
+- 证据明确区分“帖子正文 / 评论 / 已删除评论”。引用历史已删除评论不表示评论仍在线。
+- 语义模式暂停手动排序与楼层合并，保留原偏好；草稿未提交时清空选择并禁用删除，旧表格有明确提示。
+
+### 可复现的源码回归
+
+需要基础 Python 依赖和 Node.js 20+；合成测试不需要模型、业务数据或已启动的 Bridge。
+
+```powershell
+node --test extension/tests/*.test.cjs
+node extension/tests/semantic-overview.test.cjs
+python -B -m unittest discover -s bridge -p test_semantic_search.py -v
+python -B bridge/verify_release.py
+```
+
+`semantic-overview.test.cjs` 包含 17 项前端检查，使用相对源码路径和内存 DOM/mock，无机器路径或真实评论。`verify_release.py` 在临时目录创建源码快照并安装 Python I/O 隔离守卫，运行后端及前端回归；其日志和运行时绝对路径仅留在本机输出目录，不上传。真实模型质量与本机部署另行验收。
+
+本公开源码以品牌中性公开 main 为基础；品牌、产品、账号词均需用户在本机配置。测试中的可疑平台 ID 已替换为合成标识，不包含业务导出、原始评论快照或模型权重。

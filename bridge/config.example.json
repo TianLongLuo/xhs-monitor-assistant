@@ -3,7 +3,7 @@
   "port": 17881,
   "db": "bridge/data/xhs_monitor.db",
   "export_dir": "bridge/exports",
-  "seed_csv": "C:\\path\\to\\your\\小红书_笔记总表.csv",
-  "comments_csv": "C:\\path\\to\\your\\小红书_评论总表.csv",
+  "seed_csv": "../data/notes.csv",
+  "comments_csv": "../data/comments.csv",
   "seed_xlsx": ""
 }
