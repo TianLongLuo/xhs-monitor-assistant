@@ -819,6 +819,8 @@ body.is-floating .icon-button--float {
   color: #c21f30;
 }
 .batch-sync-failure[data-diagnosis="accessible_extraction_failed"] .batch-sync-failure__badge,
+.batch-sync-failure[data-diagnosis="comments_unverified"] .batch-sync-failure__badge,
+.batch-sync-failure[data-diagnosis="accessible_sync_failed"] .batch-sync-failure__badge,
 .batch-sync-failure[data-diagnosis="stored_link_needs_refresh"] .batch-sync-failure__badge,
 .batch-sync-failure[data-diagnosis="stored_link_id_mismatch"] .batch-sync-failure__badge {
   background: rgba(0, 113, 227, .1);
@@ -828,10 +830,18 @@ body.is-floating .icon-button--float {
   background: rgba(88, 86, 214, .11);
   color: #514fc1;
 }
-.batch-sync-failure__copy strong,
-.batch-sync-failure__copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-sync-failure__copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .batch-sync-failure__copy strong { font-size: 9px; }
-.batch-sync-failure__copy small { color: var(--muted); font-size: 8px; }
+.batch-sync-failure__copy small {
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.batch-sync-failure__details { color: var(--muted); font-size: 8px; min-width: 0; }
+.batch-sync-failure__details summary { cursor: pointer; }
+.batch-sync-failure__details small { display: block; margin-top: 4px; }
 .batch-sync-failure__actions { align-items: flex-end; display: grid; gap: 4px; justify-items: end; }
 .batch-sync-failure__action,
 .batch-sync-failure__excel,
@@ -3087,7 +3097,8 @@ body.apple-utility-ui:not(.is-ball) {
 .apple-utility-ui .batch-sync-failure a:hover { background: rgba(215, 0, 21, .085); }
 .apple-utility-ui .batch-sync-failure__number { color: var(--apple-red); font-size: 9px; }
 .apple-utility-ui .batch-sync-failure__copy strong { font-size: 11px; }
-.apple-utility-ui .batch-sync-failure__copy small { color: var(--apple-secondary); font-size: 10px; }
+.apple-utility-ui .batch-sync-failure__copy small,
+.apple-utility-ui .batch-sync-failure__details { color: var(--apple-secondary); font-size: 10px; }
 
 .apple-utility-ui .status {
   background: transparent;
@@ -3907,3 +3918,87 @@ body.apple-utility-ui.is-ball .ball-widget__ball {
   .data-overview-launcher { background: linear-gradient(145deg, #172536, #2c2c2e 70%); }
   .data-overview-launcher__visual { background: #102d4f; border-color: #234f7c; }
 }
+
+/* Alert preferences are quiet controls, distinct from stopping an entire post. */
+.apple-utility-ui .batch-sync-progress p,
+.apple-utility-ui .batch-sync-failure__copy strong {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+.batch-sync-failures__head,
+.batch-sync-failures__head-actions { flex-wrap: wrap; gap: 6px; }
+.batch-sync-failures__head-actions { min-width: 0; }
+.apple-utility-ui .batch-sync-failure__actions { max-width: 82px; min-width: 0; }
+.apple-utility-ui .batch-sync-failure__ignore,
+.apple-utility-ui .batch-sync-failures__head-actions button {
+  color: var(--apple-red);
+  font-size: 10px;
+  line-height: 1.45;
+  max-width: 100%;
+  min-height: 30px;
+  overflow-wrap: anywhere;
+  text-align: right;
+  white-space: normal;
+}
+.sync-alert-settings { font-size: 10px; margin-top: 5px; min-width: 0; }
+.sync-alert-controls { grid-column: 2 / -1; min-width: 0; }
+.sync-alert-controls .sync-alert-settings { margin-top: 0; }
+.sync-alert-controls .sync-alert-button { width: 100%; }
+.apple-utility-ui .sync-alert-controls .batch-sync-failure__ignore { display: block; margin-top: 8px; padding: 7px 0 0; border-top: 1px solid var(--apple-separator-soft); text-align: left; width: 100%; }
+.apple-utility-ui .batch-sync-failure__actions { align-self: start; }
+.batch-sync-failures__list:has(.sync-alert-settings[open]) { max-height: min(560px, 75vh); }
+.sync-alert-settings > summary { color: var(--apple-blue); cursor: pointer; line-height: 1.5; padding: 4px 0; }
+.sync-alert-settings > small { display: block; margin: 4px 0 7px; }
+.sync-alert-button {
+  background: rgba(0, 122, 255, .07);
+  border: 1px solid var(--apple-separator-soft);
+  border-radius: 8px;
+  color: var(--apple-blue);
+  cursor: pointer;
+  display: block;
+  font-weight: 500;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1.5;
+  margin-top: 5px;
+  max-width: 100%;
+  min-height: 30px;
+  overflow-wrap: anywhere;
+  padding: 5px 8px;
+  text-align: left;
+  white-space: normal;
+}
+.sync-alert-button:hover { background: rgba(0, 122, 255, .13); }
+.sync-alert-button:disabled { cursor: wait; opacity: .5; }
+.sync-alert-settings > summary:focus-visible,
+.sync-alert-button:focus-visible,
+.batch-sync-muted > summary:focus-visible,
+.sync-alert-rules > summary:focus-visible,
+.batch-sync-failure__ignore:focus-visible,
+.batch-sync-failures__head-actions button:focus-visible { outline: 2px solid var(--apple-blue); outline-offset: 2px; }
+.batch-sync-muted {
+  border-top: 1px solid var(--apple-separator-soft);
+  color: var(--apple-secondary);
+  margin-top: 10px;
+  padding-top: 8px;
+}
+.batch-sync-muted > summary { cursor: pointer; font-size: 11px; line-height: 1.5; padding: 4px 0; }
+.batch-sync-muted > summary strong { font-size: 10px; font-variant-numeric: tabular-nums; margin-left: 8px; }
+.apple-utility-ui .batch-sync-progress .sync-alert-hint,
+.sync-alert-hint { color: var(--apple-secondary); font-size: 10px; line-height: 1.5; margin: 6px 0 9px; overflow-wrap: anywhere; white-space: normal; }
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"],
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"]:hover { background: var(--apple-surface); border-color: var(--apple-separator-soft); }
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"] .batch-sync-failure__badge,
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"] .batch-sync-failure__number { color: var(--apple-secondary); }
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"] .batch-sync-failure__badge { background: rgba(118, 118, 128, .1); }
+.apple-utility-ui .batch-sync-failure[data-suppressed="true"] .batch-sync-failure__action { background: rgba(118, 118, 128, .06); color: var(--apple-blue); }
+.sync-alert-rules > .sync-alert-hint { margin: 0 13px 10px; }
+.sync-alert-rules > summary span { overflow-wrap: anywhere; }
+.sync-alert-rule .operations-row__copy strong,
+.sync-alert-rule .operations-row__copy p { display: block; overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; -webkit-line-clamp: unset; }
+.sync-alert-rule .operations-row__actions { max-width: 80px; }
+.sync-alert-rule .sync-alert-button { margin-top: 0; padding: 5px 8px; }
+.sync-alert-hint[data-state="warning"] { color: var(--apple-red); }
+.app-toast--neutral { background: var(--apple-text); border-radius: 12px; color: var(--apple-surface); line-height: 1.5; overflow-wrap: anywhere; white-space: normal; }

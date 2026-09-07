@@ -8,7 +8,10 @@
   </head>
   <body>
     <div class="app-shell">
-      <aside class="database-rail" aria-label="数据表切换">
+      <button id="railPeek" class="rail-peek" type="button" aria-controls="databaseRail" aria-expanded="false" aria-label="展开导航" title="靠近左侧展开导航">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <aside id="databaseRail" class="database-rail" aria-label="数据表切换" inert>
         <div class="rail-brand" aria-label="舆情雷达">
           <span class="rail-brand__mark">X</span>
           <span class="rail-brand__copy"><small>XHS MONITOR</small><strong>数据总览</strong></span>
@@ -33,7 +36,7 @@
           <button type="button" data-quick-view="deleted"><i></i>已删除历史</button>
           <button type="button" data-quick-view="ignored"><i></i>已忽略帖子</button>
           <button type="button" data-quick-view="negative"><i></i>语义差评</button>
-          <button type="button" data-quick-view="unanalyzed"><i></i>尚未语义分析</button>
+          <button type="button" data-quick-view="unanalyzed" title="筛选语义结论为空的全部记录，包括未分析、失败或尚无结果的记录；不按次数判断"><i></i>尚无语义结论</button>
         </section>
 
         <div class="rail-footnote">
@@ -56,7 +59,7 @@
             </button>
             <button id="exportCurrent" class="quiet-button" type="button" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
-              导出已加载
+              <span id="exportLabel">导出筛选结果</span>
             </button>
             <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
@@ -92,7 +95,24 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h8M8 18h4M4 5v14"/></svg>
             排序 <i id="sortCount" hidden>0</i>
           </button>
+          <button id="resetView" class="toolbar-button toolbar-button--reset" type="button"
+                  title="清除当前数据库的搜索、筛选和排序，并恢复默认显示字段、列顺序与列宽" aria-label="重置当前视图">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.8 9A8 8 0 1 1 5 15.4"/><path d="M4 4v5h5"/></svg>
+            重置
+          </button>
           <div class="result-counter"><strong id="resultCount">—</strong><span id="resultLabel">条结果</span></div>
+        </section>
+
+        <section class="semantic-toolbar" aria-label="搜索模式与语义快捷查询">
+          <label class="semantic-switch"><input id="semanticSearch" type="checkbox" aria-describedby="semanticStatus">语义检索</label>
+          <button id="searchSubmit" class="toolbar-button" type="button">搜索</button>
+          <span class="semantic-shortcuts" aria-label="填入语义查询，按搜索执行">
+            <button type="button" data-semantic-query="差评">差评</button>
+            <button type="button" data-semantic-query="强硬销售">强硬销售</button>
+            <button type="button" data-semantic-query="价格差异">价格差异</button>
+            <button type="button" data-semantic-query="过敏">过敏</button>
+          </span>
+          <small id="semanticStatus" role="status" aria-live="polite">普通搜索 · 关键词匹配</small>
         </section>
 
         <section id="pageFind" class="page-find" hidden aria-label="在筛选结果中查找">
@@ -108,6 +128,7 @@
             <div><small>FILTER FIELD</small><strong id="columnFilterTitle">字段筛选</strong></div>
             <button id="closeColumnFilter" type="button" aria-label="关闭列筛选">×</button>
           </header>
+          <label class="column-filter-control"><span>应用方式</span><select id="columnFilterMode"><option value="replace">替换本列条件</option><option value="append">追加条件</option></select></label>
           <label class="column-filter-control"><span>条件</span><select id="columnFilterOperator"></select></label>
           <div id="columnFilterValueWrap" class="column-filter-value"></div>
           <p id="columnFilterExisting">该字段暂无筛选条件</p>
@@ -117,23 +138,34 @@
           </footer>
         </section>
 
+        <p id="filterDraftNotice" class="snapshot-notice" role="status" hidden></p>
         <section id="filterPanel" class="builder-panel" hidden>
           <header>
             <div><strong>条件筛选</strong><span>满足</span><select id="filterLogic"><option value="and">全部条件</option><option value="or">任一条件</option></select></div>
             <button id="clearFilters" type="button">清空</button>
           </header>
+          <p class="filter-value-hint">全部＝同时满足；任一＝满足其中一条。同字段多选请用“属于任一值”；搜索框与筛选条件同时生效。</p>
           <div id="filterRows" class="builder-rows"></div>
           <button id="addFilter" class="builder-add" type="button">＋ 添加筛选条件</button>
         </section>
 
         <section id="fieldPanel" class="popover-panel field-panel" hidden>
           <label><span>查找字段</span><input id="fieldSearch" type="search" placeholder="输入字段名称"></label>
-          <div class="field-panel__actions"><button id="selectDefaultFields" type="button">恢复默认</button><button id="selectAllFields" type="button">显示全部</button></div>
+          <div class="field-panel__actions"><button id="selectDefaultFields" type="button">默认字段</button><button id="selectAllFields" type="button">显示全部</button><button id="restoreColumnOrder" type="button" title="只恢复列顺序，保留筛选、显示字段和排序规则">恢复列顺序</button><button id="restoreColumnWidths" type="button" title="只恢复当前数据库的列宽，保留筛选、显示字段和列顺序">恢复列宽</button></div>
           <div id="fieldOptions" class="field-options"></div>
         </section>
 
         <section id="sortPanel" class="builder-panel sort-panel" hidden>
-          <header><strong>排序规则</strong><button id="clearSorts" type="button">清空</button></header>
+          <header><strong>排序规则</strong><button id="clearSorts" type="button">恢复默认</button></header>
+          <p class="filter-value-hint">默认按发布时间从新到旧；未知时间置后。多条规则从上到下优先，语义搜索按相关度排序。</p>
+          <label id="threadGroupingRow" class="thread-grouping-option" hidden>
+            <input id="groupThreads" type="checkbox" checked>
+            <span>合并一级评论线程<small>可按一级评论时间排列整个线程，或按每条评论时间全局排列。</small></span>
+          </label>
+          <label id="threadSortModeRow" class="column-filter-control" hidden><span>合并后的时间排序</span>
+            <select id="threadSortMode"><option value="root">按一级评论发布时间（整组排序）</option><option value="comment">按各条评论发布时间（全局排序）</option></select>
+          </label>
+          <p id="threadSortModeHint" class="filter-value-hint" hidden></p>
           <div id="sortRows" class="builder-rows"></div>
           <button id="addSort" class="builder-add" type="button">＋ 添加排序</button>
         </section>
@@ -144,8 +176,10 @@
           <button id="retryHealth" type="button">重新校验</button>
         </section>
 
+        <aside id="snapshotNotice" class="snapshot-notice" hidden role="status"><span id="snapshotNoticeText"></span><button id="refreshSnapshot" type="button">更新数据</button></aside>
+
         <section id="dataSurface" class="data-surface" aria-busy="false">
-          <div id="tableViewport" class="table-viewport">
+          <div id="tableViewport" class="table-viewport" tabindex="0" aria-label="数据表格，可上下和左右滚动">
             <table id="dataTable">
               <thead><tr id="tableHead"></tr></thead>
               <tbody id="tableBody"></tbody>
@@ -160,12 +194,12 @@
           </div>
           <footer class="infinite-status">
             <span id="pageMeta">已加载 0 / 0 条</span>
-            <small>滚动到底自动加载</small>
+            <small id="columnOrderHint" role="status" aria-live="polite" title="拖动表头调整顺序，拖动右边缘调整宽度；双击边缘恢复默认；列宽与顺序自动保存">拖动表头调顺序 · 拖动列边缘调宽度 · 自动保存</small>
           </footer>
         </section>
       </main>
 
-      <aside id="recordDrawer" class="record-drawer" hidden aria-label="记录详情">
+      <aside id="recordDrawer" class="record-drawer" hidden aria-label="图文记录详情" aria-busy="false">
         <header><div><span id="drawerType">帖子记录</span><strong id="drawerTitle">记录详情</strong></div><button id="closeDrawer" type="button" aria-label="关闭详情">×</button></header>
         <div id="drawerFields" class="drawer-fields"></div>
         <footer><button id="deleteDrawerRecord" class="drawer-delete" type="button">彻底删除</button><span></span><button id="copyRecord" type="button">复制 JSON</button><button id="openRecordLink" type="button" hidden>打开原链接</button></footer>
@@ -188,6 +222,12 @@
       </dialog>
       <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     </div>
+    <script src="column-order.js"></script>
+    <script src="column-widths.js"></script>
+    <script src="data-export.js"></script>
+    <script src="overview-media.js"></script>
+    <script src="record-details.js"></script>
     <script src="data-overview.js"></script>
+    <script src="data-overview-layout.js"></script>
   </body>
 </html>

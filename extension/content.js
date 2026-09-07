@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-const CONTENT_VERSION = "0.31.1";
+const CONTENT_VERSION = "0.34.7";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -18,7 +18,13 @@ const CONTENT_VERSION = "0.31.1";
   const relevanceMatch = (note) => globalThis.XhsMonitorRelevance.match(note, activeRelevanceGroups);
   const pageContext = globalThis.XhsMonitorPageContext;
   const noteUtils = globalThis.XhsMonitorNoteUtils;
+  const locationUtils = globalThis.XhsMonitorLocationUtils;
   const commentUtils = globalThis.XhsMonitorCommentUtils;
+  const commentCollector = globalThis.XhsMonitorCommentCollector;
+  let activePageRead = null;
+  // Latch the dedicated read-only purpose before any async startup. SPA URL
+  // cleanup must not turn a locator tab back into an automatic collector.
+  let commentLocatorSurface = globalThis.__XHS_MONITOR_COMMENT_LOCATOR_SURFACE__ === true || new URL(location.href).searchParams.get("xhs_monitor_locate") === "1";
   const detailStore = globalThis.XhsMonitorDetailStore.create();
   const CARD_MARK = "data-xhs-monitor-card";
   const TOOLBAR_CLASS = "xhs-monitor-toolbar";
@@ -60,6 +66,7 @@ const CONTENT_VERSION = "0.31.1";
   let processPanelLifecycleTimer = null;
   let processPanelPositionFrame = 0;
   let processPanelGeometry = "";
+  const processReservation = globalThis.XhsMonitorProcessLayout.createReservation({ onResize: () => positionProcessPanel() });
   let currentDetailHint = null;
   let detailControlTimer = null;
   let lastDetailControlAt = 0;
@@ -68,6 +75,7 @@ const CONTENT_VERSION = "0.31.1";
   let lastAutoScanFingerprint = "";
   let lastAutoScanResult = null;
   let lastAutoScanFetchedAt = 0;
+  let scanStatusGeneration = 0;
   const STATUS_CACHE_TTL_MS = 1500;
   let dismissedDetailId = "";
 
@@ -224,7 +232,7 @@ const CONTENT_VERSION = "0.31.1";
       "noteId", "url", "title", "author", "authorUrl", "authorId", "publishedAt", "updatedAt",
       "content", "detailRead", "tags", "mediaText", "imageUrls", "imageCount", "videoUrls",
       "videoCount", "mediaType", "likeCount", "collectCount", "commentCount", "shareCount",
-      "ipLocation", "keyword", "pageUrl"
+      "ipLocation", "keyword", "pageUrl", "timeObservedAt", "timeReferenceSource"
     ];
     const result = {};
     for (const key of keys) if (Object.prototype.hasOwnProperty.call(note, key)) result[key] = note[key];
@@ -256,23 +264,23 @@ const CONTENT_VERSION = "0.31.1";
 
   function processMetric(root, patterns) {
     const keys = patterns.map((value) => String(value).toLocaleLowerCase());
+    if (keys.some((value) => value === "comment" || value.includes("评论"))) {
+      const count = commentUtils.readCommentCount(root);
+      // Read the native count/empty state rather than an unrelated number in
+      // the detail title, like bar, or our own floating panel.
+      return count.expectedCountKnown && !count.countConflict && (count.expectedCount > 0 || count.explicitEmpty)
+        ? String(count.expectedCount) : "未显示";
+    }
     const primarySelectors = keys.some((value) => value === "like" || value.includes("点赞"))
       ? [".engage-bar-style .like-wrapper > .count"]
       : keys.some((value) => value === "collect" || value.includes("收藏") || value === "star")
         ? [".engage-bar-style .collect-wrapper > .count"]
-        : keys.some((value) => value === "comment" || value.includes("评论"))
-          ? [".engage-bar-style .chat-wrapper > .count", ".comments-container .total"]
-          : keys.some((value) => value === "share" || value.includes("分享"))
-            ? [".engage-bar-style .share-wrapper > .count", ".engage-bar-style .share-wrapper .count"]
-            : [];
+        : keys.some((value) => value === "share" || value.includes("分享"))
+          ? [".engage-bar-style .share-wrapper > .count", ".engage-bar-style .share-wrapper .count"]
+          : [];
     for (const selector of primarySelectors) {
       const value = clean(root?.querySelector?.(selector)?.innerText, 120);
       if (value && /\d|万|w/i.test(value)) return value;
-    }
-    if (keys.some((value) => value === "comment" || value.includes("评论"))) {
-      const match = clean(root?.querySelector?.(".comments-container")?.innerText, 200)
-        .match(/共\s*([\d,.]+\s*[万wW]?)\s*条评论/);
-      if (match) return match[1].replace(/\s+/g, "");
     }
     if (keys.some((value) => value === "share" || value.includes("分享"))
         && root?.querySelector?.(".engage-bar-style .share-wrapper")) return "未显示";
@@ -291,25 +299,63 @@ const CONTENT_VERSION = "0.31.1";
     return candidates[0] || "";
   }
 
-  function processIpLocation(root) {
-    for (const element of root?.querySelectorAll?.("span, p, div, time") || []) {
-      const value = clean(element.innerText, 100);
-      if (/^(IP属地|IP所在地|来自)\s*[:：]?/.test(value)) return value.replace(/^(IP属地|IP所在地|来自)\s*[:：]?\s*/, "");
+  function detailMetadataNodes(root, selector) {
+    const excluded = [
+      "[class*='comments-el']", "[class*='comments-container']", "[class*='comments-list']",
+      "[class*='comment-item']", "[class*='CommentItem']", "[class*='parent-comment']",
+      "[class*='comment-thread']", "[class*='reply-item']", "[class*='ReplyItem']", "[data-comment-id]", "[comment-id]",
+      "#detail-desc", "[data-note-content]", ".note-text", "[class*='note-text']", "[class*='description']",
+      ".content", "[class*='content-text']", ".desc", "[class*='caption']",
+      "#detail-title", "h1", ".username", ".user-name", ".name", "[class*='nickname']",
+      "[class*='avatar']", "[class*='Avatar']", "a[href*='/user/profile/']",
+      ".xhs-monitor-process", ".xhs-monitor-toolbar", ".xhs-monitor-page-toast",
+      ".xhs-monitor-badge", ".xhs-monitor-relevance", ".xhs-monitor-action", "[data-xhs-monitor-ui]"
+    ].join(",");
+    return Array.from(root?.querySelectorAll?.(selector) || []).filter((node) => {
+      if (node.isConnected === false || node.hidden || node.closest?.("[hidden], [aria-hidden='true']")) return false;
+      const style = node.ownerDocument?.defaultView?.getComputedStyle(node);
+      if (style?.display === "none" || /^(hidden|collapse)$/.test(style?.visibility || "")) return false;
+      if (node.getClientRects && !node.getClientRects().length) return false;
+      if (node.closest?.(excluded) || node.querySelector?.(excluded)) return false;
+      const owner = node.closest?.("[data-note-id], [note-id], [data-noteid]");
+      return !owner || owner === root || owner.contains?.(root);
+    });
+  }
+
+  function detailDateText(root) {
+    let datetimeFallback = "";
+    for (const selector of [
+      ".note-content .date, .bottom-container .date",
+      "time, .date, .time, [class*='date'], [class*='time']"
+    ]) {
+      for (const node of detailMetadataNodes(root, selector)) {
+        const raw = node.innerText ?? node.textContent ?? "";
+        if (raw.trim()) return raw;
+        datetimeFallback ||= node.getAttribute?.("datetime") || "";
+      }
     }
-    return "";
+    return datetimeFallback;
+  }
+
+  function processIpLocation(root, rawTime = detailDateText(root)) {
+    const selector = "[class*='ip-location'], [class*='ipLocation'], [class*='ip_location'], [class*='ip-address'], [class*='ipAddress'], [data-ip-location]";
+    for (const node of detailMetadataNodes(root, selector)) {
+      const region = locationUtils?.extractRegion(node.innerText ?? node.textContent ?? "") || "";
+      if (region) return region;
+    }
+    return locationUtils?.extractRegion(rawTime) || "";
   }
 
   function processDetailMetadata(root) {
-    const raw = clean(root?.querySelector?.(".note-content .date, .bottom-container .date, time, [class*='date']")?.innerText, 200);
-    const datePattern = "\\d{4}[-/.]\\d{1,2}[-/.]\\d{1,2}(?:\\s+\\d{1,2}:\\d{2})?";
-    const updatedMatch = raw.match(new RegExp(`(?:编辑于|更新于)\\s*(${datePattern})`));
-    const publishedMatch = raw.match(new RegExp(datePattern));
-    const explicitIp = processIpLocation(root);
-    const locationMatch = raw.match(/(?:IP属地|IP所在地|来自)\s*[:：]?\s*([^\s]+)/);
+    const rawTime = detailDateText(root);
+    const raw = clean(rawTime, 200);
     return {
-      publishedAt: publishedMatch?.[0] || raw,
-      updatedAt: updatedMatch?.[1] || "未显示",
-      ipLocation: explicitIp || locationMatch?.[1] || "未显示"
+      // Preserve the edited marker and region suffix in the source text. The
+      // Bridge records a separate standard timestamp anchored to this instant.
+      publishedAt: raw,
+      updatedAt: /编辑于|更新于/.test(raw) ? raw : "未显示",
+      timeObservedAt: new Date().toISOString(),
+      ipLocation: processIpLocation(root, rawTime)
     };
   }
 
@@ -367,11 +413,16 @@ const CONTENT_VERSION = "0.31.1";
 
   function processStatusText(message = {}) {
     if (message.error) return message.error;
+    if (message.done && message.syncAlert?.suppressed && !message.mediaError
+      && (!message.mediaStatus || message.mediaStatus === "complete")) {
+      return `可见内容已同步 · ${message.syncAlert.label}已忽略`;
+    }
     if (message.done) return message.pullStatus === "partial" ? "已写入，部分内容可重试" : "已完成并写入本地 CSV";
     return message.title || PROCESS_STEPS.find((step) => step.id === message.phase)?.hint || "处理中…";
   }
 
   function removeProcessPanel() {
+    processReservation.release();
     if (processPanel?._statusRetryTimer) {
       clearTimeout(processPanel._statusRetryTimer);
       processPanel._statusRetryTimer = null;
@@ -469,6 +520,7 @@ const CONTENT_VERSION = "0.31.1";
 
   function setProcessPanelCollapsed(panel, collapsed) {
     if (!panel) return;
+    const changed = panel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`) !== Boolean(collapsed);
     panel.classList.toggle(`${PROCESS_PANEL_CLASS}--collapsed`, Boolean(collapsed));
     const button = panel.querySelector(`.${PROCESS_PANEL_CLASS}__collapse`);
     if (button) {
@@ -477,6 +529,7 @@ const CONTENT_VERSION = "0.31.1";
       button.setAttribute("aria-label", collapsed ? "展开 Process" : "折叠 Process");
       button.title = collapsed ? "展开详细进度" : "折叠详细进度";
     }
+    if (changed) positionProcessPanel();
   }
 
   function consumeProcessScroll(viewport, delta) {
@@ -529,9 +582,10 @@ const CONTENT_VERSION = "0.31.1";
     const activeDetailId = noteIdFromUrl(location.href);
     const cachedNode = processPanel?._dockNode;
     const cachedRect = cachedNode?.isConnected ? cachedNode.getBoundingClientRect?.() : null;
+    const reservedDock = processReservation.owns(cachedNode, noteId);
     if (cachedRect
-      && cachedRect.width >= 520
-      && cachedRect.height >= 280
+      && (cachedRect.width >= 520 || reservedDock)
+      && (cachedRect.height >= 280 || reservedDock)
       && cachedRect.right > 0
       && cachedRect.bottom > 0
       && cachedRect.left < window.innerWidth
@@ -551,6 +605,7 @@ const CONTENT_VERSION = "0.31.1";
     }
     const shellSelector = [
       "#noteContainer.note-container",
+      ".note-container",
       "#noteContainer[role='dialog']",
       "[role='dialog']",
       ".note-detail-mask",
@@ -614,34 +669,21 @@ const CONTENT_VERSION = "0.31.1";
   function applyProcessPanelPosition() {
     if (!processPanel) return;
     const dock = processDockRect(processPanel._processNote || {});
-    const rect = dock?.rect;
-    if (!rect) return;
-    const gap = 10;
-    const edge = 12;
-    const availableRight = Math.floor(window.innerWidth - rect.right - gap - edge);
-    const previous = processPanel._appliedGeometry || null;
-    const top = Math.max(edge, Math.min(Math.round(rect.top), window.innerHeight - 180));
-    const dockBottom = rect.bottom > top + 180 ? rect.bottom : window.innerHeight - edge;
-    const bottom = Math.min(window.innerHeight - edge, Math.round(dockBottom));
-    const maxHeight = Math.max(180, bottom - top);
-    let panelWidth;
-    let panelLeft;
-    let position;
-    const outsideThreshold = previous?.position === "outside" ? 184 : 212;
-    if (availableRight >= outsideThreshold) {
-      panelWidth = Math.min(292, availableRight);
-      panelLeft = Math.round(rect.right + gap);
-      position = "outside";
-    } else {
-      panelWidth = Math.min(288, Math.max(232, Math.round(rect.width * 0.27)));
-      const overlayLeft = Math.round(rect.right - panelWidth - 14);
-      panelLeft = Math.max(edge, Math.min(window.innerWidth - edge - panelWidth, overlayLeft));
-      position = "overlay";
-    }
+    if (!dock?.rect || !dock.node) { processReservation.release(); return; }
+    const layout = processReservation.update(dock.node, processPanel.dataset.noteId,
+      { width: window.innerWidth, height: window.innerHeight },
+      processPanel.classList.contains(`${PROCESS_PANEL_CLASS}--collapsed`));
+    if (!layout) return;
+    const top = Math.round(layout.panel.top);
+    const maxHeight = Math.floor(layout.panel.height);
+    const panelWidth = Math.floor(layout.panel.width);
+    const panelLeft = Math.round(layout.panel.left);
+    const position = layout.mode;
     const density = panelWidth < 224 ? "ultra" : panelWidth < 270 ? "compact" : "regular";
+    const previous = processPanel._appliedGeometry || null;
     const nextGeometry = {
       top, maxHeight, panelWidth, panelLeft, position, density,
-      dockRight: Math.round(rect.right)
+      dockRight: Math.round(layout.note.right)
     };
     if (previous
       && previous.position === nextGeometry.position
@@ -651,7 +693,7 @@ const CONTENT_VERSION = "0.31.1";
       && Math.abs(previous.panelWidth - nextGeometry.panelWidth) <= 3
       && Math.abs(previous.panelLeft - nextGeometry.panelLeft) <= 3
       && Math.abs(previous.dockRight - nextGeometry.dockRight) <= 3) return;
-    const geometry = [top, maxHeight, panelWidth, panelLeft, position, density, Math.round(rect.right)].join(":");
+    const geometry = [top, maxHeight, panelWidth, panelLeft, position, density].join(":");
     if (geometry === processPanelGeometry) return;
     processPanelGeometry = geometry;
     processPanel._appliedGeometry = nextGeometry;
@@ -661,7 +703,7 @@ const CONTENT_VERSION = "0.31.1";
     processPanel.style.left = `${panelLeft}px`;
     processPanel.style.right = "auto";
     processPanel.dataset.position = position;
-    processPanel.dataset.dockRight = String(Math.round(rect.right));
+    processPanel.dataset.dockRight = String(Math.round(layout.note.right));
     processPanel.dataset.density = density;
   }
 
@@ -1591,8 +1633,10 @@ const CONTENT_VERSION = "0.31.1";
         author,
         authorUrl,
         authorId: baseNote.authorId || processAuthorId(authorUrl),
-        publishedAt: baseNote.publishedAt || metadata.publishedAt,
-        updatedAt: baseNote.updatedAt || metadata.updatedAt,
+        publishedAt: metadata.publishedAt || baseNote.publishedAt || "",
+        updatedAt: metadata.publishedAt ? metadata.updatedAt : (baseNote.updatedAt || "未显示"),
+        timeObservedAt: metadata.publishedAt ? metadata.timeObservedAt : (baseNote.timeObservedAt || metadata.timeObservedAt),
+        timeReferenceSource: "capture",
         content,
         detailRead: true,
         tags: normalizeTagValues([...(Array.isArray(baseNote.tags) ? baseNote.tags : [baseNote.tags]), ...tags]),
@@ -1604,9 +1648,9 @@ const CONTENT_VERSION = "0.31.1";
         mediaType: videoUrls.length || (baseNote.videoUrls || []).length ? "video" : "image",
         likeCount: baseNote.likeCount || processMetric(detailRoot, ["like", "点赞", "赞"]),
         collectCount: baseNote.collectCount || processMetric(detailRoot, ["collect", "收藏", "star"]),
-        commentCount: baseNote.commentCount || processMetric(detailRoot, ["comment", "评论"]),
+        commentCount: processMetric(detailRoot, ["comment", "评论"]),
         shareCount: baseNote.shareCount || processMetric(detailRoot, ["share", "分享"]),
-        ipLocation: baseNote.ipLocation || metadata.ipLocation,
+        ipLocation: metadata.ipLocation || "",
         keyword: baseNote.keyword || currentKeyword(),
         pageUrl: baseNote.pageUrl || location.href
       }
@@ -1695,6 +1739,7 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   function invalidateScanStatusCache(noteId = "", freshStatus = null) {
+    scanStatusGeneration += 1;
     lastAutoScanFingerprint = "";
     lastAutoScanFetchedAt = 0;
     if (!lastAutoScanResult?.ok || !noteId || !freshStatus) return;
@@ -1766,6 +1811,21 @@ const CONTENT_VERSION = "0.31.1";
     if (pull) { pull.textContent = "评论状态：最新"; pull.dataset.state = "pulled"; }
   }
 
+  function setProcessCommentsIncomplete(panel, response, snapshot = {}) {
+    const headPull = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__head-state--pull`);
+    const pull = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__state--pull`);
+    const muted = response.syncAlert?.suppressed === true;
+    if (headPull) { headPull.textContent = muted ? "可见评论已同步" : "评论待补读"; headPull.dataset.state = muted ? "unknown" : "missing"; }
+    if (pull) { pull.textContent = muted ? "评论状态：已同步可见部分" : "评论状态：待补读"; pull.dataset.state = muted ? "unknown" : "missing"; }
+    const message = muted
+      ? `已同步 ${response.currentCount ?? snapshot.comments?.length ?? 0}/${snapshot.expectedCount || "?"} 条可见评论；${response.syncAlert.label}提醒已忽略，仍继续同步，未见评论保留`
+      : snapshot.commentError || `已保存 ${response.currentCount ?? snapshot.comments?.length ?? 0}/${snapshot.expectedCount || "?"} 条评论；自动补读后仍未完整，历史评论已保留`;
+    const status = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+    if (status) status.textContent = message;
+    if (panel) panel._commentAuditDone = false;
+    return message;
+  }
+
   function renderCommentChanges(panel, result) {
     const section = panel?.querySelector(`.${PROCESS_PANEL_CLASS}__changes`);
     if (!section) return null;
@@ -1808,6 +1868,7 @@ const CONTENT_VERSION = "0.31.1";
     button.textContent = "准备自动同步…";
     let syncPromise = null;
     const syncChanges = (automatic = false) => {
+      if (isCommentLocatorSurface()) return Promise.resolve(null);
       if (button.dataset.state === "updated") return Promise.resolve(null);
       if (syncPromise) return syncPromise;
       syncPromise = (async () => {
@@ -1822,16 +1883,24 @@ const CONTENT_VERSION = "0.31.1";
           if (!response?.ok || !response.consistencyVerified) {
             throw new Error(response?.error || "帖子、评论与素材一致性校验失败");
           }
-          button.textContent = automatic ? "已自动同步" : "已更新";
-          button.dataset.state = "updated";
-          section.dataset.state = "updated";
-          setProcessLatest(panel);
+          const complete = response.commentStatus === "likely_complete" && response.canPrune === true;
+          button.textContent = complete ? (automatic ? "已自动同步" : "已更新")
+            : response.syncAlert?.suppressed ? "已同步可见评论 · 重新核验" : "重新读取评论";
+          button.dataset.state = complete ? "updated" : "partial";
+          button.disabled = complete;
+          section.dataset.state = complete ? "updated" : "partial";
+          if (complete) setProcessLatest(panel);
           const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
           if (status) status.textContent = `帖子/评论状态同步成功：新增 ${response.newCount || 0}，标记已删除 ${response.removedCount || 0}，修改 ${response.changedCount || 0}；全存储已校验`;
-          panel._commentAuditDone = true;
+          panel._commentAuditDone = complete;
           panel._commentAudit = { ...result, synced: response };
           panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
-          showPageToast(`帖子/评论状态同步成功 · 新增 ${response.newCount || 0} · 标记已删除 ${response.removedCount || 0} · 全存储一致`);
+          if (complete) showPageToast(`帖子/评论状态同步成功 · 新增 ${response.newCount || 0} · 标记已删除 ${response.removedCount || 0} · 全存储一致`);
+          else {
+            const message = setProcessCommentsIncomplete(panel, response, result.snapshot);
+            if (!response.syncAlert?.suppressed) showPageToast(message, "warning");
+            else if (response.newCount || response.changedCount) showPageToast(`可见评论已同步 · 新增 ${response.newCount || 0} · 修改 ${response.changedCount || 0} · ${response.syncAlert.label}提醒已忽略`);
+          }
           return response;
         } catch (error) {
           button.disabled = false;
@@ -1845,7 +1914,13 @@ const CONTENT_VERSION = "0.31.1";
       })();
       return syncPromise;
     };
-    button.addEventListener("click", () => syncChanges(false).catch(() => {}));
+    button.addEventListener("click", () => {
+      if (button.dataset.state === "partial") {
+        button.disabled = true;
+        panel._commentAuditStarted = false;
+        auditPulledComments(panel, panel._processNote).catch(() => {}).finally(() => { button.disabled = false; });
+      } else syncChanges(false).catch(() => {});
+    });
     section.append(head, intro, list, button);
     panel.classList.remove(`${PROCESS_PANEL_CLASS}--collapsed`);
     positionProcessPanel();
@@ -1853,11 +1928,12 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   async function auditPulledComments(panel, note) {
+    if (isCommentLocatorSurface()) return;
     if (!panel || !note?.noteId || panel._commentAuditStarted) return;
     panel._commentAuditStarted = true;
     try {
       const result = await sendRuntime({ type: "auditCurrentNoteComments", note });
-      if (!result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      if (isCommentLocatorSurface() || !result?.ok || panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
       const syncChanges = renderCommentChanges(panel, result);
       if (result.hasChanges && syncChanges) {
         await syncChanges(true);
@@ -1870,10 +1946,16 @@ const CONTENT_VERSION = "0.31.1";
         if (!response?.ok || !response.consistencyVerified) {
           throw new Error(response?.error || "本地数据一致性校验失败");
         }
-        setProcessLatest(panel);
-        const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
-        if (status) status.textContent = "帖子与评论无变化；CSV、SQLite、存续状态与素材快照已校准";
-        panel._commentAuditDone = true;
+        const complete = response.commentStatus === "likely_complete" && response.canPrune === true;
+        if (complete) {
+          setProcessLatest(panel);
+          const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+          if (status) status.textContent = "帖子与评论无变化；CSV、SQLite、存续状态与素材快照已校准";
+        } else {
+          const message = setProcessCommentsIncomplete(panel, response, result.snapshot);
+          if (!response.syncAlert?.suppressed) showPageToast(message, "warning");
+        }
+        panel._commentAuditDone = complete;
         panel._processNote = { ...panel._processNote, commentCount: response.collectedCount };
       }
     } catch (error) {
@@ -1922,11 +2004,20 @@ const CONTENT_VERSION = "0.31.1";
 
   async function refreshProcessPanelStatus(panel, note) {
     if (!panel || !note?.noteId) return;
+    if (activePageRead?.noteId === note.noteId) return;
+    if (panel._statusRequest) {
+      if (!panel._statusFetchedAt) panel._statusRefreshQueued = true;
+      return;
+    }
     if (Date.now() - Number(panel._statusFetchedAt || 0) < 1500) return;
+    const request = {};
+    panel._statusRequest = request;
     panel._statusFetchedAt = Date.now();
     try {
       const result = await sendRuntime({ type: "getNoteStatus", noteId: note.noteId });
       if (panel !== processPanel || panel.dataset.noteId !== note.noteId) return;
+      if (panel._statusRefreshQueued || !panel._statusFetchedAt) return;
+      if (activePageRead?.noteId === note.noteId) return;
       if (!result?.ok) {
         retryProcessPanelStatus(panel, note);
         return;
@@ -1983,6 +2074,13 @@ const CONTENT_VERSION = "0.31.1";
     } catch (error) {
       panel._lastStatusError = error?.message || "状态读取失败";
       retryProcessPanelStatus(panel, note);
+    } finally {
+      if (panel._statusRequest === request) panel._statusRequest = null;
+      if (panel._statusRefreshQueued && panel === processPanel && panel.dataset.noteId === note.noteId) {
+        panel._statusRefreshQueued = false;
+        panel._statusFetchedAt = 0;
+        refreshProcessPanelStatus(panel, note).catch(() => {});
+      }
     }
   }
 
@@ -2066,8 +2164,16 @@ const CONTENT_VERSION = "0.31.1";
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function isCommentLocatorSurface() {
+    try {
+      commentLocatorSurface ||= new URL(location.href).searchParams.get("xhs_monitor_locate") === "1";
+      return commentLocatorSurface;
+    }
+    catch (_error) { return false; }
+  }
+
   function isBatchAutomationSurface() {
-    try { return new URL(location.href).searchParams.get("xhs_monitor_batch") === "1"; }
+    try { return isCommentLocatorSurface() || new URL(location.href).searchParams.get("xhs_monitor_batch") === "1"; }
     catch (_error) { return false; }
   }
 
@@ -2128,7 +2234,10 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   function pageAccessEvidence(note = {}) {
-    const bodyText = clean(document.body?.innerText, 12000);
+    let bodyText = clean(document.body?.innerText, 20000);
+    const processText = clean(processPanel?.innerText, 12000);
+    if (processText) bodyText = clean(bodyText.replace(processText, ""), 12000);
+    else bodyText = bodyText.slice(0, 12000);
     const requestedId = clean(note.noteId, 128);
     const currentPageId = noteIdFromUrl(location.href);
     // Only a target-specific detail URL may prove that a note is gone. Search
@@ -2156,7 +2265,13 @@ const CONTENT_VERSION = "0.31.1";
     ].find((marker) => bodyText.includes(marker));
     if (temporary) return { state: "temporary_blocked", marker: temporary, targetRoute, reason: "桌面页面暂时无法读取" };
     const titlePrefix = clean(note.title, 1000).slice(0, 18);
-    const accessibleSurface = Boolean(targetRoute && titlePrefix && bodyText.includes(titlePrefix));
+    const detailRoot = detailRootForNote(note);
+    const detailText = clean(detailRoot?.innerText, 16000);
+    // Only native detail content may prove reachability. The floating process
+    // panel repeats the title and must never turn its own text into evidence.
+    const accessibleSurface = Boolean(targetRoute && detailRoot && (
+      !titlePrefix || detailText.includes(titlePrefix)
+    ));
     if (accessibleSurface) return { state: "accessible_surface", marker: "target_title_visible", targetRoute, reason: "帖子页面可打开，但详情提取未完成" };
     return { state: "unknown", marker: definitive || "", targetRoute };
   }
@@ -2262,6 +2377,21 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   async function readNoteInPage(note = {}) {
+    if (isCommentLocatorSurface()) return { ok: false, cancelled: true, error: "此页专用于评论定位，采集请使用其他标签页" };
+    if (activePageRead) {
+      if (activePageRead.noteId === note.noteId && (activePageRead.allComments || !note.allComments)) return activePageRead.promise;
+      if (activePageRead.noteId !== note.noteId) activePageRead.cancelled = true;
+      await activePageRead.promise.catch(() => {});
+      return readNoteInPage(note);
+    }
+    const task = { noteId: note.noteId, allComments: Boolean(note.allComments), cancelled: false, promise: null };
+    activePageRead = task;
+    task.promise = readNoteInPageUnchecked(note, task);
+    try { return await task.promise; }
+    finally { if (activePageRead === task) activePageRead = null; }
+  }
+
+  async function readNoteInPageUnchecked(note = {}, task = {}) {
     if (!note?.noteId) return { ok: false, error: "缺少帖子 ID" };
     const originalScrollY = window.scrollY;
     const showProcess = Boolean(note.showProcess || note.process || note.batchSync);
@@ -2290,6 +2420,7 @@ const CONTENT_VERSION = "0.31.1";
       let detail = null;
       const startedAt = Date.now();
       while (Date.now() - startedAt < DETAIL_READY_TIMEOUT_MS) {
+        if (task.cancelled) return { ok: false, cancelled: true, error: "评论采集已停止" };
         detail = extractCurrentDetail(note);
         if (detail.ok && detail.note?.content) break;
         await waitFor(Date.now() - startedAt < 3000 ? 180 : 320);
@@ -2311,97 +2442,51 @@ const CONTENT_VERSION = "0.31.1";
         });
       }
 
-      let totalClicked = 0;
-      let commentRoot = detailRootForNote(detail.note) || document;
       const allComments = Boolean(note.allComments);
-      const commentScroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']");
-      const originalCommentScroll = Number(commentScroller?.scrollTop || 0);
-      let priorExtractedCount = -1;
-      let stagnantRounds = 0;
-      const collectedComments = new Map();
-      let largestExpectedCount = 0;
-      const collectSnapshot = () => {
-        const snapshot = commentUtils.extractComments(commentRoot, detail.note);
-        largestExpectedCount = Math.max(largestExpectedCount, Number(snapshot.expectedCount || 0));
-        for (const item of snapshot.comments || []) {
-          const key = item.commentId || [item.parentCommentId, item.author, item.content, item.publishedAt].join("\u001f");
-          collectedComments.set(key, { ...(collectedComments.get(key) || {}), ...item });
-        }
-        return snapshot;
+      const interruption = () => {
+        if (task.cancelled || isCommentLocatorSurface() || globalThis.__XHS_MONITOR_CONTENT_VERSION__ !== CONTENT_VERSION) return "cancelled";
+        const routeId = noteIdFromUrl(location.href);
+        if (routeId && routeId !== note.noteId) return "note_changed";
+        const root = detailRootForNote(detail.note);
+        if (!root?.isConnected) return "note_changed";
+        const explicitId = clean(root.getAttribute?.("note-id") || root.getAttribute?.("data-note-id"), 128);
+        if (explicitId && explicitId !== note.noteId) return "note_changed";
+        return "";
       };
-      collectSnapshot();
-      for (let round = 0; round < (allComments ? 60 : 4); round += 1) {
-        const buttons = commentUtils.expandableButtons(commentRoot).slice(0, 24);
-        buttons.forEach((button) => button.click());
-        totalClicked += buttons.length;
-        if (showProcess) updateProcessPanel({
-          process: true, noteId: note.noteId, phase: "comments",
-          title: `已展开 ${totalClicked} 组回复，继续读取评论`, note: detail.note,
-          commentCount: totalClicked
-        });
-        await waitFor(buttons.length ? 460 : 190);
-        commentRoot = detailRootForNote(detail.note) || commentRoot;
-        if (!allComments) {
-          if (!buttons.length) break;
-          continue;
+      let lastHeartbeatAt = 0;
+      const adapter = commentUtils.createCollectionAdapter(() => detailRootForNote(detail.note), detail.note, {
+        interruption,
+        onProgress(progress) {
+          // A bounded heartbeat keeps a long foreground/background read alive
+          // without rebuilding the sidebar or writing partial snapshots.
+          if (Date.now() - lastHeartbeatAt >= 5000) {
+            lastHeartbeatAt = Date.now();
+            sendRuntime({ type: "commentReadHeartbeat", noteId: note.noteId }).catch(() => {});
+          }
+          if (!showProcess || processPanel?.dataset.noteId !== note.noteId) return;
+          // Only update progress labels here, not all 21 fields / comment rows
+          // on every polling tick. This avoids UI churn while replies arrive.
+          const panel = processPanel;
+          const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
+          const count = panel.querySelector(`.${PROCESS_PANEL_CLASS}__comment-count`);
+          const total = progress.expectedCountKnown || progress.expectedCount > 0 ? progress.expectedCount : "?";
+          if (status) status.textContent = `评论 ${progress.count}/${total} 条${progress.pass > 1 ? ` · 第 ${progress.pass} 轮自动补读` : " · 正在展开与核验"}`;
+          if (count) count.textContent = `${progress.count} 条`;
         }
-        collectSnapshot();
-        stagnantRounds = collectedComments.size === priorExtractedCount ? stagnantRounds + 1 : 0;
-        priorExtractedCount = collectedComments.size;
-        const scroller = commentRoot.querySelector?.(".note-scroller, [class*='note-scroller'], [class*='comments-container']") || commentScroller;
-        let scrollExhausted = true;
-        if (scroller) {
-          const before = scroller.scrollTop;
-          scroller.scrollTop = Math.min(scroller.scrollHeight, before + Math.max(320, scroller.clientHeight * .78));
-          scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-          scrollExhausted = scroller.scrollTop === before
-            && before + scroller.clientHeight >= scroller.scrollHeight - 4;
-        }
-        const expandersExhausted = commentUtils.expandableButtons(commentRoot).length === 0;
-        if (expandersExhausted && scrollExhausted && stagnantRounds >= 2) break;
-        await waitFor(320);
-      }
+      });
+      let collection;
+      try { collection = await commentCollector.collect(adapter, { noteId: note.noteId, allComments }); }
+      finally { adapter.restore(); }
+      if (collection.interrupted) return { ok: false, cancelled: true, error: collection.commentError };
       const refreshed = extractCurrentDetail(detail.note);
       if (refreshed?.ok) detail = refreshed;
-      commentRoot = detailRootForNote(detail.note) || document;
-      const extracted = commentUtils.extractComments(commentRoot, detail.note);
-      for (const item of extracted.comments || []) {
-        const key = item.commentId || [item.parentCommentId, item.author, item.content, item.publishedAt].join("\u001f");
-        collectedComments.set(key, { ...(collectedComments.get(key) || {}), ...item });
-      }
-      const finalComments = allComments ? [...collectedComments.values()] : extracted.comments;
-      const expectedCount = Math.max(largestExpectedCount, Number(extracted.expectedCount || 0));
-      const remainingExpanders = commentUtils.expandableButtons(commentRoot).length;
-      const finalScroller = commentRoot.querySelector?.(
-        ".note-scroller, [class*='note-scroller'], [class*='comments-container']"
-      ) || commentScroller;
-      const scrollExhausted = !finalScroller
-        || finalScroller.scrollTop + finalScroller.clientHeight >= finalScroller.scrollHeight - 4;
-      const collectionEvidence = {
-        expandersExhausted: remainingExpanders === 0,
-        scrollExhausted,
-        stableRounds: stagnantRounds,
-        allCommentsRequested: allComments
-      };
-      const explicitEmptyVerified = allComments && finalComments.length === 0
-        && commentUtils.hasExplicitEmptyState(commentRoot)
-        && collectionEvidence.expandersExhausted;
-      const commentsWithIds = await ensureCommentIds(detail.note, finalComments || []);
-      const uniqueCommentCount = new Set(
-        commentsWithIds.map((item) => item.commentId).filter(Boolean)
-      ).size;
-      const collectionVerified = collectionEvidence.allCommentsRequested
-        && collectionEvidence.expandersExhausted
-        && collectionEvidence.scrollExhausted
-        && collectionEvidence.stableRounds >= 2;
-      const commentStatus = explicitEmptyVerified
-        ? "likely_complete"
-        : expectedCount > 0 && uniqueCommentCount >= expectedCount && collectionVerified
-          ? "likely_complete" : "partial";
-      if (allComments && commentScroller) commentScroller.scrollTop = originalCommentScroll;
+      if (interruption()) return { ok: false, cancelled: true, error: "当前帖子已切换，未写入本次采集" };
+      const commentsWithIds = await ensureCommentIds(detail.note, collection.comments);
       if (showProcess) updateProcessPanel({
         process: true, noteId: note.noteId, phase: "media",
-        title: `评论及 ID 已读取 ${commentsWithIds.length} 条，准备保存图片 / 视频素材`, note: detail.note,
+        title: collection.explicitEmptyVerified
+          ? "已核验：当前帖子暂无评论，准备保存素材"
+          : `评论及 ID 已读取 ${commentsWithIds.length} 条，准备保存图片 / 视频素材`, note: detail.note,
         commentCount: commentsWithIds.length,
         commentRows: commentsWithIds.slice(0, 12)
       });
@@ -2410,12 +2495,13 @@ const CONTENT_VERSION = "0.31.1";
         access: { state: "ok", marker: "detail_loaded" },
         note: sourceNoteSnapshot(detail.note),
         comments: commentsWithIds,
-        expectedCount,
-        explicitEmptyVerified,
-        collectionEvidence,
-        status: commentStatus,
-        commentError: commentStatus === "partial" ? `当前读取 ${commentsWithIds.length}/${expectedCount || "?"} 条，仍有回复未加载，可再次补采` : "",
-        expandedCount: totalClicked
+        expectedCount: collection.expectedCount,
+        expectedCountKnown: collection.expectedCountKnown,
+        explicitEmptyVerified: collection.explicitEmptyVerified,
+        collectionEvidence: collection.collectionEvidence,
+        status: collection.status,
+        commentError: collection.commentError,
+        expandedCount: collection.expandedCount
       };
     } catch (error) {
       if (showProcess) updateProcessPanel({
@@ -2431,8 +2517,10 @@ const CONTENT_VERSION = "0.31.1";
       // A user-triggered pull leaves the enlarged note visible so the Process
       // window and the exact source text/comments can be checked side by side.
       // Background deep reads keep the previous open/read/close behavior.
-      if (opened && !showProcess) await closeDetailInPage();
-      try { window.scrollTo({ top: originalScrollY, behavior: "auto" }); } catch (_error) { window.scrollTo(0, originalScrollY); }
+      if (!task.cancelled && !isCommentLocatorSurface() && currentDetailMatches(note)) {
+        if (opened && !showProcess) await closeDetailInPage();
+        try { window.scrollTo({ top: originalScrollY, behavior: "auto" }); } catch (_error) { window.scrollTo(0, originalScrollY); }
+      }
     }
   }
 
@@ -2509,10 +2597,11 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   function autoDetailEligible(note) {
-    return detailStore.needsDetail(note) && (detailRetryAt.get(note.noteId) || 0) <= Date.now();
+    return !isCommentLocatorSurface() && detailStore.needsDetail(note) && (detailRetryAt.get(note.noteId) || 0) <= Date.now();
   }
 
   async function performDeepScan(reason = "manual") {
+    if (isCommentLocatorSurface()) return { ok: false, skipped: true, reason: "comment_locator" };
     if (!isSearchPage()) return { ok: false, error: "深度补全仅支持小红书搜索结果页" };
     if (activeScan) await activeScan.catch(() => {});
     bridgeReady = true;
@@ -2814,6 +2903,7 @@ const CONTENT_VERSION = "0.31.1";
       };
     }
     let result;
+    const requestedGeneration = scanStatusGeneration;
     try {
       result = await sendRuntime({
         type: "scanPage",
@@ -2825,6 +2915,13 @@ const CONTENT_VERSION = "0.31.1";
       });
     } catch (error) {
       result = { ok: false, offline: true, statuses: [], error: error.message || "本地 Bridge 暂不可用" };
+    }
+    if (requestedGeneration !== scanStatusGeneration) {
+      // A pull/delete/config update happened after this request started. Its
+      // older answer must not repaint a freshly updated card as “未拉取”.
+      pendingScan = true;
+      return { ...(lastAutoScanResult || {}), ok: true, superseded: true,
+        notes, scannedCount: notes.length, statuses: lastAutoScanResult?.statuses || [] };
     }
     bridgeReady = Boolean(result?.ok);
     if (result?.ok) {
@@ -2851,6 +2948,7 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   function scan(reason = "auto") {
+    if (isCommentLocatorSurface()) return Promise.resolve({ ok: false, skipped: true, reason: "comment_locator" });
     if (activeScan) {
       pendingScan = true;
       return activeScan;
@@ -2868,11 +2966,13 @@ const CONTENT_VERSION = "0.31.1";
   }
 
   function scheduleScan(delay = 220) {
+    if (isCommentLocatorSurface()) return;
     clearTimeout(scanTimer);
     scanTimer = setTimeout(() => scan("auto").catch(() => {}), delay);
   }
 
   function scheduleDeepScan(delay = 700) {
+    if (isCommentLocatorSurface()) return;
     if (!bridgeReady || !config.enabled || !isSearchPage()) return;
     clearTimeout(deepScanTimer);
     deepScanTimer = setTimeout(async () => {
@@ -2923,7 +3023,57 @@ const CONTENT_VERSION = "0.31.1";
     scheduleDetailControl(35);
   }
 
+  let commentLocationTask = null;
+  async function locateCommentInPage({ note, comment } = {}) {
+    if (!isCommentLocatorSurface()) return { ok: false, error: "请从数据总览重新打开独立定位页" };
+    if (!note?.noteId || comment?.noteId !== note.noteId || !comment?.commentId) return { ok: false, error: "评论与帖子不匹配" };
+    commentLocationTask?.abort();
+    const controller = new AbortController();
+    commentLocationTask = controller;
+    clearTimeout(scanTimer); clearTimeout(deepScanTimer);
+    pendingScan = false; deepScanQueued = false;
+    const previousRead = activePageRead;
+    if (previousRead) previousRead.cancelled = true;
+    const isCurrent = () => !controller.signal.aborted && noteIdFromUrl(location.href) === note.noteId
+      && globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION;
+    const stop = () => controller.abort();
+    window.addEventListener("pagehide", stop, { once: true });
+    try {
+      // Wait until collector cleanup/restoration has finished before scrolling.
+      if (previousRead) await previousRead.promise.catch(() => {});
+      if (!isCurrent()) return { ok: false, error: "定位已取消" };
+      showPageToast("正在查找原评论；此页已暂停自动拉取");
+      const startedAt = Date.now();
+      let root;
+      while (isCurrent() && Date.now() - startedAt < DETAIL_READY_TIMEOUT_MS) {
+        const candidate = detailRootForNote(note);
+        const explicitId = candidate && (candidate.getAttribute("note-id") || candidate.getAttribute("data-note-id"));
+        if (candidate?.isConnected && (!explicitId || explicitId === note.noteId)
+          && candidate.querySelector(".comments-el, .comments-container, .comment-item, [data-comment-id]")) { root = candidate; break; }
+        await waitFor(120);
+      }
+      if (!isCurrent()) return { ok: false, error: "页面已切换，定位已停止" };
+      if (!root) throw new Error("评论区尚未就绪，请检查登录及帖子加载状态");
+      const result = await globalThis.XhsMonitorCommentLocator.locate({
+        root, noteId: note.noteId, comment, utils: commentUtils, signal: controller.signal,
+        isCurrent: () => isCurrent() && root.isConnected, timeoutMs: 30000, highlightMs: 60000
+      });
+      if (isCurrent()) showPageToast(result.ok ? "已定位并高亮原评论" : (result.message || "未找到原评论；可能尚未加载或当前不可见"), result.ok ? "success" : "error");
+      return { ...result, error: result.ok ? undefined : (result.message || "未找到原评论；未修改数据状态") };
+    } catch (error) {
+      if (isCurrent()) showPageToast(error.message, "error");
+      return { ok: false, error: error.message };
+    } finally {
+      window.removeEventListener("pagehide", stop);
+      if (commentLocationTask === controller) commentLocationTask = null;
+    }
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === "locateCommentInPage") {
+      locateCommentInPage(message).then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));
+      return true;
+    }
     if (message.type === "localNoteStateChanged") {
       const noteId = clean(message.noteId, 128);
       if (!noteId || (message.inExcel === true && message.consistencyVerified !== true)) return false;
@@ -3031,6 +3181,15 @@ const CONTENT_VERSION = "0.31.1";
       readNoteInPage(message.note || {}).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
       return true;
     }
+    if (message.type === "cancelCommentRead") {
+      if (activePageRead && (!message.noteId || activePageRead.noteId === message.noteId)) activePageRead.cancelled = true;
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message.type === "probeNoteAccess") {
+      sendResponse({ ok: true, access: pageAccessEvidence(message.note || {}) });
+      return false;
+    }
     if (message.type === "fillCommentReply") {
       fillCommentReply(message).then(sendResponse).catch((error) => sendResponse({ ok: false, error: error.message }));
       return true;
@@ -3071,6 +3230,7 @@ const CONTENT_VERSION = "0.31.1";
         title: message.title || "正在同步本地数据",
         done: Boolean(message.done),
         error: message.error || "",
+        syncAlert: message.syncAlert,
         pullStatus: message.pullStatus || "synced",
         commentCount: message.commentCount ?? note.commentCount ?? 0,
         commentRows: Array.isArray(message.commentRows) ? message.commentRows : undefined
@@ -3176,9 +3336,18 @@ const CONTENT_VERSION = "0.31.1";
     startFallbackNavigation();
   });
 
-  chrome.storage.onChanged.addListener((changes) => {
+  function onContentConfigChanged(changes, areaName) {
+    if (areaName && areaName !== "local") return;
+    // Batch progress, panel geometry and warning preferences are not scan
+    // inputs. Reacting to every storage write repeatedly scanned every tab.
+    if (!changes.targetKeywords && !changes.enabled) return;
     if (changes.targetKeywords) config.targetKeywords = changes.targetKeywords.newValue || DEFAULT_CONFIG.targetKeywords;
     if (changes.enabled) config.enabled = changes.enabled.newValue !== false;
-    scheduleScan();
-  });
+    scanStatusGeneration += 1;
+    lastAutoScanFingerprint = "";
+    lastAutoScanResult = null;
+    lastAutoScanFetchedAt = 0;
+    if (!isCommentLocatorSurface()) scheduleScan();
+  }
+  chrome.storage.onChanged.addListener(onContentConfigChanged);
 })();

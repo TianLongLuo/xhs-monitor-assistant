@@ -66,7 +66,7 @@ class V0183Tests(unittest.TestCase):
         root = Path(self.tmp.name)
         self.store = MonitorStore(root / "monitor.sqlite3", root / "exports", ai_client=FakeAI())
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), MediaHandler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         MediaHandler.counts = {"image": 0, "video": 0}
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -1246,7 +1246,8 @@ class V0183Tests(unittest.TestCase):
         self.assertIn("enforceExactNoteIdentity", worker)
         self.assertIn("identityConflictBlocked", content)
         self.assertIn("processPanelMutationIsInternal", content)
-        self.assertIn("outsideThreshold", content)
+        self.assertIn("processReservation.update", content)
+        self.assertNotIn('position = "overlay"', content)
         self.assertIn("_appliedGeometry", content)
         self.assertIn("batchFailureRenderSignature", panel)
         self.assertIn("ignoredNotes", worker)
@@ -1419,11 +1420,14 @@ class V0183Tests(unittest.TestCase):
         self.store.seed_from_xlsx(notes_path)
         self.assertEqual([], self.store.list_unreachable_notes())
         with self.store._session() as db:
-            self.assertEqual(("check_failed", "存在", 0), tuple(db.execute(
-                "SELECT access_status,post_status,is_deleted FROM notes WHERE note_id=?", (note_id,)
+            self.assertEqual(("ok", "opened", "存在", 0), tuple(db.execute(
+                "SELECT access_status,access_check_result,post_status,is_deleted FROM notes WHERE note_id=?", (note_id,)
             ).fetchone()))
+        repaired_row = next(row for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)
+                            if row["笔记ID"] == note_id)
+        self.assertEqual("可打开", repaired_row["访问状态"])
         migrated = self.store.reconcile_legacy_access_statuses()
-        self.assertEqual(1, migrated["updated"])
+        self.assertEqual(0, migrated["updated"])
 
         self.store.set_note_access_status({
             "noteId": note_id, "status": "unreachable", "error": "两条独立证据确认内容已删除",
@@ -1692,6 +1696,37 @@ class V0183Tests(unittest.TestCase):
         self.assertEqual("check_failed", db_states["accessreview123"])
         self.assertEqual("unreachable", db_states["accessgone123"])
 
+    def test_inconclusive_access_attempt_keeps_previous_verified_status(self):
+        notes_path, _comments_path = self._configure_csv("access-stable")
+        note_id = "accessstable123"
+        note = {"noteId": note_id, "title": "访问状态稳定帖子", "content": "正文"}
+        self.store.confirm(note)
+        self.store._sync_pull_to_xlsx(note, [], {"folder": "", "files": []})
+        opened = self.store.set_note_access_status({"noteId": note_id, "status": "ok"})
+        self.assertEqual("ok", opened["accessStatus"])
+
+        result = self.store.set_note_access_statuses({"items": [{
+            "noteId": note_id,
+            "status": "check_failed",
+            "result": "temporary_blocked",
+            "error": "页面短暂限流",
+        }]})
+        item = result["items"][0]
+        self.assertEqual({"ok": 1}, result["byStatus"])
+        self.assertEqual("ok", item["status"])
+        self.assertTrue(item["inconclusivePreserved"])
+        self.assertEqual("check_failed", item["attemptedStatus"])
+        self.assertEqual("temporary_blocked", item["attemptedResult"])
+
+        csv_row = next(row for row in self._csv_rows(notes_path, NOTE_CSV_HEADERS)
+                       if row["笔记ID"] == note_id)
+        self.assertEqual("可打开", csv_row["访问状态"])
+        with self.store._session() as db:
+            stored = db.execute(
+                "SELECT access_status,access_check_result,access_error FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        self.assertEqual(("ok", "opened", ""), tuple(stored))
+
     def test_data_overview_filters_all_note_and_comment_fields_on_verified_snapshot(self):
         notes_path, _comments_path = self._configure_csv("data-overview")
         notes = [
@@ -1726,6 +1761,9 @@ class V0183Tests(unittest.TestCase):
             "expectedCount": 3, "status": "likely_complete",
         })
         self.store._sync_pull_to_xlsx(thread_note, thread_comments, {"folder": "", "files": []})
+        # Complete the same CSV->SQLite round trip as production before asking
+        # for a fully verified snapshot (the CSV writer alone is not a sync).
+        self.store.seed_from_xlsx(notes_path)
         schema = self.store.data_overview_schema()
         self.assertTrue(schema["queryReady"])
         self.assertTrue(schema["health"]["summary"]["relationshipsConsistent"])
@@ -1737,7 +1775,7 @@ class V0183Tests(unittest.TestCase):
         self.assertTrue({"comment_id", "content", "post__title", "post__payload_json"}.issubset(comment_fields))
         comment_field_rows = schema["datasets"]["comments"]["fields"]
         self.assertEqual(
-            ["comment_id", "note_id", "post_locator", "thread_root_content", "content", "author", "published_at", "like_count",
+            ["comment_id", "note_id", "post_locator", "media_preview", "thread_root_content", "content", "author", "published_at", "ip_location", "like_count",
              "comment_level", "analysis_is_negative", "negative_type", "comment_status", "comment_type",
              "post__url", "post__title", "post__post_status"],
             [item["key"] for item in comment_field_rows if item["defaultVisible"]],
@@ -1792,7 +1830,8 @@ class V0183Tests(unittest.TestCase):
                 "field": "post_locator",
             })
         thread_result = self.store.query_data_overview({
-            "dataset": "comments", "snapshotToken": schema["snapshotToken"], "groupThreads": True,
+            "dataset": "comments", "snapshotToken": schema["snapshotToken"], "groupThreads": True, "threadSortMode": "root",
+            "sort": [{"field": "comment_id", "direction": "asc"}],
             "fields": ["comment_id", "thread_root_id", "thread_root_content", "thread_root_author", "content"],
             "filter": {"logic": "and", "children": [
                 {"field": "note_id", "operator": "eq", "value": thread_note["noteId"]},
@@ -1816,7 +1855,7 @@ class V0183Tests(unittest.TestCase):
             self.store.query_data_overview({"dataset": "notes", "snapshotToken": schema["snapshotToken"]})
 
     def test_data_overview_note_scope_excludes_discovery_and_includes_ignored(self):
-        self._configure_csv("data-overview-scope")
+        notes_path, _ = self._configure_csv("data-overview-scope")
         business = {
             "noteId": "overview-business-1", "url": "https://www.xiaohongshu.com/explore/overview-business-1",
             "title": "业务总表帖子", "content": "正文", "author": "作者", "detailRead": True,
@@ -1835,6 +1874,7 @@ class V0183Tests(unittest.TestCase):
         }
         self.store.confirm(business)
         self.store._sync_pull_to_xlsx(business, [], {"folder": "", "files": []})
+        self.store.seed_from_xlsx(notes_path)
         self.store.confirm(confirmed)
         self.store.confirm(ignored)
         self.store.ignore({"noteId": ignored["noteId"]})
@@ -1863,7 +1903,7 @@ class V0183Tests(unittest.TestCase):
                                           if row["note_id"] == ignored["noteId"]))
 
     def test_purge_untracked_discoveries_preserves_formal_and_ignored_records(self):
-        self._configure_csv("data-overview-purge")
+        notes_path, _ = self._configure_csv("data-overview-purge")
         business = {
             "noteId": "purge-business-1", "url": "https://www.xiaohongshu.com/explore/purge-business-1",
             "title": "正式记录", "content": "正文", "author": "作者", "detailRead": True,
@@ -1878,6 +1918,7 @@ class V0183Tests(unittest.TestCase):
         }
         self.store.confirm(business)
         self.store._sync_pull_to_xlsx(business, [], {"folder": "", "files": []})
+        self.store.seed_from_xlsx(notes_path)
         self.store.confirm(ignored)
         self.store.ignore({"noteId": ignored["noteId"]})
         self.store.confirm(discovery)

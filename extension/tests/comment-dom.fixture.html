@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'none'; style-src 'unsafe-inline'; connect-src 'none'">
+<title>评论采集 DOM 回归测试</title>
+<style>
+body{font:14px system-ui;margin:28px;color:#17212e;background:#f5f6f8}button{padding:10px 16px}li{padding:5px}
+#mount{position:fixed;right:24px;top:24px;width:440px;background:white;border:1px solid #ccc;padding:12px}
+.fixture-root{max-height:400px;overflow-y:auto}.comment-item{padding:12px;border-bottom:1px solid #ddd}
+.avatar img{width:16px;height:16px}.pictures img{width:72px;height:64px}.comment-item-sub{margin-left:24px}
+.total{padding:12px}.date{font-size:11px;color:#677}.name{font-weight:600}.content{padding:8px 0}
+#results{max-width:calc(100% - 500px)}[data-status=failed]{color:#b21c2e}[data-status=passed]{color:#168146}
+</style>
+<h1>评论采集 DOM 回归测试</h1><p>只使用合成页面，不连接平台或本地业务数据库。</p>
+<button id="run">运行 DOM 回归测试</button><p id="summary" role="status">等待运行</p>
+<p id="metrics" aria-label="实测耗时"></p>
+<ol id="results"></ol><div id="mount"></div>
+<script src="../location-utils.js"></script><script src="../comment-utils.js"></script><script src="../comment-collector.js"></script>
+<script src="comment-dom.fixture.js"></script></html>
