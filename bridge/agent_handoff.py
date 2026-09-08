@@ -131,8 +131,12 @@ class Client:
 
 
 def validate_submission(payload):
-    if not isinstance(payload, dict) or set(payload) != {"batchId", "agent", "model", "items"}:
-        raise HandoffError("结果 JSON 须且仅含 batchId、agent、model、items。")
+    required_root = {"batchId", "agent", "model", "items"}
+    if (not isinstance(payload, dict) or not required_root <= set(payload)
+            or not set(payload) <= required_root | {"mode"}):
+        raise HandoffError("结果 JSON 须含 batchId、agent、model、items，仅可另含 mode。")
+    if payload.get("mode", "analyze") not in ("analyze", "fillMissingCategories"):
+        raise HandoffError("mode 仅允许 analyze 或 fillMissingCategories；省略时为 analyze。")
     for key in ("batchId", "agent", "model"):
         if not isinstance(payload[key], str) or not payload[key].strip():
             raise HandoffError(f"{key} 须为非空字符串；未知身份填写 unknown。")
@@ -154,15 +158,10 @@ def validate_submission(payload):
         if item["targetType"] not in ("note", "comment") or item["analysisIsNegative"] not in ("是", "否", "待复核"):
             raise HandoffError("目标类型或语义结论不合法。")
         for key in ("negativeType", "negativeSubtype"):
-            if not isinstance(item[key], str):
-                raise HandoffError(f"{key} 须为字符串。")
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise HandoffError(f"{key} 在是/否/待复核三种结论下均须为非空字符串。")
         if not isinstance(item["evidence"], list) or any(not isinstance(v, str) or not v for v in item["evidence"]):
             raise HandoffError("evidence 须为非空原文子串组成的数组；无证据时可为空数组并标待复核。")
-        if item["analysisIsNegative"] == "是":
-            if not item["negativeType"].strip():
-                raise HandoffError("差评结论为是时 negativeType 必填。")
-        elif item["negativeType"] != "" or item["negativeSubtype"] != "":
-            raise HandoffError("否/待复核的 negativeType 和 negativeSubtype 必须为空字符串。")
         if item["analysisIsNegative"] != "待复核" and not item["evidence"]:
             raise HandoffError("是/否结论至少提供一条原文证据。")
         identity = (item["targetType"], item["targetId"])
@@ -181,10 +180,20 @@ def absolute_path(value):
     return path
 
 
-def pending(client, limit):
-    result = client.post("pending", {"limit": limit})
+def pending(client, limit, mode="analyze"):
+    if mode not in ("analyze", "fillMissingCategories"):
+        raise HandoffError("未知导出模式。")
+    request = {"limit": limit}
+    if mode != "analyze":
+        request["mode"] = mode
+    result = client.post("pending", request)
     if result.get("protocolVersion") != 1 or not isinstance(result.get("items"), list):
         raise HandoffError("pending 协议版本不兼容；请升级配套 Bridge/CLI。")
+    policy = result.get("classificationPolicyVersion")
+    if type(policy) is not int or policy < 2:
+        raise HandoffError("classificationPolicyVersion 须 >=2；请主 agent 升级运行中的 Bridge 后继续。")
+    if result.get("mode", "analyze") != mode:
+        raise HandoffError("pending 返回模式与请求不一致；停止而不混用批次。")
     if result["items"] and not result.get("batchId"):
         raise HandoffError("pending 缺少 batchId。")
     for key in ("pendingCount", "excludedCount", "needsReviewCount"):
@@ -192,6 +201,15 @@ def pending(client, limit):
             raise HandoffError(f"pending 缺少有效 {key}；不据此宣告任务完成。")
     if len(result["items"]) > limit or any(not isinstance(item, dict) for item in result["items"]):
         raise HandoffError("pending 返回不合法批次。")
+    if mode == "fillMissingCategories":
+        for item in result["items"]:
+            current = item.get("currentAnalysis")
+            if (not isinstance(current, dict)
+                    or set(current) != {"analysisIsNegative", "negativeType", "negativeSubtype"}
+                    or current.get("analysisIsNegative") not in ("是", "否", "待复核")
+                    or any(not isinstance(current.get(key), str) for key in ("negativeType", "negativeSubtype"))
+                    or all(current[key].strip() for key in ("negativeType", "negativeSubtype"))):
+                raise HandoffError("补齐批次须提供有效 currentAnalysis，且既有结论非空、至少一个分类为空。")
     return result
 
 
@@ -204,6 +222,8 @@ def main(argv=None):
     export = subs.add_parser("export")
     export.add_argument("--out", required=True)
     export.add_argument("--limit", type=int, default=25, choices=range(1, 26))
+    export.add_argument("--fill-missing-categories", action="store_true",
+                        help="显式导出已有结论但缺类型/子类型的历史记录，仅补空分类")
     submit = subs.add_parser("submit")
     submit.add_argument("--input", required=True)
     for name in ("status", "verify"):
@@ -216,19 +236,22 @@ def main(argv=None):
         if args.command == "doctor":
             result = pending(client, 1)
             result = {"ok": True, "protocolVersion": 1, "baseUrl": client.base_url,
+                      "classificationPolicyVersion": result["classificationPolicyVersion"],
                       "pendingCount": result.get("pendingCount"), "excludedCount": result.get("excludedCount"),
-                      "needsReviewCount": result.get("needsReviewCount"), "probeBatchId": result.get("batchId")}
+                      "needsReviewCount": result.get("needsReviewCount"), "invalidConclusionCount": result.get("invalidConclusionCount"), "probeBatchId": result.get("batchId")}
         elif args.command == "export":
             output = absolute_path(args.out)
             if output.exists():
                 raise HandoffError("导出目标已存在；请使用独立新文件，禁止覆盖。")
-            result = pending(client, args.limit)
+            mode = "fillMissingCategories" if args.fill_missing_categories else "analyze"
+            result = pending(client, args.limit, mode)
             with output.open("x", encoding="utf-8") as stream:
                 json.dump(result, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
             result = {"ok": True, "out": str(output), "batchId": result.get("batchId"),
+                      "mode": mode, "classificationPolicyVersion": result["classificationPolicyVersion"],
                       "itemCount": len(result["items"]), "pendingCount": result.get("pendingCount"),
-                      "excludedCount": result.get("excludedCount"), "needsReviewCount": result.get("needsReviewCount")}
+                      "excludedCount": result.get("excludedCount"), "needsReviewCount": result.get("needsReviewCount"), "invalidConclusionCount": result.get("invalidConclusionCount")}
         elif args.command == "submit":
             path = absolute_path(args.input)
             if path.stat().st_size > MAX_BYTES:

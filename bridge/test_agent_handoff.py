@@ -15,11 +15,11 @@ def submission():
     return {"batchId": "fixture-batch", "agent": "unknown", "model": "unknown", "items": [{
         "targetType": "comment", "targetId": "comment-fixture", "noteId": "fixture-note",
         "sourceHash": "fixture-hash", "analysisRevision": "a" * 64, "analysisIsNegative": "否",
-        "negativeType": "", "negativeSubtype": "", "reason": "中性询问", "evidence": ["多少钱？"]}]}
+        "negativeType": "信息咨询", "negativeSubtype": "价格询问", "reason": "中性询问", "evidence": ["多少钱？"]}]}
 
 
 def exported():
-    return {"protocolVersion": 1, "batchId": "fixture-batch", "items": [],
+    return {"protocolVersion": 1, "classificationPolicyVersion": 2, "batchId": "fixture-batch", "items": [],
             "pendingCount": 0, "excludedCount": 2, "needsReviewCount": 1}
 
 
@@ -168,16 +168,80 @@ class PayloadTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(cli.HandoffError): cli.validate_submission(value)
 
     def test_classification_constraints(self):
-        for changes in ({"analysisIsNegative": "是"}, {"evidence": []}, {"negativeType": "产品"},
-                        {"analysisIsNegative": "待复核", "negativeSubtype": "未知"}, {"reason": "  "}):
+        for changes in ({"analysisIsNegative": ""}, {"evidence": []}, {"negativeType": ""},
+                        {"analysisIsNegative": "待复核", "negativeSubtype": " "}, {"reason": "  "}):
             value = submission()
             value["items"][0].update(changes)
             with self.subTest(changes=changes), self.assertRaises(cli.HandoffError): cli.validate_submission(value)
         value = submission()
         value["items"][0].update(analysisIsNegative="待复核", evidence=[])
         cli.validate_submission(value)
-        value["items"][0].update(analysisIsNegative="是", negativeType="服务体验", evidence=["态度差"])
+        value["items"][0].update(analysisIsNegative="是", negativeType="服务体验", negativeSubtype="服务态度", evidence=["态度差"])
         cli.validate_submission(value)
+
+    def test_all_three_conclusions_require_both_nonblank_categories(self):
+        for conclusion in ("是", "否", "待复核"):
+            for field in ("negativeType", "negativeSubtype"):
+                for invalid in ("", " \t\n", None, 1, [], {}):
+                    value = submission()
+                    value["items"][0].update(analysisIsNegative=conclusion)
+                    value["items"][0][field] = invalid
+                    with self.subTest(conclusion=conclusion, field=field, invalid=invalid), self.assertRaises(cli.HandoffError):
+                        cli.validate_submission(value)
+        value = submission()
+        value["items"][0].update(analysisIsNegative="待复核", negativeType="待复核",
+                                negativeSubtype="上下文缺失", reason="缺少所指对象的上下文", evidence=[])
+        cli.validate_submission(value)
+
+    def test_modes_are_optional_default_analyze_and_payload_is_unchanged(self):
+        for mode in (None, "analyze", "fillMissingCategories"):
+            value = submission()
+            if mode is not None: value["mode"] = mode
+            before = copy.deepcopy(value)
+            cli.validate_submission(value)
+            self.assertEqual(before, value)
+        for invalid in ("", "repair", False, None, [], {}):
+            value = {**submission(), "mode": invalid}
+            with self.subTest(mode=invalid), self.assertRaises(cli.HandoffError): cli.validate_submission(value)
+
+    def test_current_analysis_is_read_only_and_never_accepted_in_submission(self):
+        value = {**submission(), "mode": "fillMissingCategories"}
+        value["items"][0]["currentAnalysis"] = {"analysisIsNegative": "否", "negativeType": "", "negativeSubtype": ""}
+        with self.assertRaises(cli.HandoffError): cli.validate_submission(value)
+
+    def test_legacy_category_vocabulary_is_not_normalized(self):
+        for category in ("Neutral", "Positive", "seeding", " Neutral "):
+            value = {**submission(), "mode": "fillMissingCategories"}
+            value["items"][0].update(negativeType=category, negativeSubtype="seeding")
+            before = copy.deepcopy(value)
+            cli.validate_submission(value)
+            self.assertEqual(before, value)
+
+    def test_pending_backfill_requires_matching_mode_and_current_analysis(self):
+        current = {"analysisIsNegative": "否", "negativeType": "历史非空类型", "negativeSubtype": ""}
+        result = {**exported(), "mode": "fillMissingCategories", "pendingCount": 1,
+                  "items": [{"currentAnalysis": current}]}
+        client = Mock(); client.post.return_value = result
+        before = copy.deepcopy(result)
+        self.assertEqual(result, cli.pending(client, 25, "fillMissingCategories"))
+        self.assertEqual(before, result)
+        client.post.assert_called_once_with("pending", {"limit": 25, "mode": "fillMissingCategories"})
+        for invalid in (None, {}, {**current, "analysisIsNegative": ""},
+                        {**current, "negativeSubtype": "已有子类型"}, {**current, "negativeType": None}):
+            client.post.return_value = {**result, "items": [{"currentAnalysis": invalid}]}
+            with self.subTest(current=invalid), self.assertRaises(cli.HandoffError): cli.pending(client, 25, "fillMissingCategories")
+        client.post.return_value = exported()
+        with self.assertRaises(cli.HandoffError): cli.pending(client, 25, "fillMissingCategories")
+        client.post.return_value = result
+        with self.assertRaises(cli.HandoffError): cli.pending(client, 25)
+
+    def test_policy_version_gate_rejects_legacy_and_malformed_values(self):
+        for policy in (None, 0, 1, True, "2", 2.0):
+            client = Mock(); client.post.return_value = {**exported(), "classificationPolicyVersion": policy}
+            with self.subTest(policy=policy), self.assertRaisesRegex(cli.HandoffError, "classificationPolicyVersion"):
+                cli.pending(client, 1)
+        client.post.return_value = {**exported(), "classificationPolicyVersion": 3}
+        self.assertEqual(3, cli.pending(client, 1)["classificationPolicyVersion"])
 
     def test_pending_protocol_and_counts_required(self):
         for changes in ({"protocolVersion": 2}, {"pendingCount": None}, {"pendingCount": False}, {"items": [None]}):
@@ -199,6 +263,7 @@ class CommandTests(unittest.TestCase):
         code, output, _ = self.invoke(["doctor"], client)
         self.assertEqual(0, code)
         self.assertEqual(0, json.loads(output)["pendingCount"])
+        self.assertEqual(2, json.loads(output)["classificationPolicyVersion"])
         client.post.assert_called_once_with("pending", {"limit": 1})
 
     def test_export_new_absolute_file_only(self):
@@ -211,6 +276,35 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(2, self.invoke(["export", "--out", str(target)], client)[0])
             self.assertEqual(1, client.post.call_count)
         self.assertEqual(2, self.invoke(["export", "--out", "relative.json"], client)[0])
+
+    def test_explicit_backfill_export_keeps_read_only_context_and_mode(self):
+        client = Mock()
+        result = {**exported(), "mode": "fillMissingCategories", "pendingCount": 1,
+                  "items": [{"currentAnalysis": {"analysisIsNegative": "否", "negativeType": "信息咨询", "negativeSubtype": ""}}]}
+        client.post.return_value = result
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder).resolve() / "fill.json"
+            code, output, _ = self.invoke(["export", "--fill-missing-categories", "--out", str(target)], client)
+            self.assertEqual(0, code)
+            self.assertEqual(result, json.loads(target.read_text(encoding="utf-8")))
+            self.assertEqual("fillMissingCategories", json.loads(output)["mode"])
+            client.post.assert_called_once_with("pending", {"limit": 25, "mode": "fillMissingCategories"})
+
+    def test_doctor_stops_on_old_policy(self):
+        client = Mock(); client.post.return_value = {**exported(), "classificationPolicyVersion": 1}
+        code, output, error = self.invoke(["doctor"], client)
+        self.assertEqual(2, code); self.assertEqual("", output)
+        self.assertIn("classificationPolicyVersion", error)
+
+    def test_doctor_accepts_explicit_analyze_policy_two_protocol_one(self):
+        client = Mock(base_url=cli.DEFAULT_BASE_URL)
+        client.post.return_value = {**exported(), "mode": "analyze", "classificationPolicyVersion": 2}
+        code, output, error = self.invoke(["doctor"], client)
+        self.assertEqual(0, code)
+        self.assertEqual("", error)
+        self.assertEqual(1, json.loads(output)["protocolVersion"])
+        self.assertEqual(2, json.loads(output)["classificationPolicyVersion"])
+        client.post.assert_called_once_with("pending", {"limit": 1})
 
     def test_submit_reads_independent_json(self):
         client = Mock()

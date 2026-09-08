@@ -70,6 +70,8 @@ def export_filtered_workbook(store, source: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise ValueError("导出条件格式无效")
     payload = copy.deepcopy(source)
+    payload.pop("useReadSession", None)
+    payload.pop("readSessionId", None)
     dataset = payload.get("dataset")
     token = payload.get("snapshotToken")
     expected = payload.pop("expectedTotal", None)

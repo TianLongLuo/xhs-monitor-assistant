@@ -64,11 +64,19 @@ def item_for(db, kind, target_id):
             'sourceHash': digest(context), 'analysisRevision': digest(revision)}, row, note
 
 
+def analysis_mode(payload):
+    mode = payload.get('mode', 'analyze')
+    if mode not in ('analyze', 'fillMissingCategories'):
+        raise ValueError('mode 必须为 analyze 或 fillMissingCategories')
+    return mode
+
+
 def pending(store, payload):
+    mode = analysis_mode(payload)
     limit = payload.get('limit', 25)
     if type(limit) is not int or not 1 <= limit <= 25:
         raise ValueError('limit 必须为 1–25 的整数')
-    items, total, excluded, review = [], 0, 0, 0
+    items, total, excluded, review, invalid = [], 0, 0, 0, 0
     selected_note = None
     with store.pull_lock, store.lock, store._session() as db:
         notes = {r['note_id']: dict(r) for r in db.execute('SELECT * FROM notes ORDER BY note_id')}
@@ -80,18 +88,30 @@ def pending(store, payload):
                 if not eligible(note, row):
                     excluded += 1
                     continue
-                conclusion = str(row.get('analysis_is_negative') or '').strip()
+                raw_conclusion = row.get('analysis_is_negative') or ''
+                conclusion = str(raw_conclusion).strip()
+                if conclusion and raw_conclusion not in ('是', '否', '待复核'):
+                    invalid += 1
+                    continue
                 review += int(conclusion == '待复核')
-                if conclusion:
+                if mode == 'fillMissingCategories':
+                    if conclusion not in ('是', '否', '待复核') or all(str(row.get(k) or '').strip() for k in ('negative_type', 'negative_subtype')):
+                        continue
+                elif conclusion:
                     continue
                 total += 1
                 if selected_note is None:
                     selected_note = row['note_id']
                 if row['note_id'] == selected_note and len(items) < limit:
                     key = 'note_id' if kind == 'note' else 'comment_id'
-                    items.append(item_for(db, kind, row[key])[0])
-    return {'ok': True, 'protocolVersion': 1, 'batchId': str(uuid.uuid4()), 'items': items,
-            'pendingCount': total, 'excludedCount': excluded, 'needsReviewCount': review}
+                    item = item_for(db, kind, row[key])[0]
+                    if mode == 'fillMissingCategories':
+                        item['currentAnalysis'] = dict(zip(('analysisIsNegative', 'negativeType', 'negativeSubtype'),
+                                                          (row.get(k) or '' for k in FIELDS[1:])))
+                    items.append(item)
+    return {'ok': True, 'protocolVersion': 1, 'classificationPolicyVersion': 2, 'mode': mode,
+            'batchId': str(uuid.uuid4()), 'items': items,
+            'pendingCount': total, 'excludedCount': excluded, 'needsReviewCount': review, 'invalidConclusionCount': invalid}
 
 
 def batch_id(payload):
@@ -144,6 +164,7 @@ def verify(store, payload):
 
 
 def submit(store, payload):
+    mode = analysis_mode(payload)
     bid = batch_id(payload)
     request_hash = digest(payload)
     entries = payload.get('items')
@@ -173,8 +194,14 @@ def submit(store, payload):
                     raise ValueError('对象 ID 无效或重复')
                 seen.add((kind, tid))
                 item, row, note = item_for(db, kind, tid)
-                if not eligible(note, row) or str(row['analysis_is_negative'] or '').strip():
-                    raise ValueError('对象已删除、忽略或已有结论；禁止覆盖')
+                existing = str(row['analysis_is_negative'] or '').strip()
+                if not eligible(note, row):
+                    raise ValueError('对象已删除或忽略；禁止覆盖')
+                if mode == 'fillMissingCategories':
+                    if row['analysis_is_negative'] not in ('是', '否', '待复核') or all(str(row.get(k) or '').strip() for k in ('negative_type', 'negative_subtype')):
+                        raise ValueError('补齐模式只处理已有结论且分类缺项的对象；禁止覆盖')
+                elif existing:
+                    raise ValueError('对象已有结论；禁止覆盖')
                 if any(entry.get(key) != item[key] for key in ('noteId', 'sourceHash', 'analysisRevision')):
                     raise ValueError('分析期间原文、上下文或结论已变化，请重新导出并分析')
                 value = entry.get('analysisIsNegative')
@@ -183,10 +210,14 @@ def submit(store, payload):
                 for key, maximum in (('negativeType', 1000), ('negativeSubtype', 2000), ('reason', 8000)):
                     if not isinstance(entry.get(key), str) or len(entry[key]) > maximum:
                         raise ValueError(f'{key} 缺失或超长')
-                if not entry['reason'].strip() or (value == '是' and not entry['negativeType'].strip()):
-                    raise ValueError('必须提供判断理由，差评必须提供类型')
-                if value != '是' and (entry['negativeType'] or entry['negativeSubtype']):
-                    raise ValueError('非差评与待复核的差评类型、子类型必须为空')
+                if not all(entry[k].strip() for k in ('reason', 'negativeType', 'negativeSubtype')):
+                    raise ValueError('必须提供判断理由、类型和子类型；信息不足应明确填写待复核及缺失信息')
+                if mode == 'fillMissingCategories':
+                    if value != row['analysis_is_negative']:
+                        raise ValueError('补齐分类不得修改原语义结论')
+                    for incoming, stored in (('negativeType', 'negative_type'), ('negativeSubtype', 'negative_subtype')):
+                        if str(row.get(stored) or '').strip() and entry[incoming] != row[stored]:
+                            raise ValueError('补齐分类不得覆盖已有类型或子类型')
                 evidence = entry.get('evidence')
                 texts = [str(v or '') for section in ('source', 'noteContext', 'parentContext')
                          for k, v in item[section].items() if k in ('title', 'content')]
@@ -204,11 +235,22 @@ def submit(store, payload):
         note_id = next(iter(note_ids))
         store._verify_note_store_consistency(note_id, media_dir, verify_fields=True)
         assert_material_ids(store, note_id, media_dir)
-        checkpoint = store._capture_sync_checkpoint(note_id)
+        checkpoint = None
         try:
-            checkpoint['externalAnalysisBatch'] = bid
-            store._persist_sync_checkpoint(checkpoint)
             with store._session() as db:
+                # Recheck inside the actual write transaction. A foreign change
+                # before this point must be rejected, not overwritten by an old
+                # prepared value or restored away by checkpoint rollback.
+                db.execute('BEGIN IMMEDIATE')
+                for entry in prepared:
+                    current, current_row, current_note = item_for(db, entry['targetType'], entry['targetId'])
+                    if (not eligible(current_note, current_row)
+                        or any(entry[k] != current[k] for k in ('noteId', 'sourceHash', 'analysisRevision'))
+                        or [current_row[k] for k in FIELDS] != entry['before']):
+                        raise ValueError('提交前数据已变化，请重新导出；未覆盖其他写入')
+                checkpoint = store._capture_sync_checkpoint(note_id)
+                checkpoint['externalAnalysisBatch'] = bid
+                store._persist_sync_checkpoint(checkpoint)
                 for entry in prepared:
                     table, key = ('notes', 'note_id') if entry['targetType'] == 'note' else ('comments', 'comment_id')
                     db.execute(f'UPDATE {table} SET semantic_analysis_count=?,analysis_is_negative=?,negative_type=?,negative_subtype=? WHERE {key}=?',
@@ -237,6 +279,7 @@ def submit(store, payload):
             assert_material_ids(store, note_id, media_dir)
             receipt = {'ok': True, 'protocolVersion': 1, 'batchId': bid, 'noteId': note_id,
                        'status': 'committed', 'updatedCount': len(prepared), 'verified': True,
+                       'classificationPolicyVersion': 2, 'mode': mode,
                        'committedAt': datetime.now(timezone.utc).isoformat()}
             with store._session() as db:
                 db.execute('INSERT INTO external_analysis_batches VALUES(?,?,?,?,?)',
@@ -244,6 +287,8 @@ def submit(store, payload):
                             encoded({'agent': payload['agent'], 'model': payload['model'], 'items': prepared}),
                             receipt['committedAt']))
         except Exception:
+            if checkpoint is None:
+                raise
             failures = store._rollback_sync_checkpoints([checkpoint])
             if failures:
                 raise RuntimeError('分析写入回滚未完成，请先恢复：' + '；'.join(failures))

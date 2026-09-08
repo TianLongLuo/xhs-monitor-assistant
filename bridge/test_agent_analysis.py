@@ -22,7 +22,7 @@ class AgentAnalysisTests(unittest.TestCase):
         batch = api.pending(self.store, {'limit': 25})
         return {'batchId': batch['batchId'], 'agent': 'fixture', 'model': 'fixture', 'items': [
             {k: v for k, v in item.items() if k not in ('source', 'noteContext', 'parentContext')} |
-            {'analysisIsNegative': '否', 'negativeType': '', 'negativeSubtype': '',
+            {'analysisIsNegative': '否', 'negativeType': 'Neutral', 'negativeSubtype': '中性陈述',
              'reason': 'Fixture reason', 'evidence': [item['source']['content']]}
             for item in batch['items']]}
 

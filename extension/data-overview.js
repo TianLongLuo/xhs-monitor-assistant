@@ -79,7 +79,7 @@ const drawerGallery = globalThis.XhsMonitorOverviewMedia?.create({
 const COMMENT_ACTION_FIELD = "__overview_comment_actions";
 const COMMENT_ACTION_COLUMN = Object.freeze({ key: COMMENT_ACTION_FIELD, label: "操作", dataType: "text", action: "locate_comment" });
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
-const DATA_OVERVIEW_VERSION = "0.34.14";
+const DATA_OVERVIEW_VERSION = "0.34.16";
 const INFINITE_BATCH_SIZE = 100;
 const TIME_COLUMNS = {
   published_at: ["published_at_raw", "published_at_precision", "published_at_status"],
@@ -1576,7 +1576,8 @@ function renderInfiniteState(forcedState = "") {
     elements.pageMeta.textContent = `已保留 ${state.rows.length} 条当前记录 · 数据有更新，等待手动刷新`;
     return;
   }
-  elements.pageMeta.textContent = `已加载 ${state.rows.length.toLocaleString("zh-CN")} / ${state.total.toLocaleString("zh-CN")} 条`;
+  elements.pageMeta.textContent = `已加载 ${state.rows.length.toLocaleString("zh-CN")} / ${state.total.toLocaleString("zh-CN")} 条`
+    + (overviewReadSessions.has(overviewReadSessionKey(queryPayload())) ? " · 浏览快照，更新数据查看最新" : "");
   if (!state.rows.length) {
     elements.infiniteSentinel.hidden = true;
     return;
@@ -1594,6 +1595,119 @@ function renderInfiniteState(forcedState = "") {
   } else {
     elements.infiniteSentinel.dataset.state = "done";
     elements.loadMoreText.textContent = `已加载全部 ${state.total.toLocaleString("zh-CN")} 条`;
+  }
+}
+
+// Browse-only session handles are never persisted or sent to export/delete/detail.
+const overviewReadSessions = new Map();
+function overviewReadSessionKey(payload) {
+  const { page, ...query } = payload;
+  return JSON.stringify(query);
+}
+function rememberOverviewReadSession(payload, result) {
+  const key = overviewReadSessionKey(payload);
+  overviewReadSessions.delete(key);
+  if (result.readSessionId) overviewReadSessions.set(key, result.readSessionId);
+  while (overviewReadSessions.size > 4) overviewReadSessions.delete(overviewReadSessions.keys().next().value);
+}
+async function requestOverviewPage(payload, sessionId = "", supported = state.schema?.browsingSnapshotSupported) {
+  const useSession = supported === true && payload.semanticSearch !== true;
+  const request = useSession ? { ...payload, useReadSession: true, ...(sessionId ? { readSessionId: sessionId } : {}) } : payload;
+  const result = await sendRuntime({ type: "queryDataOverview", payload: request });
+  if (result.readSessionId && (!useSession || typeof result.readSessionId !== "string"
+      || result.readSessionId.length > 128 || (sessionId && result.readSessionId !== sessionId)
+      || result.browsingSnapshot !== true || result.consistentSnapshot !== true
+      || result.snapshotToken !== payload.snapshotToken || result.dataset !== payload.dataset
+      || Number(result.page) !== payload.page || Number(result.pageSize) !== payload.pageSize)) {
+    throw new Error("浏览快照响应不一致，请重新校验后查询");
+  }
+  if (sessionId && !result.readSessionId) throw new Error("浏览快照已过期，请重新校验后查询");
+  return result;
+}
+
+// Revalidate reads without combining pages from different database snapshots.
+// No delete/export is retried here, and no editor or selected-row intent is reset.
+async function recoverQuerySnapshot(payload, requestedPage, append, serial) {
+  if (state.snapshotRefreshing || state.deletePending || state.exporting || state.selectedIds.size
+      || columnFilterDraft || filterDraftProblem() || !elements.recordDrawer.hidden
+      || elements.refreshSchema.disabled) return false;
+  const requestKey = JSON.stringify(payload);
+  const current = () => serial === state.querySerial && !state.resetScheduled && !state.queryPending
+    && !state.semanticAwaitingSubmit && !columnFilterDraft && !state.deletePending && !state.exporting
+    && !state.selectedIds.size && elements.recordDrawer.hidden && JSON.stringify(queryPayload(requestedPage)) === requestKey;
+  if (!current()) return false;
+  state.snapshotRefreshing = true;
+  state.snapshotStale = true;
+  elements.snapshotNotice.hidden = true;
+  elements.refreshSchema.disabled = true;
+  elements.exportCurrent.disabled = true;
+  updateSelectionUi();
+  elements.pageMeta.textContent = "数据有更新，正在校验并恢复当前位置…";
+  try {
+    const schema = await sendRuntime({ type: "getDataOverviewSchema" });
+    if (!current()) return false;
+    if (schema.queryReady !== true || !schema.snapshotToken) throw new Error(healthIssueText(schema.health));
+    const token = schema.snapshotToken;
+    const freshRows = [], ids = new Set();
+    let first = null, total = 0, lastPage = 0, targetPages = append ? requestedPage : 1;
+      let replacementSession = "";
+    for (let page = 1; page <= targetPages; page += 1) {
+      const result = await requestOverviewPage({ ...payload, snapshotToken: token, page }, replacementSession, schema.browsingSnapshotSupported);
+        replacementSession = result.readSessionId || "";
+      if (!current()) return false;
+      if (result.consistentSnapshot !== true || result.snapshotToken !== token || result.dataset !== payload.dataset
+          || Number(result.page) !== page || Number(result.pageSize) !== payload.pageSize || !Array.isArray(result.rows)
+          || !Number.isSafeInteger(Number(result.total)) || Number(result.total) < 0
+          || (payload.semanticSearch && result.semantic?.mode !== "embedding")) {
+        throw new Error("自动更新的快照或分页校验未通过");
+      }
+      if (!first) {
+        first = result; total = Number(result.total);
+        targetPages = Math.min(targetPages, Math.max(1, Math.ceil(total / payload.pageSize)));
+      }
+      if (Number(result.total) !== total || result.rows.length !== Math.max(0, Math.min(payload.pageSize, total - (page - 1) * payload.pageSize))) {
+        throw new Error("自动更新期间记录数量发生变化，已保留原表格");
+      }
+      for (const row of result.rows) {
+        const id = recordIdentity(row, payload.dataset);
+        if (!id || ids.has(id)) throw new Error("自动更新发现缺失或重复 ID，已保留原表格");
+        ids.add(id); freshRows.push(row);
+      }
+      lastPage = page;
+    }
+    // Keep the latest scroll position if the user scrolled while revalidation
+    // was running; preserve a visible record anchor when rows above it changed.
+    const viewport = elements.tableViewport;
+    const top = viewport.scrollTop, left = viewport.scrollLeft;
+    const windowTop = window.scrollY || 0, windowLeft = window.scrollX || 0;
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const headerBottom = elements.tableHead.getBoundingClientRect().bottom;
+    const anchor = append ? [...elements.tableBody.children].find(row =>
+      row.dataset.recordId && row.getBoundingClientRect().bottom > Math.max(viewportTop, headerBottom)) : null;
+    const anchorId = anchor?.dataset.recordId;
+    const anchorOffset = anchor ? anchor.getBoundingClientRect().top - viewportTop : 0;
+    // The old table/token remain intact until EVERY replacement page passes.
+    if (!current()) return false;
+    if (!append) resetLoadedRows();
+    state.schema = schema; state.snapshotToken = token; state.snapshotStale = false;
+      rememberOverviewReadSession({ ...payload, snapshotToken: token }, { readSessionId: replacementSession });
+    state.rows = freshRows; state.total = total; state.page = lastPage; state.pageSize = payload.pageSize;
+    state.hasMore = freshRows.length < total;
+    valueOptionsCache.clear();
+    renderSchemaState(); renderSemanticControls(first);
+    if (state.semanticSearch) state.rows.sort((a, b) => semanticScore(b) - semanticScore(a));
+    renderTable(first, { append: false, incomingRows: state.rows });
+    elements.snapshotNotice.hidden = true;
+    if (append) {
+      viewport.scrollTop = top; viewport.scrollLeft = left;
+      const newAnchor = anchorId ? [...elements.tableBody.children].find(row => row.dataset.recordId === anchorId) : null;
+      if (newAnchor) viewport.scrollTop += newAnchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - anchorOffset;
+      window.scrollTo?.({ top: windowTop, left: windowLeft, behavior: "instant" });
+    }
+    return true;
+  } finally {
+    state.snapshotRefreshing = false;
+    elements.refreshSchema.disabled = false;
   }
 }
 
@@ -1626,14 +1740,18 @@ async function runQuery({ retrySnapshot = true, append = false } = {}) {
   elements.tableEmpty.hidden = true;
   renderInfiniteState();
   let failed = false;
+  let activeQueryPayload = null;
   try {
     const payload = queryPayload(requestedPage);
-    const result = await sendRuntime({ type: "queryDataOverview", payload });
+    activeQueryPayload = payload;
+    const sessionId = append ? overviewReadSessions.get(overviewReadSessionKey(payload)) || "" : "";
+    const result = await requestOverviewPage(payload, sessionId);
     // A response must not render old criteria or shorten a newer edit's debounce.
     if (serial !== state.querySerial || state.resetScheduled || state.queryPending || state.semanticAwaitingSubmit) return;
     if (payload.semanticSearch === true && result.semantic?.mode !== "embedding") {
       throw new Error("后端未返回语义检索结果，请升级并重启后端 0.34.0 后重试。");
     }
+    rememberOverviewReadSession(payload, result);
     const incomingRows = result.rows || [];
     if (!append) resetLoadedRows();
     state.rows = append ? [...state.rows, ...incomingRows] : incomingRows;
@@ -1654,6 +1772,17 @@ async function runQuery({ retrySnapshot = true, append = false } = {}) {
     if (serial !== state.querySerial || state.resetScheduled || state.queryPending || state.semanticAwaitingSubmit) return;
     failed = true;
     if (/快照|数据已变化|重新校验/.test(error.message)) {
+      if (retrySnapshot && activeQueryPayload) {
+        try {
+          if (await recoverQuerySnapshot(activeQueryPayload, requestedPage, append, serial)) {
+            failed = false;
+            return;
+          }
+        } catch (refreshError) {
+          error = refreshError;
+        }
+      }
+      if (serial !== state.querySerial) return;
       markSnapshotStale(error.message);
       return;
     }
@@ -1683,7 +1812,10 @@ async function runQuery({ retrySnapshot = true, append = false } = {}) {
       } else {
         elements.dataSurface.setAttribute("aria-busy", "false");
         elements.tableLoading.hidden = true;
-        if (!failed) renderInfiniteState();
+        if (!failed) {
+          renderInfiniteState();
+          scheduleInfiniteLoadCheck();
+        }
       }
     }
   }
@@ -1996,10 +2128,53 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     if (state.dataset === "comments") tr.append(renderCommentActionCell(record, fields.length + 3));
     elements.tableBody.append(tr);
   }
-  if (!append) columnSizer?.sync();
-  syncColumnPins();
+  const appendedDomRows = [];
+  if (append) {
+    // Index only the newly appended suffix; do not enumerate retained rows.
+    const children = elements.tableBody.children;
+    for (let index = Math.max(0, children.length - incomingRows.length); index < children.length; index++) appendedDomRows.push(children[index]);
+    const headers = [...elements.tableHead.children];
+    const slots = headers.filter(cell => cell.dataset.field);
+    const pinStyles = new Map(headers.map(cell => [pinColumnKey(cell), {
+      pinned: cell.dataset.pinned, left: cell.style.left
+    }]));
+    const pinned = new Set(state.pinnedColumns[state.dataset]);
+    let offset = 0, changedPinGeometry = false;
+    for (const header of headers) {
+      if (!pinned.has(pinColumnKey(header))) continue;
+      if (header.dataset.pinned !== "true" || header.style.left !== `${offset}px`) changedPinGeometry = true;
+      offset += header.getBoundingClientRect?.().width || header.offsetWidth || 42;
+    }
+    const top = elements.tableViewport.scrollTop, left = elements.tableViewport.scrollLeft;
+    for (const row of appendedDomRows) {
+      const cells = new Map([...row.children].filter(cell => cell.dataset.field).map(cell => [cell.dataset.field, cell]));
+      let position = [...row.children].filter(cell => !cell.dataset.field).length;
+      slots.forEach((header, index) => {
+        const cell = cells.get(header.dataset.field);
+        if (!cell) return; // Replies still share an earlier root's rowspan.
+        if (row.children[position] !== cell) row.insertBefore(cell, row.children[position] || null);
+        cell.setAttribute("aria-colindex", String(index + 3));
+        position++;
+      });
+      for (const cell of row.children) {
+        const style = pinStyles.get(pinColumnKey(cell));
+        if (style?.pinned === "true") { cell.dataset.pinned = "true"; cell.style.left = style.left; }
+      }
+    }
+    // Real header-width changes still require updating every old sticky offset.
+    // Ordinary appends reuse existing header layout/observers/colgroup.
+    if (changedPinGeometry) syncColumnPins();
+    elements.tableViewport.scrollTop = top;
+    elements.tableViewport.scrollLeft = left;
+  } else {
+    columnSizer?.sync();
+    syncColumnPins();
+  }
   elements.resultCount.textContent = state.total.toLocaleString("zh-CN");
-  elements.resultLabel.textContent = state.filters.length || state.search ? "条筛选结果" : "条结果";
+  const browsingSnapshot = overviewReadSessions.has(overviewReadSessionKey(queryPayload()));
+  elements.resultLabel.textContent = (state.filters.length || state.search ? "条筛选结果" : "条结果")
+    + (browsingSnapshot ? " · 快照" : "");
+  elements.resultLabel.title = browsingSnapshot ? "当前显示稳定的浏览快照，并非实时数据；点击“更新数据”查看最新数据。" : "";
   elements.tableEmpty.hidden = state.rows.length > 0;
   if (!state.rows.length) {
     elements.tableEmpty.querySelector("strong").textContent = "没有符合当前条件的数据";
@@ -2009,9 +2184,28 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
   elements.exportCurrent.title = `按当前筛选、搜索和排序导出全部 ${state.total.toLocaleString("zh-CN")} 条结果（不限已加载行）`;
   elements.snapshotCode.textContent = state.snapshotToken.slice(0, 14).toUpperCase();
   updateHeaderFilterState();
-  updateSelectionUi();
+  if (append && state.selectedIds.size === 0 && incomingRows.some(record => recordIdentity(record))) {
+    // No selection can change on retained rows during a plain append. Keep the
+    // full path for active selections rather than guessing selected-ID counts.
+    elements.selectedCount.textContent = "0";
+    elements.deleteSelected.disabled = true;
+    elements.deleteSelected.title = "先勾选要删除的数据";
+    elements.confirmDelete.disabled = state.snapshotStale || state.semanticAwaitingSubmit
+      || !elements.deleteAcknowledgement.checked || state.deletePending || state.exporting;
+    const disabled = state.snapshotStale || state.semanticAwaitingSubmit || state.deletePending;
+    const selectAll = elements.tableHead.querySelector('[data-role="select-loaded"]');
+    if (selectAll) { selectAll.checked = false; selectAll.indeterminate = false; selectAll.disabled = disabled || state.rows.length === 0; }
+    for (const row of appendedDomRows) {
+      row.dataset.selected = "false";
+      const input = row.querySelector('[data-role="select-row"]');
+      if (input) { input.checked = false; input.disabled = disabled; }
+    }
+  } else updateSelectionUi();
   renderInfiniteState();
-  refreshFindMatches(false);
+  if (append && !state.findQuery.trim() && !state.findMatches.length) {
+    state.findIndex = -1;
+    updateFindCount(); // No existing search marks to clear or old text to scan.
+  } else refreshFindMatches(false);
 }
 
 function renderThreadRootCell(cell, record) {
@@ -2329,25 +2523,119 @@ async function exportCurrentPage() {
   }
 }
 
-function loadNextBatch() {
-  if (columnDrag || columnLayoutFrame || state.snapshotStale || columnFilterDraft) return;
-  if (!state.queryReady || state.loading || state.resetScheduled || !state.hasMore || !state.rows.length) return;
-  runQuery({ append: true });
+function infiniteLoadPumpState() {
+  return scheduleInfiniteLoadCheck.pump || (scheduleInfiniteLoadCheck.pump = {
+    frame: 0, request: null, failedScope: ""
+  });
+}
+
+function infiniteLoadScope() {
+  return JSON.stringify([state.dataset, state.snapshotToken, state.querySerial, state.page, state.rows.length]);
+}
+
+function infiniteLoadBlocked() {
+  return state.snapshotStale || columnFilterDraft || !state.queryReady || state.resetScheduled
+    || state.queryPending || state.semanticAwaitingSubmit || !state.hasMore || !state.rows.length
+    || Boolean(filterDraftProblem());
+}
+
+function infiniteLoadAheadDistance(visibleHeight) {
+  return Math.max(1200, Math.min(2400, visibleHeight * 2));
+}
+
+function infiniteLoadNearVisibleBottom() {
+  const viewport = elements.tableViewport;
+  if (document.visibilityState === "hidden" || viewport.hidden || elements.infiniteSentinel.hidden) return false;
+  const rect = viewport.getBoundingClientRect?.();
+  const screenHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  if (!rect || !(rect.height > 0) || !(viewport.clientHeight > 0) || !(screenHeight > 0)) return false;
+  const top = rect.top + (viewport.clientTop || 0);
+  const bottom = Math.min(rect.bottom, top + viewport.clientHeight, screenHeight);
+  const visibleHeight = bottom - Math.max(top, 0);
+  if (!(visibleHeight > 0)) return false;
+  // Use the visible lower edge, not a below-screen part of a tall viewport.
+  const remaining = viewport.scrollHeight - viewport.scrollTop - (bottom - top);
+  return Number.isFinite(remaining) && remaining < infiniteLoadAheadDistance(visibleHeight);
+}
+
+function scheduleInfiniteLoadCheck() {
+  const pump = infiniteLoadPumpState();
+  if (pump.frame) return;
+  pump.frame = window.requestAnimationFrame(() => {
+    pump.frame = 0;
+    if (infiniteLoadBlocked() || !infiniteLoadNearVisibleBottom()) return;
+    if (elements.infiniteSentinel.dataset.state === "error") pump.failedScope = infiniteLoadScope();
+    if (pump.failedScope === infiniteLoadScope()) return;
+    // A pending append rearms from its settlement, not once per network tick.
+    if (pump.request) return;
+    if (state.loading || columnDrag || columnLayoutFrame) {
+      scheduleInfiniteLoadCheck(); // Keep a busy-time IO/scroll intent alive.
+      return;
+    }
+    loadNextBatch({ automatic: true });
+  });
+}
+
+function loadNextBatch({ automatic = false } = {}) {
+  const pump = infiniteLoadPumpState();
+  if (infiniteLoadBlocked()) return;
+  if (pump.request || columnDrag || columnLayoutFrame || state.loading) {
+    scheduleInfiniteLoadCheck();
+    return;
+  }
+  if (automatic && (!infiniteLoadNearVisibleBottom()
+    || elements.infiniteSentinel.dataset.state === "error" || pump.failedScope === infiniteLoadScope())) return;
+  // Only explicit clicks bypass the automatic failure latch, never data guards.
+  if (!automatic) pump.failedScope = "";
+  const before = { page: state.page, count: state.rows.length };
+  const request = { serial: state.querySerial, dataset: state.dataset };
+  pump.request = request;
+  const settle = () => {
+    if (pump.request !== request) return;
+    pump.request = null;
+    if (request.serial === state.querySerial && request.dataset === state.dataset
+      && elements.infiniteSentinel.dataset.state === "error") pump.failedScope = infiniteLoadScope();
+    else if (state.page !== before.page || state.rows.length !== before.count) scheduleInfiniteLoadCheck();
+  };
+  const failed = () => {
+    if (request.serial === state.querySerial && request.dataset === state.dataset) pump.failedScope = infiniteLoadScope();
+    // runQuery normally catches and renders failures itself. Preserve a latch
+    // for unexpected rejected promises too, without an unhandled rejection.
+  };
+  try {
+    const result = runQuery({ append: true });
+    request.serial = state.querySerial;
+    return Promise.resolve(result).catch(failed).finally(settle);
+  } catch (_error) {
+    failed(); settle();
+  }
 }
 
 function initializeInfiniteScroll() {
+  if (initializeInfiniteScroll.initialized) return;
+  initializeInfiniteScroll.initialized = true;
   if ("IntersectionObserver" in window) {
     const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) loadNextBatch();
-    }, { root: elements.tableViewport, rootMargin: "0px 0px 240px 0px", threshold: 0.01 });
+      if (entries.some((entry) => entry.isIntersecting)) scheduleInfiniteLoadCheck();
+    // IO is only a wake-up hint. RAF geometry applies the adaptive 1200–2400px
+    // threshold, including resize and partially clipped viewports.
+    }, { root: elements.tableViewport, rootMargin: "0px 0px 2400px 0px", threshold: 0 });
     observer.observe(elements.infiniteSentinel);
+    initializeInfiniteScroll.intersectionObserver = observer;
   }
+  if ("ResizeObserver" in window) {
+    const observer = new ResizeObserver(scheduleInfiniteLoadCheck);
+    for (const target of [elements.tableViewport, elements.tableBody, elements.infiniteSentinel]) observer.observe(target);
+    initializeInfiniteScroll.resizeObserver = observer;
+  }
+  window.addEventListener("resize", scheduleInfiniteLoadCheck, { passive: true });
+  document.addEventListener("visibilitychange", scheduleInfiniteLoadCheck);
   elements.tableViewport.addEventListener("scroll", () => {
     if (!elements.columnFilterPopover.hidden) closeColumnFilterPopover();
-    const remaining = elements.tableViewport.scrollHeight - elements.tableViewport.scrollTop - elements.tableViewport.clientHeight;
-    if (remaining < 240) loadNextBatch();
+    scheduleInfiniteLoadCheck();
   }, { passive: true });
-  elements.infiniteSentinel.addEventListener("click", loadNextBatch);
+  elements.infiniteSentinel.addEventListener("click", () => loadNextBatch());
+  scheduleInfiniteLoadCheck();
 }
 
 function clearFindMarks() {

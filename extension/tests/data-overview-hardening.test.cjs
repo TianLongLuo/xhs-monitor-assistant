@@ -290,11 +290,13 @@ test("hardening: observer and scroll bursts serialize appends and cannot append 
   const all = prepareRows(h, 205);
   const pageTwo = deferred();
   h.respondWith((request) => request.page === 2 ? pageTwo.promise : pageResult(request, all));
-  Object.assign(h.elements.tableViewport, { scrollTop: 0, clientHeight: 600, scrollHeight: 620 });
+  Object.assign(h.elements.tableViewport, { scrollTop: 0, clientHeight: 600, scrollHeight: 620, getBoundingClientRect: () => ({top:0,bottom:600,height:600}) });
   for (let index = 0; index < 30; index += 1) {
     h.intersect();
     await h.elements.tableViewport.emit("scroll");
   }
+  h.window.innerHeight = 800;
+  h.flushAnimationFrames(); await settle();
   assert.deepEqual(h.queries.map((request) => request.page), [2]);
   pageTwo.resolve(pageResult(h.queries[0], all));
   await settle();
@@ -303,6 +305,7 @@ test("hardening: observer and scroll bursts serialize appends and cannot append 
   await search(h, "pending filter");
   h.intersect();
   await h.elements.tableViewport.emit("scroll");
+  h.flushAnimationFrames(); await settle();
   assert.equal(h.queries.length, 1, "a scheduled reset must block both append entry points");
 });
 
@@ -326,20 +329,20 @@ test("hardening: current append failures retain rows and an explicit retry uses 
   assert.equal(h.elements.infiniteSentinel.dataset.state, "done");
 });
 
-test("hardening: snapshot invalidation preserves rows/scroll and waits for explicit refresh", async (t) => {
+test("hardening: snapshot invalidation preserves rows/scroll after one bounded recovery then waits for explicit refresh", async (t) => {
   const h = await harness(t); const all = prepareRows(h, 205);
   h.elements.tableViewport.scrollTop = 410; h.elements.tableViewport.scrollLeft = 180;
   const rows = h.state.rows, nodes = [...h.elements.tableBody.children];
   h.respondWith(() => { throw new Error("快照已变化，请重新校验"); });
   await h.runQuery({append:true}); await settle();
-  assert.equal(schemaCalls(h).length,1);assert.equal(h.queries.length,1);
+  assert.equal(schemaCalls(h).length,2);assert.equal(h.queries.length,2);
   assert.equal(h.state.rows,rows);assert.deepEqual(h.elements.tableBody.children,nodes);
   assert.equal(h.elements.tableViewport.scrollTop,410);assert.equal(h.elements.tableViewport.scrollLeft,180);
   assert.equal(h.state.snapshotStale,true);assert.equal(h.elements.snapshotNotice.hidden,false);
-  for(let i=0;i<10;i++) h.intersect();await settle();assert.equal(h.queries.length,1);
+  for(let i=0;i<10;i++) h.intersect();h.flushAnimationFrames();await settle();assert.equal(h.queries.length,2);
   h.respondWith(request=>pageResult(request,all));
   await h.elements.refreshSnapshot.click();await settle();
-  assert.equal(schemaCalls(h).length,2);assert.equal(h.state.snapshotStale,false);
+  assert.equal(schemaCalls(h).length,3);assert.equal(h.state.snapshotStale,false);
   assert.equal(h.state.rows.length,100);assert.equal(h.elements.snapshotNotice.hidden,true);
 });
 
@@ -609,5 +612,95 @@ test("quick unanalyzed: uses empty conclusion for both datasets and clears prior
     h.applyQuickView("unanalyzed");assert.equal(h.state.search,"");assert.equal(h.state.semanticSearch,false);
     assert.equal(h.state.semanticAwaitingSubmit,false);assert.equal(h.state.filterLogic,"and");
     assert.deepEqual(plain(h.state.filters).map(({id,...filter})=>filter),[{field:"analysis_is_negative",operator:"is_empty",value:"",value2:""}]);
+  }
+});
+
+function enableReadRecovery(h) {
+  h.elements.recordDrawer.hidden = true;
+  h.elements.tableViewport.getBoundingClientRect = () => ({ top: 0, bottom: 600 });
+  h.elements.tableHead.getBoundingClientRect = () => ({ top: 0, bottom: 30 });
+  for (const row of h.elements.tableBody.children) row.getBoundingClientRect = () => ({ top: -100, bottom: -10 });
+  h.respondSchemaWith(() => ({ ...h.schema, snapshotToken: 'fresh-snapshot', queryReady: true }));
+}
+test('snapshot recovery replaces the entire loaded prefix, never appending a new snapshot to old rows', async t => {
+  const h=await harness(t);prepareRows(h,205);enableReadRecovery(h);
+  h.elements.tableViewport.scrollTop=410;h.elements.tableViewport.scrollLeft=180;
+  const fresh=Array.from({length:205},(_,i)=>({note_id:'fresh-'+i,title:'new '+i}));
+  h.respondWith(p=>{if(p.snapshotToken===SNAPSHOT)throw new Error('本地数据已变化，请重新校验');return pageResult(p,fresh);});
+  await h.runQuery({append:true});
+  assert.deepEqual(h.queries.map(p=>p.page),[2,1,2]);assert.equal(schemaCalls(h).length,2);
+  assert.equal(h.state.snapshotToken,'fresh-snapshot');assert.equal(h.state.rows.length,200);
+  assert.ok(h.state.rows.every(r=>r.note_id.startsWith('fresh-')));assert.equal(h.state.snapshotStale,false);
+  assert.equal(h.elements.snapshotNotice.hidden,true);assert.equal(h.elements.tableViewport.scrollTop,410);assert.equal(h.elements.tableViewport.scrollLeft,180);
+});
+test('recovery failure or a second snapshot change retains original rows and stops automatic retries',async t=>{
+  for(const failure of ['health','page','token','duplicate','truncated']){
+    const h=await harness(t);prepareRows(h,205);enableReadRecovery(h);const rows=h.state.rows,nodes=[...h.elements.tableBody.children];
+    if(failure==='health')h.respondSchemaWith(()=>({...h.schema,queryReady:false}));
+    h.respondWith(p=>{
+      if(p.snapshotToken===SNAPSHOT || failure==='page')throw new Error('本地数据已变化，请重新校验');
+      const data=Array.from({length:205},(_,i)=>({note_id:'f'+i}));const result=pageResult(p,data);
+      if(failure==='token')result.snapshotToken='changed-again';
+      if(failure==='duplicate')result.rows[1]=result.rows[0];
+      if(failure==='truncated')result.rows.pop();
+      return result;
+    });
+    await h.runQuery({append:true});const count=h.queries.length;
+    assert.equal(h.state.rows,rows,failure);assert.deepEqual(h.elements.tableBody.children,nodes,failure);
+    assert.equal(h.state.snapshotToken,SNAPSHOT);assert.equal(h.state.snapshotStale,true);assert.equal(schemaCalls(h).length,2);
+    for(let i=0;i<4;i++)h.intersect();await settle();assert.equal(h.queries.length,count);
+  }
+});
+test('selected records and open drawers require explicit refresh rather than changing deletion or reading intent',async t=>{
+  for(const mode of ['selection','drawer']){
+    const h=await harness(t);prepareRows(h,205);enableReadRecovery(h);
+    if(mode==='selection')h.state.selectedIds.add('n0');else h.elements.recordDrawer.hidden=false;
+    h.respondWith(()=>{throw new Error('本地数据已变化，请重新校验');});await h.runQuery({append:true});
+    assert.equal(schemaCalls(h).length,1);assert.equal(h.state.snapshotStale,true);
+    if(mode==='selection')assert.ok(h.state.selectedIds.has('n0'));
+  }
+});
+test('editing criteria while recovery awaits schema discards the superseded refresh',async t=>{
+  const h=await harness(t);prepareRows(h,205);enableReadRecovery(h);const gate=deferred(),rows=h.state.rows;
+  h.respondSchemaWith(()=>gate.promise);h.respondWith(()=>{throw new Error('本地数据已变化，请重新校验');});
+  const pending=h.runQuery({append:true});await settle();await search(h,'new draft');
+  gate.resolve({...h.schema,queryReady:true,snapshotToken:'new'});await pending;
+  assert.equal(h.state.rows,rows);assert.equal(h.elements.globalSearch.value,'new draft');assert.equal(h.queries.length,1);
+  assert.equal(h.state.snapshotToken,SNAPSHOT);assert.equal(h.state.snapshotStale,true);
+});
+
+test('browsing sessions negotiate once and stay out of export/delete query payloads', async t => {
+  const h=await harness(t), all=prepareRows(h,205);h.schema.browsingSnapshotSupported=true;
+  h.respondWith(p=>({...pageResult(p,all),readSessionId:'session-one',browsingSnapshot:true}));
+  await h.runQuery();await h.runQuery({append:true});
+  assert.equal(h.queries[0].useReadSession,true);assert.equal(h.queries[0].readSessionId,undefined);
+  assert.equal(h.queries[1].readSessionId,'session-one');assert.equal(h.state.rows.length,200);
+  assert.equal(h.queryPayload().readSessionId,undefined);assert.equal(h.queryPayload().useReadSession,undefined);
+  assert.match(h.elements.pageMeta.textContent,/浏览快照/);
+  await h.runQuery();assert.equal(h.queries[2].readSessionId,undefined,'new first page must create a new copy');
+});
+test('legacy bridge queries keep the previous wire payload',async t=>{
+  const h=await harness(t),all=prepareRows(h,205);h.respondWith(p=>pageResult(p,all));
+  await h.runQuery();await h.runQuery({append:true});
+  assert.ok(h.queries.every(p=>p.useReadSession===undefined&&p.readSessionId===undefined));
+});
+test('expired browsing session rebuilds coherent prefix under a single replacement session',async t=>{
+  const h=await harness(t),all=prepareRows(h,205);h.schema.browsingSnapshotSupported=true;enableReadRecovery(h);
+  h.respondWith(p=>({...pageResult(p,all),readSessionId:'old-session',browsingSnapshot:true}));await h.runQuery();
+  for(const row of h.elements.tableBody.children)row.getBoundingClientRect=()=>({top:-100,bottom:-10});
+  h.respondWith(p=>{if(p.readSessionId==='old-session')throw new Error('浏览快照已过期，请重新校验');
+    return {...pageResult(p,all),readSessionId:'replacement',browsingSnapshot:true};});
+  await h.runQuery({append:true});
+  const last=h.queries.slice(-2);assert.equal(last[0].page,1);assert.equal(last[0].readSessionId,undefined);
+  assert.equal(last[1].page,2);assert.equal(last[1].readSessionId,'replacement');assert.equal(h.state.rows.length,200);
+  await h.runQuery({append:true});assert.equal(h.queries.at(-1).readSessionId,'replacement');assert.equal(h.state.rows.length,205);
+});
+test('changed or missing session response never silently mixes live rows into a browsing copy',async t=>{
+  for(const mode of ['missing','changed']){
+    const h=await harness(t),all=prepareRows(h,205);h.schema.browsingSnapshotSupported=true;
+    h.respondWith(p=>({...pageResult(p,all),readSessionId:'session-one',browsingSnapshot:true}));await h.runQuery();
+    const rows=h.state.rows;h.elements.recordDrawer.hidden=false; // Preserve reading intent; no recovery.
+    h.respondWith(p=>({...pageResult(p,all),...(mode==='changed'?{readSessionId:'session-two',browsingSnapshot:true}:{})}));
+    await h.runQuery({append:true});assert.equal(h.state.rows,rows);assert.equal(h.state.snapshotStale,true);
   }
 });

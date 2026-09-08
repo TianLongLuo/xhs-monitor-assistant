@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 try:
+    from .overview_read_sessions import OverviewReadSessions
     from . import agent_analysis
     from .ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from .data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
@@ -46,6 +47,7 @@ try:
     from .overview_export_service import export_filtered_workbook
     from .semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 except ImportError:  # Native Host runs this module as a top-level script.
+    from overview_read_sessions import OverviewReadSessions
     import agent_analysis
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
@@ -57,7 +59,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 
 
-VERSION = "0.34.14"
+VERSION = "0.34.18"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )
@@ -801,6 +803,7 @@ class MonitorStore:
         self._persistent_checkpoints_recovered = False
         # Tokens are issued only after a full CSV/SQLite/material health pass.
         # Complex overview queries must present one of these short-lived tokens.
+        self._overview_read_sessions = OverviewReadSessions()
         self._data_overview_approved_tokens: dict[str, float] = {}
         self._data_overview_read_renewals: dict[str, float] = {}
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
@@ -1099,6 +1102,17 @@ class MonitorStore:
                 checkpoint = self._checkpoint_json_value(raw, decode=True)
                 if Path(checkpoint.get("dbPath", "")).resolve() != self.db_path.resolve():
                     raise ValueError("检查点数据库路径与当前配置不同")
+                reload_batch = checkpoint.get("reloadBatchId")
+                if reload_batch:
+                    if not re.fullmatch(r"[0-9]+-[0-9]+", str(reload_batch)):
+                        raise ValueError("总表重载检查点批次无效")
+                    marker = self.export_dir / ".reload_commits" / f"{reload_batch}.json"
+                    if marker.is_file():
+                        committed = json.loads(marker.read_text(encoding="utf-8"))
+                        if committed != {"batchId": reload_batch, "dbPath": str(self.db_path.resolve())}:
+                            raise ValueError("总表重载提交标记无效")
+                        self._discard_sync_checkpoint(checkpoint)
+                        continue
                 if checkpoint.get("externalAnalysisBatch") and agent_analysis.committed(self, checkpoint["externalAnalysisBatch"]):
                     self._discard_sync_checkpoint(checkpoint)
                     continue
@@ -2548,6 +2562,95 @@ class MonitorStore:
         inserted = self._seed_from_csv(notes_path)
         self._seed_comments_from_csv(comments_path)
         return inserted
+
+    def reload_data_files(self) -> dict[str, Any]:
+        """Publish an explicit CSV reload to DB and material snapshots together.
+
+        The low-level seed method is also used during startup and repair; keep
+        this user-facing publication boundary separate from those imports.
+        External CSV/SQLite writers must finish before starting a reload.
+        """
+        seed_path = self.seed_xlsx_path
+        if not seed_path or Path(seed_path).suffix.lower() != ".csv":
+            raise ValueError("请先配置并迁移为 CSV 总表，再重新载入")
+        with self.pull_lock, self.lock:
+            if list((self.export_dir / ".sync_checkpoints").glob("*/checkpoint.json")):
+                raise ValueError("存在未恢复的同步检查点，请先重启服务完成恢复")
+            notes_path, comments_path = self._csv_paths()
+            _, csv_notes = self._read_csv_table(notes_path, [])
+            _, csv_comments = self._read_csv_table(comments_path, [])
+            with self._session() as db:
+                existing = {row["note_id"]: dict(row) for row in db.execute("SELECT * FROM notes")}
+                note_ids = set(existing) | {row[0] for row in db.execute("SELECT DISTINCT note_id FROM comments")}
+            for row in existing.values():
+                if row.get("media_dir") and not Path(row["media_dir"]).is_dir():
+                    raise ValueError(f"素材目录缺失，重载已取消：{row['note_id']}")
+            for row in csv_notes:
+                note_id = valid_note_id(row.get("笔记ID"))
+                if not note_id:
+                    raise ValueError("笔记总表存在缺失的笔记 ID")
+                note_ids.add(note_id)
+                # Reload is not a material-folder migration. A changed folder
+                # would sit outside the captured rollback files.
+                incoming = text(row.get("对应帖子文件夹地址"), 4000)
+                previous = text(existing.get(note_id, {}).get("media_dir"), 4000)
+                if incoming != previous:
+                    raise ValueError("总表素材目录已变化，请使用采集/素材迁移流程，不要直接重载")
+            note_ids.update(csv_comment_note_id(row) for row in csv_comments)
+            note_ids.discard("")
+            checkpoints: list[dict[str, Any]] = []
+            reload_batch = f"{os.getpid()}-{time.time_ns()}"
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(note_ids) or ["checkpoint-empty"]):
+                    checkpoints.append(self._capture_sync_checkpoint(
+                        note_id, capture_csv=index == 0, capture_global_database=index == 0,
+                    ))
+                    checkpoints[-1]["reloadBatchId"] = reload_batch
+                    self._persist_sync_checkpoint(checkpoints[-1])
+                mutation_started = True
+                inserted = self.seed_from_xlsx(Path(seed_path))
+                migration = self.reconcile_legacy_access_statuses()
+                with self._session() as db:
+                    material_rows = [dict(row) for row in db.execute(
+                        "SELECT note_id,media_dir FROM notes WHERE media_dir<>'' ORDER BY note_id"
+                    )]
+                for row in material_rows:
+                    folder = self._refresh_material_snapshot_for_note(row["note_id"])
+                    if not folder:
+                        raise ValueError(f"素材目录缺失，重载已取消：{row['note_id']}")
+                    self._verify_note_store_consistency(row["note_id"], folder, verify_fields=True)
+                health = self.data_health()
+                if health.get("status") == "critical" or not health.get("summary", {}).get("relationshipsConsistent"):
+                    raise ValueError("重载后的全局字段/关联校验未通过")
+                # One durable batch marker precedes every checkpoint deletion.
+                # A crash during cleanup must never partially undo a success.
+                commit_root = self.export_dir / ".reload_commits"
+                commit_root.mkdir(parents=True, exist_ok=True)
+                marker = commit_root / f"{reload_batch}.json"
+                temporary = commit_root / f"{reload_batch}.tmp"
+                try:
+                    with temporary.open("x", encoding="utf-8") as stream:
+                        json.dump({"batchId": reload_batch, "dbPath": str(self.db_path.resolve())}, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, marker)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                errors = self._rollback_sync_checkpoints(checkpoints)
+                if errors:
+                    raise RuntimeError("总表重载失败且回滚未完全成功：" + "；".join(errors)) from exc
+                raise ValueError(f"总表重载未通过，已恢复重载前状态：{text(exc, 1000)}") from exc
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return {"ok": True, "inserted": inserted, "path": str(seed_path),
+                    "accessMigration": migration.get("updated", 0), "accessMigrationError": "",
+                    "materialSnapshotsRefreshed": len(material_rows), "consistencyVerified": True}
 
     def _find_match(
         self,
@@ -4890,7 +4993,7 @@ class MonitorStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def _data_overview_snapshot_token(self) -> str:
+    def _data_overview_snapshot_token(self, snapshot_db=None) -> str:
         """Fingerprint query data, not SQLite/WAL bookkeeping or file mtimes.
 
         All notes/comments columns are included: the dynamic field catalogue can
@@ -4911,10 +5014,11 @@ class MonitorStore:
                 fingerprint.update(b"\n")
 
             add({"snapshotFormat": 2, "dbPath": str(self.db_path.resolve()).casefold()})
-            db = self._connect()
+            db = snapshot_db if snapshot_db is not None else self._connect()
             try:
-                db.execute("PRAGMA query_only=ON")
-                db.execute("BEGIN")
+                if snapshot_db is None:
+                    db.execute("PRAGMA query_only=ON")
+                    db.execute("BEGIN")
                 for table, key in (("notes", "note_id"), ("comments", "comment_id")):
                     add({"table": table, "schema": [tuple(row) for row in db.execute(
                         f"PRAGMA table_info({table})"
@@ -4927,7 +5031,8 @@ class MonitorStore:
                     ).fetchall() if text(row[0], 4000)
                 ]
             finally:
-                db.close()
+                if snapshot_db is None:
+                    db.close()
             for folder in material_dirs:
                 material_root = Path(folder)
                 add({"materialDir": str(material_root.resolve()).casefold(),
@@ -4940,7 +5045,7 @@ class MonitorStore:
                 add({"path": str(path.resolve()).casefold(), "sha256": self._file_sha256(path)})
             return fingerprint.hexdigest()
 
-    def _validate_data_overview_read_snapshot(self, supplied_token: str, action: str) -> str:
+    def _validate_data_overview_read_snapshot(self, supplied_token: str, action: str, snapshot_db=None) -> str:
         """Renew only an already-approved read snapshot after full verification.
 
         An independent read lease never extends the 30-minute deletion/purge
@@ -4950,7 +5055,7 @@ class MonitorStore:
             issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
             if not issued_at:
                 raise ValueError("一致性快照已过期，请重新校验数据总览")
-            current_token = self._data_overview_snapshot_token()
+            current_token = (self._data_overview_snapshot_token(snapshot_db) if snapshot_db is not None else self._data_overview_snapshot_token())
             if current_token != supplied_token:
                 self._data_overview_approved_tokens.pop(supplied_token, None)
                 self._data_overview_read_renewals.pop(supplied_token, None)
@@ -4964,7 +5069,7 @@ class MonitorStore:
                     self._data_overview_approved_tokens.pop(supplied_token, None)
                     self._data_overview_read_renewals.pop(supplied_token, None)
                     raise ValueError("一致性快照自动复核未通过，请更新数据并检查数据体检")
-                if self._data_overview_snapshot_token() != supplied_token:
+                if (self._data_overview_snapshot_token(snapshot_db) if snapshot_db is not None else self._data_overview_snapshot_token()) != supplied_token:
                     self._data_overview_approved_tokens.pop(supplied_token, None)
                     self._data_overview_read_renewals.pop(supplied_token, None)
                     raise ValueError(f"本地数据已变化，请重新校验后再{action}")
@@ -5156,6 +5261,7 @@ class MonitorStore:
                 self._data_overview_read_renewals[token] = now
             return {
                 "ok": True, "version": VERSION, "queryReady": query_ready,
+                "browsingSnapshotSupported": True,
                 "snapshotToken": token if query_ready else "", "health": health,
                 "operators": DATA_OVERVIEW_OPERATORS,
                 "datasets": {
@@ -5173,108 +5279,128 @@ class MonitorStore:
             }
 
     def query_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Run one parameterized, read-only query against an approved consistent snapshot."""
+        """Strict live reads by default; opt-in browsing uses a pinned database copy."""
         dataset = text(payload.get("dataset"), 30).lower() or "notes"
         if dataset not in {"notes", "comments"}:
             raise ValueError("dataset must be notes or comments")
-        supplied_token = text(payload.get("snapshotToken"), 128)
-        if not supplied_token:
+        token = text(payload.get("snapshotToken"), 128)
+        if not token:
             raise ValueError("缺少一致性快照，请重新校验数据总览")
-        # Hold both write locks from token validation through SELECT completion;
-        # no sync or background AI write can move the underlying snapshot.
+        if payload.get("useReadSession") is True and payload.get("semanticSearch") is not True:
+            with self._overview_read_sessions.open(self, payload, token) as session:
+                if session is not None:
+                    db, entry = session
+                    result = entry["cache"].pop("first_result", None)
+                    if result is None:
+                        result = self._query_data_overview_db(db, payload, token, entry["cache"])
+                    result.update(readSessionId=entry["id"], browsingSnapshot=True)
+                    return result
+        # Deletion/export/detail/legacy callers keep full live validation.
         with self.pull_lock, self.lock:
-            current_token = self._validate_data_overview_read_snapshot(supplied_token, "查询")
-
+            token = self._validate_data_overview_read_snapshot(token, "查询")
             db = self._connect()
             try:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
-                field_specs = build_field_specs(db, dataset)
-                by_key = {field.key: field for field in field_specs}
-                requested_fields = list(dict.fromkeys(
-                    text(item, 160) for item in (payload.get("fields") or []) if text(item, 160) in by_key
-                ))
-                if not requested_fields:
-                    requested_fields = [field.key for field in field_specs if field.default_visible]
-                if not requested_fields:
-                    requested_fields = [field_specs[0].key]
-                if len(requested_fields) > 180:
-                    raise ValueError("单次最多显示 180 个字段")
-
-                filter_sql, filter_params, condition_count = compile_filter_group(
-                    payload.get("filter") if isinstance(payload.get("filter"), dict) else None, by_key
-                )
-                semantic = payload.get("semanticSearch") is True
-                query_text = str(payload.get("search") or "").strip()
-                search_sql, search_params = ("", []) if semantic else search_clause(text(query_text, 500), dataset)
-                clauses = [DATA_OVERVIEW_NOTE_SCOPE, *[item for item in (filter_sql, search_sql) if item]]
-                where = " WHERE " + " AND ".join(clauses) if clauses else ""
-                parameters = [*filter_params, *search_params]
-                base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
-                select_sql = ", ".join(
-                    f"{by_key[key].expression} AS {json.dumps(key)}" for key in requested_fields
-                )
-                page_size = max(1, min(int(payload.get("pageSize") or 50), 200))
-                group_threads = not semantic and effective_thread_grouping(
-                    payload.get("sort") if isinstance(payload.get("sort"), list) else [],
-                    by_key, dataset, payload.get("groupThreads"), payload.get("threadSortMode", "comment"))
-                if semantic:
-                    if not hasattr(self, "_semantic_encoder"):
-                        self._semantic_encoder = LocalEncoder(self.db_path.with_name(self.db_path.name + ".semantic.sqlite3"))
-                    ids, evidence = semantic_retrieve(
-                        db, self._semantic_encoder, dataset, base, where, parameters, query_text,
-                        minimum=payload.get("semanticMinScore", 0.5), limit=payload.get("semanticLimit", 200),
-                    )
-                    total = len(ids)
-                    page_count = max(1, (total + page_size - 1) // page_size)
-                    page = max(1, min(int(payload.get("page") or 1), page_count))
-                    page_ids = ids[(page - 1) * page_size:page * page_size]
-                    rows = []
-                    if page_ids:
-                        key_expr = "n.note_id" if dataset == "notes" else "c.comment_id"
-                        marks = ",".join("?" for _ in page_ids)
-                        selected = {row["__semantic_id"]: dict(row) for row in db.execute(
-                            f"SELECT {select_sql}, {key_expr} AS __semantic_id FROM {base} "
-                            f"WHERE {key_expr} IN ({marks})", page_ids,
-                        )}
-                        for record_id in page_ids:
-                            record = selected[record_id]
-                            record.pop("__semantic_id", None)
-                            record.update(evidence[record_id])
-                            rows.append(record)
-                else:
-                    total = int(db.execute(f"SELECT COUNT(*) FROM {base}{where}", parameters).fetchone()[0])
-                    page_count = max(1, (total + page_size - 1) // page_size)
-                    page = max(1, min(int(payload.get("page") or 1), page_count))
-                    order_by = compile_sort(
-                        payload.get("sort") if isinstance(payload.get("sort"), list) else [],
-                        by_key, dataset, group_threads=group_threads, thread_sort_mode=payload.get("threadSortMode", "comment"),
-                    )
-                    rows = [dict(row) for row in db.execute(
-                        f"SELECT {select_sql} FROM {base}{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
-                        (*parameters, page_size, (page - 1) * page_size),
-                    ).fetchall()]
-                db.rollback()
+                return self._query_data_overview_db(db, payload, token)
             finally:
                 db.close()
-            query_hash = hashlib.sha256(json.dumps({
-                "dataset": dataset, "fields": requested_fields, "search": payload.get("search") or "",
-                "filter": payload.get("filter") or {}, "sort": payload.get("sort") or [],
-                "groupThreads": group_threads, "threadSortMode": payload.get("threadSortMode", "comment"),
-                "semanticSearch": semantic, "semanticMinScore": payload.get("semanticMinScore", 0.5),
-                "semanticLimit": payload.get("semanticLimit", 200),
-                "page": page, "pageSize": page_size,
-            }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-            return {
-                "ok": True, "dataset": dataset, "rows": rows, "fields": requested_fields,
-                "total": total, "page": page, "pageSize": page_size, "pageCount": page_count,
-                "filterConditionCount": condition_count, "snapshotToken": current_token,
-                "queryHash": query_hash, "consistentSnapshot": True,
-                "semantic": {"mode": "embedding", "model": SEMANTIC_MODEL,
-                             "limit": max(1, min(int(payload.get("semanticLimit", 200)), 2000)),
-                             "minimumScore": float(payload.get("semanticMinScore", 0.5)),
-                             "note": "向量相关度不是情绪分类或事实置信度；返回阈值以上最相关记录"} if semantic else None,
-            }
+
+    def _query_data_overview_db(self, db, payload, current_token, query_cache=None):
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if query_cache is not None and "field_specs" in query_cache:
+            field_specs = query_cache["field_specs"]
+        else:
+            field_specs = build_field_specs(db, dataset)
+            if query_cache is not None:
+                query_cache["field_specs"] = field_specs
+        by_key = {field.key: field for field in field_specs}
+        requested_fields = list(dict.fromkeys(
+            text(item, 160) for item in (payload.get("fields") or []) if text(item, 160) in by_key
+        ))
+        if not requested_fields:
+            requested_fields = [field.key for field in field_specs if field.default_visible]
+        if not requested_fields:
+            requested_fields = [field_specs[0].key]
+        if len(requested_fields) > 180:
+            raise ValueError("单次最多显示 180 个字段")
+
+        filter_sql, filter_params, condition_count = compile_filter_group(
+            payload.get("filter") if isinstance(payload.get("filter"), dict) else None, by_key
+        )
+        semantic = payload.get("semanticSearch") is True
+        query_text = str(payload.get("search") or "").strip()
+        search_sql, search_params = ("", []) if semantic else search_clause(text(query_text, 500), dataset)
+        clauses = [DATA_OVERVIEW_NOTE_SCOPE, *[item for item in (filter_sql, search_sql) if item]]
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        parameters = [*filter_params, *search_params]
+        base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
+        select_sql = ", ".join(
+            f"{by_key[key].expression} AS {json.dumps(key)}" for key in requested_fields
+        )
+        page_size = max(1, min(int(payload.get("pageSize") or 50), 200))
+        group_threads = not semantic and effective_thread_grouping(
+            payload.get("sort") if isinstance(payload.get("sort"), list) else [],
+            by_key, dataset, payload.get("groupThreads"), payload.get("threadSortMode", "comment"))
+        if semantic:
+            if not hasattr(self, "_semantic_encoder"):
+                self._semantic_encoder = LocalEncoder(self.db_path.with_name(self.db_path.name + ".semantic.sqlite3"))
+            ids, evidence = semantic_retrieve(
+                db, self._semantic_encoder, dataset, base, where, parameters, query_text,
+                minimum=payload.get("semanticMinScore", 0.5), limit=payload.get("semanticLimit", 200),
+            )
+            total = len(ids)
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(payload.get("page") or 1), page_count))
+            page_ids = ids[(page - 1) * page_size:page * page_size]
+            rows = []
+            if page_ids:
+                key_expr = "n.note_id" if dataset == "notes" else "c.comment_id"
+                marks = ",".join("?" for _ in page_ids)
+                selected = {row["__semantic_id"]: dict(row) for row in db.execute(
+                    f"SELECT {select_sql}, {key_expr} AS __semantic_id FROM {base} "
+                    f"WHERE {key_expr} IN ({marks})", page_ids,
+                )}
+                for record_id in page_ids:
+                    record = selected[record_id]
+                    record.pop("__semantic_id", None)
+                    record.update(evidence[record_id])
+                    rows.append(record)
+        else:
+            if query_cache is not None and "total" in query_cache:
+                total = query_cache["total"]
+            else:
+                total = int(db.execute(f"SELECT COUNT(*) FROM {base}{where}", parameters).fetchone()[0])
+                if query_cache is not None:
+                    query_cache["total"] = total
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(payload.get("page") or 1), page_count))
+            order_by = compile_sort(
+                payload.get("sort") if isinstance(payload.get("sort"), list) else [],
+                by_key, dataset, group_threads=group_threads, thread_sort_mode=payload.get("threadSortMode", "comment"),
+            )
+            rows = [dict(row) for row in db.execute(
+                f"SELECT {select_sql} FROM {base}{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                (*parameters, page_size, (page - 1) * page_size),
+            ).fetchall()]
+        query_hash = hashlib.sha256(json.dumps({
+            "dataset": dataset, "fields": requested_fields, "search": payload.get("search") or "",
+            "filter": payload.get("filter") or {}, "sort": payload.get("sort") or [],
+            "groupThreads": group_threads, "threadSortMode": payload.get("threadSortMode", "comment"),
+            "semanticSearch": semantic, "semanticMinScore": payload.get("semanticMinScore", 0.5),
+            "semanticLimit": payload.get("semanticLimit", 200),
+            "page": page, "pageSize": page_size,
+        }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return {
+            "ok": True, "dataset": dataset, "rows": rows, "fields": requested_fields,
+            "total": total, "page": page, "pageSize": page_size, "pageCount": page_count,
+            "filterConditionCount": condition_count, "snapshotToken": current_token,
+            "queryHash": query_hash, "consistentSnapshot": True,
+            "semantic": {"mode": "embedding", "model": SEMANTIC_MODEL,
+                         "limit": max(1, min(int(payload.get("semanticLimit", 200)), 2000)),
+                         "minimumScore": float(payload.get("semanticMinScore", 0.5)),
+                         "note": "向量相关度不是情绪分类或事实置信度；返回阈值以上最相关记录"} if semantic else None,
+        }
 
     def export_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
         return export_filtered_workbook(self, payload)
@@ -10599,22 +10725,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/comments/collection/start":
                 result = self.store.start_comment_collection(payload)
             elif self.path == "/api/excel/reload":
-                seed_path = getattr(self.store, "seed_xlsx_path", None)
-                if not seed_path:
-                    raise ValueError("未配置 CSV 总表路径")
-                inserted = self.store.seed_from_xlsx(Path(seed_path))
-                access_migration: dict[str, Any] = {"updated": 0}
-                migration_error = ""
-                try:
-                    access_migration = self.store.reconcile_legacy_access_statuses()
-                except Exception as exc:
-                    # Database statuses were already made conservative by the
-                    # schema migration. Keep reload usable when Excel happens
-                    # to be open; the next sync/reload will retry the label.
-                    migration_error = text(exc, 1000)
-                result = {"ok": True, "inserted": inserted, "path": str(seed_path),
-                          "accessMigration": access_migration.get("updated", 0),
-                          "accessMigrationError": migration_error}
+                result = self.store.reload_data_files()
             elif self.path == "/api/ai/settings":
                 result = self.store.save_ai_settings(payload)
             elif self.path == "/api/ai/test":
