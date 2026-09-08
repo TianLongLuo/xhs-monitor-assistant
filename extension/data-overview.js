@@ -2,11 +2,13 @@
 
 const byId = (id) => document.getElementById(id);
 const elements = {
+  searchOptions: byId("searchOptions"), searchModeLabel: byId("searchModeLabel"),
+  returnToComments: byId("returnToComments"),
   notesCount: byId("notesCount"), commentsCount: byId("commentsCount"),
   railHealthDot: byId("railHealthDot"), railHealthText: byId("railHealthText"), railHealthMeta: byId("railHealthMeta"),
   datasetTitle: byId("datasetTitle"), datasetSubtitle: byId("datasetSubtitle"),
   snapshotNotice: byId("snapshotNotice"), snapshotNoticeText: byId("snapshotNoticeText"), refreshSnapshot: byId("refreshSnapshot"),
-  refreshSchema: byId("refreshSchema"), exportCurrent: byId("exportCurrent"), exportLabel: byId("exportLabel"),
+  refreshSchema: byId("refreshSchema"), exportCurrent: byId("exportCurrent"), exportLabel: byId("exportLabel"), exportFormat: byId("exportFormat"),
   deleteSelected: byId("deleteSelected"), selectedCount: byId("selectedCount"),
   lineageRibbon: byId("lineageRibbon"), consistencyTitle: byId("consistencyTitle"),
   consistencyMeta: byId("consistencyMeta"), snapshotCode: byId("snapshotCode"),
@@ -23,6 +25,7 @@ const elements = {
   selectDefaultFields: byId("selectDefaultFields"), selectAllFields: byId("selectAllFields"),
   restoreColumnOrder: byId("restoreColumnOrder"), columnOrderHint: byId("columnOrderHint"),
   restoreColumnWidths: byId("restoreColumnWidths"),
+  columnPinOptions: byId("columnPinOptions"), clearColumnPins: byId("clearColumnPins"),
   sortPanel: byId("sortPanel"), sortRows: byId("sortRows"), addSort: byId("addSort"), clearSorts: byId("clearSorts"),
   threadGroupingRow: byId("threadGroupingRow"), groupThreads: byId("groupThreads"),
   threadSortMode: byId("threadSortMode"), threadSortModeRow: byId("threadSortModeRow"), threadSortModeHint: byId("threadSortModeHint"),
@@ -76,7 +79,7 @@ const drawerGallery = globalThis.XhsMonitorOverviewMedia?.create({
 const COMMENT_ACTION_FIELD = "__overview_comment_actions";
 const COMMENT_ACTION_COLUMN = Object.freeze({ key: COMMENT_ACTION_FIELD, label: "操作", dataType: "text", action: "locate_comment" });
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
-const DATA_OVERVIEW_VERSION = "0.34.7";
+const DATA_OVERVIEW_VERSION = "0.34.14";
 const INFINITE_BATCH_SIZE = 100;
 const TIME_COLUMNS = {
   published_at: ["published_at_raw", "published_at_precision", "published_at_status"],
@@ -95,6 +98,7 @@ const state = {
   visibleFields: { notes: [], comments: [] },
   columnOrder: { notes: [], comments: [] },
   columnWidths: { notes: {}, comments: {} },
+  pinnedColumns: { notes: [], comments: [] },
   savedViews: {
     notes: { search: "", filterLogic: "and", filters: [], sorts: [] },
     comments: { search: "", filterLogic: "and", filters: [], sorts: [] }
@@ -135,6 +139,7 @@ let toastTimer = 0;
 let findTimer = 0;
 let threadMergeCell = null;
 let columnFilterDraft = null;
+let commentReturnPoint = null;
 let columnDrag = null;
 let columnDragFrame = 0;
 let columnLayoutFrame = 0;
@@ -195,7 +200,8 @@ function normalizeViewPreferences(value = {}) {
     field: String(item?.field || "").slice(0, 160),
     operator: String(item?.operator || "eq").slice(0, 40),
     value: Array.isArray(item?.value) ? item.value.slice(0,100).map(String) : String(item?.value ?? "").slice(0, 5000),
-    value2: String(item?.value2 ?? "").slice(0, 5000)
+    value2: String(item?.value2 ?? "").slice(0, 5000),
+    ...(item?.includeEmpty === true && item?.operator === "in" ? { includeEmpty: true } : {})
   })).filter((item) => item.field) : [];
   const sorts = Array.isArray(value.sorts) ? value.sorts.slice(0, 4).map((item) => ({
     id: String(item?.id || crypto.randomUUID()),
@@ -268,6 +274,9 @@ function loadPreferences() {
         state.columnOrder[dataset] = XhsMonitorColumnOrder.sanitize(saved.columnOrder[dataset]);
       }
     }
+    for (const dataset of ["notes", "comments"]) {
+      state.pinnedColumns[dataset] = XhsMonitorColumnOrder.sanitize(saved.pinnedColumns?.[dataset]);
+    }
     if (saved.columnWidths && typeof saved.columnWidths === "object") {
       for (const dataset of ["notes", "comments"]) {
         state.columnWidths[dataset] = globalThis.XhsMonitorColumnWidths?.sanitize(saved.columnWidths[dataset]) || {};
@@ -288,11 +297,12 @@ function savePreferences() {
   captureCurrentView();
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      version: 4,
+      version: 5,
       dataset: state.dataset,
       visibleFields: state.visibleFields,
       columnOrder: state.columnOrder,
       columnWidths: state.columnWidths,
+      pinnedColumns: state.pinnedColumns,
       threadSortModes: state.threadSortModes,
       savedViews: state.savedViews
     }));
@@ -341,7 +351,90 @@ function tableLayoutFields() {
   const map = fieldMap();
   const fields = currentVisibleFields().map(key => map.get(key)).filter(Boolean);
   if (state.dataset === "comments") fields.push(COMMENT_ACTION_COLUMN);
-  return fields;
+  const pinned = new Set(state.pinnedColumns[state.dataset]);
+  return [...fields.filter(field => pinned.has(field.key)), ...fields.filter(field => !pinned.has(field.key))];
+}
+
+// Column pinning is presentation-only and opt-in, independently per dataset.
+function pinColumnKey(cell) {
+  return cell.dataset.field || (cell.classList.contains("select-column") ? "__selection"
+    : cell.classList.contains("row-number-column") ? "__row_number" : "");
+}
+
+// Pinning must move trailing columns into the leading table slots. A left-only
+// sticky cell at the end of a wide table never reaches its sticky threshold.
+// Keep the saved user order untouched so unpin restores that exact order.
+function arrangeRenderedColumnSlots() {
+  const keys = tableLayoutFields().map(field => field.key);
+  let changed = false;
+  for (const row of [elements.tableHead, ...elements.tableBody.children]) {
+    const cells = new Map([...row.children].filter(cell => cell.dataset.field).map(cell => [cell.dataset.field, cell]));
+    let position = [...row.children].filter(cell => !cell.dataset.field).length;
+    keys.forEach((key, index) => {
+      const cell = cells.get(key);
+      if (!cell) return; // A reply shares its root's rowspan slot.
+      if (row.children[position] !== cell) { row.insertBefore(cell, row.children[position] || null); changed = true; }
+      cell.setAttribute("aria-colindex", String(index + 3));
+      position++;
+    });
+  }
+  return changed;
+}
+
+function applyColumnPins() {
+  const pinned = new Set(state.pinnedColumns[state.dataset]);
+  const offsets = new Map();
+  let left = 0;
+  for (const header of elements.tableHead.children) {
+    const key = pinColumnKey(header);
+    if (!pinned.has(key)) continue;
+    offsets.set(key, left);
+    left += header.getBoundingClientRect?.().width || header.offsetWidth || 42;
+  }
+  for (const row of [elements.tableHead, ...elements.tableBody.children]) {
+    for (const cell of row.children) {
+      const offset = offsets.get(pinColumnKey(cell));
+      if (offset === undefined) {
+        delete cell.dataset.pinned;
+        cell.style.left = "";
+      } else {
+        cell.dataset.pinned = "true";
+        cell.style.left = `${offset}px`;
+      }
+    }
+  }
+}
+
+function renderColumnPinOptions() {
+  if (!elements.columnPinOptions) return;
+  const pinned = new Set(state.pinnedColumns[state.dataset]);
+  elements.columnPinOptions.replaceChildren();
+  const fields = [{key: "__selection", label: "选择框"}, {key: "__row_number", label: "行号"}, ...tableLayoutFields()];
+  for (const field of fields) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox"; input.dataset.pinField = field.key;
+    input.checked = pinned.has(field.key);
+    input.setAttribute("aria-label", `固定${field.label}列`);
+    const name = document.createElement("span"); name.textContent = field.label;
+    label.append(input, name); elements.columnPinOptions.append(label);
+  }
+}
+
+// Width changes during drag/keyboard resize update offsets without requerying data.
+let pinLayoutFrame = 0;
+const pinResizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
+  if (pinLayoutFrame) return;
+  pinLayoutFrame = window.requestAnimationFrame(() => { pinLayoutFrame = 0; applyColumnPins(); });
+}) : null;
+function syncColumnPins() {
+  const top = elements.tableViewport.scrollTop, left = elements.tableViewport.scrollLeft;
+  if (arrangeRenderedColumnSlots()) columnSizer?.sync();
+  pinResizeObserver?.disconnect();
+  for (const header of elements.tableHead.children) pinResizeObserver?.observe(header);
+  applyColumnPins();
+  elements.tableViewport.scrollTop = top;
+  elements.tableViewport.scrollLeft = left;
 }
 
 function reorderRenderedColumns() {
@@ -378,6 +471,8 @@ function reorderRenderedColumns() {
     }
   }
   columnSizer?.sync();
+  syncColumnPins();
+  renderColumnPinOptions();
   elements.tableViewport.scrollTop = scrollTop;
   elements.tableViewport.scrollLeft = scrollLeft;
   refreshFindMatches(false);
@@ -546,6 +641,7 @@ function healthIssueText(health) {
 }
 
 function renderSchemaState() {
+  elements.returnToComments.hidden = state.dataset !== "notes" || !commentReturnPoint;
   const health = state.schema?.health || {};
   const summary = health.summary || {};
   const noteDataset = state.schema?.datasets?.notes || {};
@@ -601,13 +697,14 @@ function renderFieldOptions() {
       const name = document.createElement("span");
       name.textContent = field.label;
       const type = document.createElement("small");
-      type.textContent = input.disabled ? "固定" : field.dataType;
+      type.textContent = input.disabled ? "必显" : field.dataType;
       label.append(input, name, type);
       group.append(label);
     }
     elements.fieldOptions.append(group);
   }
   elements.fieldCount.textContent = String(selected.size);
+  renderColumnPinOptions();
 }
 
 function fieldOptionsHtml(selectedKey = "", mode = "all") {
@@ -649,8 +746,135 @@ function markSnapshotStale(message = "本地数据已更新") {
   renderInfiniteState();
 }
 
+// Preserve exact option boundaries (including commas) through editing, storage and export.
+function writeFilterInput(input, value) {
+  const values = Array.isArray(value) ? value.map(String) : null;
+  input.value = values ? (values.some(v => /[,，\n]/.test(v)) ? JSON.stringify(values) : values.join(", ")) : value ?? "";
+  input.filterValues = values;
+  input.filterValuesText = input.value;
+}
+function readFilterInput(input) {
+  if (!input) return "";
+  return Array.isArray(input.filterValues) && input.value === input.filterValuesText
+    ? [...input.filterValues] : input.value;
+}
+
+function attachMultiValueOptions(container, input, field, operator, filterId, isCurrent) {
+  const picker = document.createElement("div"); picker.className = "filter-value-picker filter-multi-picker";
+  const selected = document.createElement("div"); selected.className = "filter-selected-values";
+  const details = document.createElement("details"); details.className = "filter-multi-menu";
+  const summary = document.createElement("summary");
+  const search = document.createElement("input"); search.type = "search";
+  search.className = "filter-options-search"; search.maxLength = 500; search.placeholder = "搜索已有值";
+  search.setAttribute("aria-label", `搜索${field.label}的可选值`);
+  const list = document.createElement("div"); list.className = "filter-multi-options";
+  list.setAttribute("role", "group"); list.setAttribute("aria-label", `${field.label} · 多选已有值`);
+  const hint = document.createElement("small"); hint.className = "filter-value-hint"; hint.setAttribute("aria-live", "polite");
+  const supportsEmpty = ["ip_location", "source_ip_location", "post__source_ip_location"].includes(field.key);
+  const emptyOption = document.createElement("label"); emptyOption.className = "filter-multi-option filter-empty-option";
+  const emptyCheckbox = document.createElement("input"); emptyCheckbox.type = "checkbox";
+  emptyCheckbox.className = "filter-empty-checkbox"; emptyCheckbox.dataset.emptyValue = "true";
+  const emptyText = document.createElement("span"); emptyText.textContent = "未显示（空值）";
+  emptyOption.append(emptyCheckbox, emptyText);
+  emptyOption.hidden = !supportsEmpty;
+  details.append(summary, search); if (supportsEmpty) details.append(emptyOption); details.append(list);
+  picker.append(selected, details, hint); container.append(picker);
+  const dataset = state.dataset, token = state.snapshotToken;
+  const current = () => picker.isConnected && isCurrent() && state.dataset === dataset && state.snapshotToken === token;
+  let mode = operator, sequence = 0, timer = null, entries = [];
+  const inputValues = () => mode === "in" ? splitFilterValues(readFilterInput(input)) : input.value.trim() ? [input.value.trim()] : [];
+  let values = inputValues();
+  let includeEmpty = supportsEmpty && (filterId === "column" ? columnFilterDraft : state.filters.find(item => item.id === filterId))?.includeEmpty === true;
+  function syncSelection() {
+    const count = values.length + Number(includeEmpty);
+    summary.textContent = count ? `已选 ${count} 项 · 点击增减` : "选择已有值（可多选）";
+    selected.replaceChildren(); selected.hidden = !count;
+    emptyCheckbox.checked = includeEmpty;
+    if (includeEmpty) {
+      const chip = document.createElement("button"); chip.type = "button"; chip.className = "filter-value-chip";
+      chip.textContent = "未显示（空值） ×"; chip.setAttribute("aria-label", "移除筛选值 未显示（空值）");
+      chip.addEventListener("click", event => { event.stopPropagation(); commit(values, false); });
+      selected.append(chip);
+    }
+    for (const value of values) {
+      const chip = document.createElement("button"); chip.type = "button"; chip.className = "filter-value-chip";
+      chip.textContent = `${value} ×`; chip.title = value; chip.setAttribute("aria-label", `移除筛选值 ${value}`);
+      chip.addEventListener("click", event => { event.stopPropagation(); commit(values.filter(v => v !== value)); });
+      selected.append(chip);
+    }
+    for (const checkbox of list.querySelectorAll('input[type="checkbox"]')) checkbox.checked = values.includes(checkbox.value);
+  }
+  function commit(next, nextEmpty = includeEmpty) {
+    if (!current()) return;
+    if (next.length > 100) { showToast("每条规则最多选择 100 项"); syncSelection(); return; }
+    values = [...new Set(next)]; includeEmpty = supportsEmpty && nextEmpty; mode = "in";
+    input.type = "text"; input.placeholder = "多值用逗号分隔；也可在下方勾选";
+    writeFilterInput(input, values);
+    if (filterId === "column") {
+      columnFilterDraft.operator = "in"; columnFilterDraft.value = [...values];
+      if (includeEmpty) columnFilterDraft.includeEmpty = true; else delete columnFilterDraft.includeEmpty;
+      elements.columnFilterOperator.value = "in";
+    } else {
+      const filter = state.filters.find(item => item.id === filterId);
+      if (!filter) return;
+      filter.operator = "in"; filter.value = [...values];
+      if (includeEmpty) filter.includeEmpty = true; else delete filter.includeEmpty;
+      const control = input.closest("[data-filter-id]")?.querySelector('[data-role="operator"]');
+      if (control) control.value = "in";
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    syncSelection();
+    if (filterId === "column") positionColumnFilterPopover(columnFilterDraft.anchor);
+  }
+  emptyCheckbox.addEventListener("change", () => commit(values, emptyCheckbox.checked));
+  function renderOptions() {
+    list.replaceChildren();
+    for (const item of entries) {
+      const value = field.dataType === "boolean" ? String(item.label) : String(item.value ?? "");
+      if (!value) continue;
+      const label = document.createElement("label"); label.className = "filter-multi-option";
+      const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.value = value;
+      checkbox.checked = values.includes(value);
+      const text = document.createElement("span"); text.textContent = String(item.label ?? value); text.title = text.textContent;
+      const count = document.createElement("small"); count.textContent = `${Number(item.count || 0).toLocaleString("zh-CN")} 条`;
+      checkbox.addEventListener("change", () => commit(checkbox.checked ? [...values, value] : values.filter(v => v !== value)));
+      label.append(checkbox, text, count); list.append(label);
+    }
+    if (!entries.length) list.textContent = "暂无匹配值";
+    syncSelection();
+  }
+  async function populate(query = "") {
+    const serial = ++sequence;
+    list.textContent = "正在读取可选值…";
+    try {
+      const result = await getFieldValueOptions(field, query);
+      if (!current() || serial !== sequence) return;
+      entries = result.values || []; renderOptions();
+      hint.textContent = `${result.truncated ? `显示前 ${entries.length} 项，可搜索更多。` : ""}${supportsEmpty ? "可将地区与“未显示（空值）”一起勾选，任一匹配。" : "多选按任一值匹配；空值请用“为空”条件。"}`;
+    } catch (error) {
+      if (!current() || serial !== sequence) return;
+      list.textContent = "选项读取失败"; hint.textContent = error.message || "可手动输入筛选值。";
+      if (/快照|数据已变化|重新校验/.test(error.message)) markSnapshotStale(error.message);
+    }
+    if (filterId === "column" && current()) positionColumnFilterPopover(columnFilterDraft.anchor);
+  }
+  input.addEventListener("input", () => { values = inputValues(); syncSelection(); });
+  search.addEventListener("input", () => {
+    clearTimeout(timer); ++sequence;
+    timer = setTimeout(() => { if (current()) populate(search.value.trim()); }, 250);
+  });
+  details.addEventListener("toggle", () => {
+    if (filterId === "column" && current()) positionColumnFilterPopover(columnFilterDraft.anchor);
+  });
+  syncSelection(); populate();
+}
+
 function attachValueOptions(container, input, field, operator, filterId, role, isCurrent = () => true) {
   if (!field.filterable || NO_VALUE_OPERATORS.has(operator)) return;
+  if (role === "value" && ["eq", "in"].includes(operator) && operatorsFor(field).some(item => item.id === "in")) {
+    attachMultiValueOptions(container, input, field, operator, filterId, isCurrent);
+    return;
+  }
   const picker = document.createElement("div"); picker.className = "filter-value-picker";
   const select = document.createElement("select"); select.className = "filter-value-options";
   select.setAttribute("aria-label", `${field.label} · ${role === "value2" ? "上限" : "筛选值"}可选项`);
@@ -768,12 +992,15 @@ function openColumnFilter(fieldKey, anchor) {
   const operators = operatorsFor(field);
   const preferred = field.suggestValues ? "eq" : field.dataType === "text" ? "contains" : "eq";
   const operator = operators.some((item) => item.id === preferred) ? preferred : operators[0]?.id || "eq";
-  columnFilterDraft = { field: field.key, operator, value: "", value2: "", anchor };
+  const existing = state.filters.filter(item => item.field === field.key);
+  const editable = existing.length === 1 && ["eq", "in"].includes(existing[0].operator) && operators.some(item => item.id === existing[0].operator) ? existing[0] : null;
+  columnFilterDraft = { field: field.key, operator: editable?.operator || operator,
+    value: editable ? (Array.isArray(editable.value) ? [...editable.value] : editable.value) : "", value2: "", anchor, ...(editable?.includeEmpty === true ? { includeEmpty: true } : {}) };
   elements.columnFilterTitle.textContent = field.label;
   elements.columnFilterOperator.innerHTML = operators.map((item) =>
     `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`
   ).join("");
-  elements.columnFilterOperator.value = operator;
+  elements.columnFilterOperator.value = columnFilterDraft.operator;
   const existingCount = state.filters.filter((item) => item.field === field.key).length;
   elements.columnFilterExisting.textContent = existingCount
     ? `该字段已有 ${existingCount} 条规则；默认替换本列，需叠加请选“追加条件”。`
@@ -791,21 +1018,26 @@ function applyColumnFilter() {
   if (!columnFilterDraft) return;
   const first = elements.columnFilterValueWrap.querySelector('[data-role="value"]');
   const second = elements.columnFilterValueWrap.querySelector('[data-role="value2"]');
-  columnFilterDraft.value = first?.value ?? "";
+  columnFilterDraft.value = readFilterInput(first);
   columnFilterDraft.value2 = second?.value ?? "";
-  if (!NO_VALUE_OPERATORS.has(columnFilterDraft.operator)) {
+  if (!NO_VALUE_OPERATORS.has(columnFilterDraft.operator) && !(columnFilterDraft.operator === "in" && columnFilterDraft.includeEmpty)) {
     if (!String(columnFilterDraft.value).trim()
+        || (columnFilterDraft.operator === "in" && !splitFilterValues(columnFilterDraft.value).length)
         || (columnFilterDraft.operator === "between" && !String(columnFilterDraft.value2).trim())) {
       showToast("请先填写筛选值");
       first?.focus();
       return;
     }
   }
+  if (columnFilterDraft.operator === "in" && splitFilterValues(columnFilterDraft.value).length > 100) {
+    showToast("每条规则最多选择 100 项"); first?.focus(); return;
+  }
   const fieldKey = columnFilterDraft.field;
   if (elements.columnFilterMode.value !== "append") state.filters = state.filters.filter(item => item.field !== fieldKey);
   state.filters.push({
     id: crypto.randomUUID(), field: fieldKey, operator: columnFilterDraft.operator,
     value: columnFilterDraft.value, value2: columnFilterDraft.value2,
+    ...(columnFilterDraft.includeEmpty === true && columnFilterDraft.operator === "in" ? { includeEmpty: true } : {}),
   });
   closeColumnFilterPopover();
   renderFilters();
@@ -887,13 +1119,16 @@ function makeValueInput(field, value, role, operator = "eq") {
   const input = document.createElement("input");
   input.dataset.role = role;
   input.type = field.dataType === "number" && operator !== "in" ? "number" : field.dataType === "datetime" ? "text" : "text";
-  input.value = value ?? "";
-  input.placeholder = field.dataType === "datetime" ? "如 2026-09-01" : field.dataType === "boolean" ? "是 / 否" : "输入值";
+  writeFilterInput(input, value);
+  input.placeholder = operator === "in" ? "多值用逗号分隔；也可在下方勾选" : field.dataType === "datetime" ? "如 2026-09-01" : field.dataType === "boolean" ? "是 / 否" : "输入值";
   if (field.dataType === "number") input.step = "any";
   return input;
 }
 
 function renderSemanticControls(result = null) {
+  elements.searchModeLabel.textContent = state.semanticSearch ? "语义" : "关键词";
+  elements.searchSubmit.title = state.semanticSearch ? "提交语义检索（Enter）" : "搜索（Enter）";
+  elements.globalSearch.setAttribute("aria-label", state.semanticSearch ? "语义检索内容" : "搜索标题、正文、作者或 ID");
   elements.semanticSearch.checked = state.semanticSearch;
   elements.semanticStatus.textContent = !state.semanticSearch ? "普通搜索 · 关键词匹配"
     : state.semanticAwaitingSubmit ? "语义检索待提交 · 点击搜索或按 Enter；表内仍为上次结果，已暂停选择与删除"
@@ -921,6 +1156,7 @@ function submitSearch() {
     return;
   }
   state.semanticAwaitingSubmit = false;
+  elements.searchOptions.open = false;
   renderSemanticControls();
   scheduleQuery(0, true);
 }
@@ -986,7 +1222,10 @@ function setPanel(name, open = null) {
 }
 
 function splitFilterValues(value) {
-  return (Array.isArray(value) ? value : String(value ?? "").split(/[,，\n]/)).map(x => String(x).trim()).filter(Boolean);
+  if (typeof value === "string" && value.trim().startsWith("[")) {
+    try { const parsed = JSON.parse(value); if (Array.isArray(parsed) && parsed.every(x => typeof x === "string" || typeof x === "number")) value = parsed; } catch {}
+  }
+  return [...new Set((Array.isArray(value) ? value : String(value ?? "").split(/[,，\n]/)).map(x => String(x).trim()).filter(Boolean))];
 }
 function parseFilterDate(value) {
   // Match backend calendar semantics: timezone-less input is Beijing, not the
@@ -1013,7 +1252,9 @@ function filterDraftProblem() {
     if (NO_VALUE_OPERATORS.has(filter.operator)) continue;
     const value = String(filter.value ?? "").trim(), end = String(filter.value2 ?? "").trim();
     const name = `第 ${index + 1} 条筛选`;
-    if (!value || (filter.operator === "between" && !end)) return `${name}尚未填写完整`;
+    if (filter.operator === "in" && filter.includeEmpty === true && !splitFilterValues(filter.value).length) continue;
+    if (!value || (filter.operator === "between" && !end) || (filter.operator === "in" && !splitFilterValues(filter.value).length)) return `${name}尚未填写完整`;
+    if (filter.operator === "in" && splitFilterValues(filter.value).length > 100) return `${name}最多选择 100 项`;
     const field = fieldMap().get(filter.field);
     if (field?.dataType === "number") {
       const values = filter.operator === "in" ? splitFilterValues(filter.value) : [value, ...(filter.operator === "between" ? [end] : [])];
@@ -1055,9 +1296,32 @@ function scheduleQuery(delay = 220, explicitSearch = false) {
   }, delay);
 }
 
+function rowVisualState(record, dataset = state.dataset) {
+  const yes = value => value === true || value === 1 || ["1", "true", "是"].includes(String(value ?? "").trim().toLowerCase());
+  const deletedStatus = value => ["已删除", "已下架", "deleted", "removed"].includes(String(value ?? "").trim().toLowerCase());
+  return {
+    deleted: yes(record.is_deleted) || deletedStatus(dataset === "comments" ? record.comment_status : record.post_status)
+      || (dataset === "comments" && (yes(record.post__is_deleted) || deletedStatus(record.post__post_status))),
+    // Use the published semantic conclusion, never legacy AI flags or keywords.
+    negative: yes(record.analysis_is_negative)
+  };
+}
+
+function filterQueryCondition({ id, includeEmpty, ...filter }) {
+  if (filter.operator !== "in") return filter;
+  const value = splitFilterValues(filter.value);
+  const matchValues = { ...filter, value };
+  if (includeEmpty !== true) return matchValues;
+  const empty = { field: filter.field, operator: "is_empty" };
+  return value.length ? { logic: "or", children: [matchValues, empty] } : empty;
+}
 function queryPayload(page = 1) {
   const fields = currentVisibleFields();
   const available = fieldMap();
+  for (const key of ["is_deleted", "post_status", "comment_status", "analysis_is_negative",
+    ...(state.dataset === "comments" ? ["post__is_deleted", "post__post_status"] : [])]) {
+    if (available.has(key) && !fields.includes(key)) fields.push(key);
+  }
   for (const key of [...fields]) {
     for (const metadataKey of TIME_COLUMNS[key] || []) {
       if (available.has(metadataKey) && !fields.includes(metadataKey)) fields.push(metadataKey);
@@ -1081,7 +1345,7 @@ function queryPayload(page = 1) {
     fields,
     search: state.search,
     semanticSearch: state.semanticSearch,
-    filter: { logic: state.filterLogic, children: state.filters.map(({ id, ...filter }) => filter.operator === "in" ? { ...filter, value: splitFilterValues(filter.value) } : filter) },
+    filter: { logic: state.filterLogic, children: state.filters.map(filterQueryCondition) },
     sort: state.semanticSearch ? [] : effectiveSorts().map(({ id, ...sort }) => sort),
     groupThreads: effectiveThreadGrouping(),
     threadSortMode: state.threadSortModes[state.dataset],
@@ -1425,13 +1689,94 @@ async function runQuery({ retrySnapshot = true, append = false } = {}) {
   }
 }
 
-async function locatePostInDatabase(noteId) {
+// A single in-memory return point retains all loaded comment pages. Never replay
+// an old snapshot as live data after a refresh or mutation changes the token.
+function cancelNavigationQuery() {
+  clearTimeout(queryTimer);
+  ++state.querySerial;
+  state.loading = false;
+  state.queryPending = false;
+  state.resetScheduled = false;
+  elements.tableLoading.hidden = true;
+  elements.dataSurface.setAttribute("aria-busy", "false");
+}
+function returnToCommentPosition() {
+  if (!commentReturnPoint || state.dataset !== "notes") return;
+  if (elements.refreshSchema.disabled) { showToast("正在更新数据，请完成后再返回评论位置"); return; }
+  if (state.deletePending || state.exporting) { showToast("请等待当前操作完成后返回"); return; }
+  const point = commentReturnPoint;
+  const stale = state.snapshotStale || state.snapshotToken !== point.snapshotToken || !state.queryReady;
+  closeDrawer(); closeColumnFilterPopover(); closePageFind();
+  setPanel("none", false);
+  captureCurrentView();
+  cancelNavigationQuery();
+  commentReturnPoint = null;
+  state.dataset = "comments";
+  state.savedViews.comments = normalizeViewPreferences(point.view);
+  restoreDatasetView("comments");
+  state.semanticAwaitingSubmit = point.semanticAwaitingSubmit;
+  state.rows = point.rows;
+  state.total = point.total;
+  state.page = point.page;
+  state.pageSize = point.pageSize;
+  state.hasMore = point.hasMore;
+  state.selectedIds = new Set(stale ? [] : point.selectedIds);
+  state.snapshotStale = stale;
+  document.querySelectorAll("[data-quick-view]").forEach(item => item.classList.remove("is-active"));
+  renderSchemaState(); renderFieldOptions(); renderFilters(); renderSorts();
+  renderTable({ rows: state.rows });
+  elements.semanticStatus.textContent = point.semanticStatus;
+  elements.filterDraftNotice.hidden = point.draftNoticeHidden;
+  elements.filterDraftNotice.textContent = point.draftNotice;
+  if (stale) markSnapshotStale("已返回原评论位置；数据已更新，此处保留的是离开时的记录");
+  else if (!point.draftNoticeHidden) elements.exportCurrent.disabled = true;
+  savePreferences();
+  const serial = state.querySerial;
+  const restoreScroll = () => {
+    if (state.dataset !== "comments" || serial !== state.querySerial || state.rows !== point.rows) return;
+    elements.tableViewport.scrollTop = point.scrollTop;
+    elements.tableViewport.scrollLeft = point.scrollLeft;
+    window.scrollTo?.({ top: point.windowScrollY, left: point.windowScrollX, behavior: "instant" });
+  };
+  requestAnimationFrame(() => {
+    restoreScroll();
+    if (state.dataset !== "comments" || serial !== state.querySerial || state.rows !== point.rows) return;
+    const row = [...elements.tableBody.querySelectorAll("tr[data-record-id]")].find(item => item.dataset.recordId === point.commentId);
+    if (row) {
+      row.classList.add("return-comment-highlight");
+      row.querySelector('[data-action="locate_post"]')?.focus({ preventScroll: true });
+      setTimeout(() => row.classList.remove("return-comment-highlight"), 3000);
+    }
+    requestAnimationFrame(restoreScroll);
+  });
+  showToast(stale ? "已返回原评论位置，请更新数据后继续操作" : "已返回评论原位置");
+}
+
+async function locatePostInDatabase(noteId, commentId = "") {
   if (state.snapshotStale) { showToast("请先更新数据，再定位关联帖子"); return; }
+  if (state.resetScheduled || state.queryPending || state.semanticAwaitingSubmit) { showToast("请先完成当前查询，再定位关联帖子"); return; }
+  if (state.deletePending || state.exporting) { showToast("请等待当前操作完成后再定位"); return; }
   const targetId = String(noteId || "").trim();
   if (!targetId) { showToast("该评论缺少关联笔记 ID"); return; }
-  closeDrawer();
+  if (state.dataset === "comments") {
+    captureCurrentView();
+    commentReturnPoint = {
+      view: normalizeViewPreferences(state.savedViews.comments),
+      semanticAwaitingSubmit: state.semanticAwaitingSubmit,
+      rows: [...state.rows], total: state.total, page: state.page, pageSize: state.pageSize, hasMore: state.hasMore,
+      snapshotToken: state.snapshotToken, selectedIds: [...state.selectedIds],
+      scrollTop: elements.tableViewport.scrollTop, scrollLeft: elements.tableViewport.scrollLeft,
+      windowScrollY: window.scrollY || 0, windowScrollX: window.scrollX || 0,
+      commentId: String(commentId), semanticStatus: elements.semanticStatus.textContent,
+      draftNoticeHidden: elements.filterDraftNotice.hidden, draftNotice: elements.filterDraftNotice.textContent,
+    };
+  }
+  const returnPoint = commentReturnPoint;
+  closeDrawer(); closeColumnFilterPopover(); closePageFind();
+  setPanel("none", false);
   columnSizer?.cancel();
   captureCurrentView();
+  cancelNavigationQuery();
   state.dataset = "notes";
   state.page = 0;
   state.search = "";
@@ -1448,6 +1793,7 @@ async function locatePostInDatabase(noteId) {
   renderSorts();
   savePreferences();
   await runQuery({ append: false });
+  if (state.dataset !== "notes" || commentReturnPoint !== returnPoint) return;
   const row = elements.tableBody.querySelector("tr[data-record-id]");
   row?.scrollIntoView({ block: "center", inline: "nearest" });
   showToast(state.total === 1 ? "已定位到帖子数据库" : "未找到对应的帖子记录");
@@ -1468,7 +1814,7 @@ async function runTableAction(button) {
     }
     if (action === "locate_post") {
       button.textContent = "定位中…";
-      await locatePostInDatabase(value);
+      await locatePostInDatabase(value, button.closest("tr[data-record-id]")?.dataset.recordId || "");
       return;
     }
     if (action === "open_material") {
@@ -1582,7 +1928,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
       actions.dataset.utility = "comment-actions";
       actions.setAttribute("aria-colindex", String(fields.length + 3));
       actions.draggable = false;
-      actions.title = "评论操作 · 固定在最右侧，不参与筛选、排序或导出";
+      actions.title = "评论操作 · 独立操作列，不参与筛选、排序或导出";
       const label = document.createElement("span");
       const name = document.createElement("b");
       name.textContent = "操作";
@@ -1600,6 +1946,10 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     tr.tabIndex = 0;
     tr.dataset.index = String(absoluteIndex);
     tr.dataset.recordId = recordIdentity(record);
+    const visual = rowVisualState(record);
+    tr.dataset.rowDeleted = String(visual.deleted);
+    tr.dataset.rowNegative = String(visual.negative);
+    if (visual.deleted || visual.negative) tr.title = [visual.deleted ? "已删除（含所属帖子已删除）" : "", visual.negative ? "语义差评" : ""].filter(Boolean).join(" · ");
     const selectCell = document.createElement("td");
     selectCell.className = "select-column";
     const selectRow = document.createElement("input");
@@ -1647,6 +1997,7 @@ function renderTable(result, { append = false, incomingRows = result.rows || [] 
     elements.tableBody.append(tr);
   }
   if (!append) columnSizer?.sync();
+  syncColumnPins();
   elements.resultCount.textContent = state.total.toLocaleString("zh-CN");
   elements.resultLabel.textContent = state.filters.length || state.search ? "条筛选结果" : "条结果";
   elements.tableEmpty.hidden = state.rows.length > 0;
@@ -1895,6 +2246,7 @@ function resetCurrentView() {
   state.groupThreads = true;
   state.columnOrder[state.dataset] = [];
   state.columnWidths[state.dataset] = {};
+  state.pinnedColumns[state.dataset] = [];
   if (elements.columnOrderHint) elements.columnOrderHint.textContent = "拖动表头调整列顺序 · 自动保存";
   state.visibleFields[state.dataset] = orderedDatasetFields()
     .filter((field) => field.defaultVisible)
@@ -1932,6 +2284,7 @@ async function exportCurrentPage() {
   const fields = currentVisibleFields().filter((key) => !map.get(key)?.action);
   const payload = { ...queryPayload(1), fields };
   const expectedTotal = state.total;
+  const format = elements.exportFormat?.value === "csv" ? "csv" : "xlsx";
   const columns = fields.map((key) => ({ key, label: map.get(key)?.label || key, dataType: map.get(key)?.dataType }));
   state.exporting = true;
   // Export and deletion are mutually exclusive until their async work settles.
@@ -1939,19 +2292,34 @@ async function exportCurrentPage() {
   elements.exportCurrent.disabled = true;
   elements.exportLabel.textContent = "正在导出…";
   try {
-    const result = await XhsMonitorDataExport.collectFilteredRows(
+    let result, blob;
+    if (format === "xlsx") {
+      elements.exportLabel.textContent = `生成 Excel · 全部 ${expectedTotal} 条…`;
+      result = await sendRuntime({ type: "exportDataOverview", payload: { ...payload, expectedTotal } });
+      if (result.dataset !== payload.dataset || result.total !== expectedTotal || result.snapshotToken !== payload.snapshotToken
+        || result.consistentSnapshot !== true || typeof result.contentBase64 !== "string") {
+        throw new Error("Excel 导出数量或快照校验失败，未生成文件");
+      }
+      const bytes = Uint8Array.from(atob(result.contentBase64), char => char.charCodeAt(0));
+      if (bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes[2] !== 3 || bytes[3] !== 4) throw new Error("Excel 文件内容无效");
+      blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    } else {
+    result = await XhsMonitorDataExport.collectFilteredRows(
       (request) => sendRuntime({ type: "queryDataOverview", payload: request }), payload,
       { expectedTotal, onProgress: (loaded, total) => { elements.exportLabel.textContent = `导出 ${loaded} / ${total}`; } }
     );
-    const blob = new Blob([XhsMonitorDataExport.toCsv(result.rows, columns)], { type: "text/csv;charset=utf-8" });
+    blob = new Blob([XhsMonitorDataExport.toCsv(result.rows, columns)], { type: "text/csv;charset=utf-8" });
+    }
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `XHS-Monitor_${payload.dataset}_${new Date().toISOString().slice(0,10)}_filtered-${result.total}.csv`;
+    link.download = `XHS-Monitor_${payload.dataset}_${new Date().toISOString().slice(0,10)}_filtered-${result.total}.${format}`;
     document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast(`已按导出开始时的筛选条件导出全部 ${result.total} 条结果`);
   } catch (error) {
-    showToast(error?.message || "筛选结果导出失败，未生成文件");
+    showToast(format === "xlsx" && /not found|未知消息|unsupported/i.test(error?.message || "")
+      ? "Excel 导出需要新版本地 Bridge；请重启 Bridge 后重试，也可选择 CSV 导出全部筛选结果"
+      : error?.message || "筛选结果导出失败，未生成文件");
   } finally {
     state.exporting = false;
     elements.exportLabel.textContent = "导出筛选结果";
@@ -2085,6 +2453,7 @@ async function navigateFind(direction) {
 }
 
 function bindEvents() {
+  elements.returnToComments.addEventListener("click", returnToCommentPosition);
   document.querySelectorAll(".dataset-button").forEach((button) => button.addEventListener("click", () => {
     if (button.dataset.dataset === state.dataset) return;
     if (state.snapshotStale) { showToast("数据有更新，请先更新数据再切换数据库"); return; }
@@ -2093,6 +2462,7 @@ function bindEvents() {
     finishColumnDrag();
     savePreferences();
     state.dataset = button.dataset.dataset;
+    if (state.dataset === "comments") commentReturnPoint = null;
     restoreDatasetView(state.dataset);
     validateCurrentView();
     clearSelection();
@@ -2124,6 +2494,7 @@ function bindEvents() {
     elements.globalSearch.value = state.search;
     markSemanticDraft();
     renderSorts();
+    elements.searchOptions.open = false;
     elements.globalSearch.focus();
   }));
   window.addEventListener("keydown", (event) => {
@@ -2135,6 +2506,7 @@ function bindEvents() {
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); elements.globalSearch.focus(); }
     if (event.key === "Escape") {
+      elements.searchOptions.open = false;
       if (document.querySelector?.(".media-viewer[open]")) return;
       if (columnResizeActive) { columnSizer?.cancel(); return; }
       if (columnDrag) { finishColumnDrag(); return; }
@@ -2196,13 +2568,14 @@ function bindEvents() {
   elements.columnFilterOperator.addEventListener("change", () => {
     if (!columnFilterDraft) return;
     columnFilterDraft.operator = elements.columnFilterOperator.value;
+    delete columnFilterDraft.includeEmpty;
     columnFilterDraft.value = "";
     columnFilterDraft.value2 = "";
     renderColumnFilterValue();
     positionColumnFilterPopover(columnFilterDraft.anchor);
   });
   elements.columnFilterValueWrap.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") { event.preventDefault(); applyColumnFilter(); }
+    if (event.key === "Enter" && ["value", "value2"].includes(event.target.dataset.role)) { event.preventDefault(); applyColumnFilter(); }
   });
   elements.applyColumnFilter.addEventListener("click", applyColumnFilter);
   elements.clearColumnFilter.addEventListener("click", clearColumnFilters);
@@ -2225,6 +2598,17 @@ function bindEvents() {
   elements.filterRows.addEventListener("change", handleFilterChange);
   elements.filterRows.addEventListener("input", handleFilterInput);
   elements.filterRows.addEventListener("click", handleFilterClick);
+  elements.columnPinOptions?.addEventListener("change", (event) => {
+    const input = event.target.closest("input[data-pin-field]"); if (!input) return;
+    const pinned = new Set(state.pinnedColumns[state.dataset]);
+    if (input.checked) pinned.add(input.dataset.pinField); else pinned.delete(input.dataset.pinField);
+    state.pinnedColumns[state.dataset] = [...pinned];
+    savePreferences(); syncColumnPins();
+  });
+  elements.clearColumnPins?.addEventListener("click", () => {
+    state.pinnedColumns[state.dataset] = [];
+    savePreferences(); syncColumnPins(); renderColumnPinOptions();
+  });
   elements.fieldSearch.addEventListener("input", renderFieldOptions);
   elements.fieldOptions.addEventListener("change", (event) => {
     const input = event.target.closest("input[data-field]"); if (!input) return;
@@ -2325,6 +2709,7 @@ function bindEvents() {
   elements.confirmDelete.addEventListener("click", performPermanentDelete);
   elements.deleteDialog.addEventListener("cancel", (event) => { event.preventDefault(); closeDeleteDialog(); });
   document.addEventListener("click", (event) => {
+    if (elements.searchOptions.open && !elements.searchOptions.contains(event.target)) elements.searchOptions.open = false;
     if (!elements.fieldPanel.hidden && !elements.fieldPanel.contains(event.target) && !elements.toggleFields.contains(event.target)) setPanel("none", false);
     if (!elements.columnFilterPopover.hidden
         && !elements.columnFilterPopover.contains(event.target)
@@ -2337,16 +2722,22 @@ function handleFilterChange(event) {
   const filter = state.filters.find((item) => item.id === row.dataset.filterId); if (!filter) return;
   const role = event.target.dataset.role;
   if (!["field", "operator", "value", "value2"].includes(role)) return;
-  if (role === "field") { filter.field = event.target.value; filter.operator = operatorsFor(fieldMap().get(filter.field))[0]?.id || "eq"; filter.value = ""; filter.value2 = ""; renderFilters(); }
-  if (role === "operator") { filter.operator = event.target.value; filter.value2 = ""; renderFilters(); }
-  if (role === "value" || role === "value2") filter[role] = event.target.value;
+  if (role === "field") { delete filter.includeEmpty; filter.field = event.target.value; filter.operator = operatorsFor(fieldMap().get(filter.field))[0]?.id || "eq"; filter.value = ""; filter.value2 = ""; renderFilters(); }
+  if (role === "operator") {
+    const next = event.target.value;
+    if (next !== "in") delete filter.includeEmpty;
+    if (next === "in" && filter.operator === "eq" && !Array.isArray(filter.value)) filter.value = String(filter.value ?? "").trim() ? [String(filter.value)] : [];
+    if (filter.operator === "in" && next !== "in") { const values = splitFilterValues(filter.value); filter.value = values.length === 1 ? values[0] : ""; }
+    filter.operator = next; filter.value2 = ""; renderFilters();
+  }
+  if (role === "value" || role === "value2") filter[role] = readFilterInput(event.target);
   scheduleQuery(180);
 }
 
 function handleFilterInput(event) {
   const row = event.target.closest("[data-filter-id]"); if (!row) return;
   const filter = state.filters.find((item) => item.id === row.dataset.filterId); if (!filter) return;
-  const role = event.target.dataset.role; if (role === "value" || role === "value2") { filter[role] = event.target.value; scheduleQuery(360); }
+  const role = event.target.dataset.role; if (role === "value" || role === "value2") { filter[role] = readFilterInput(event.target); scheduleQuery(360); }
 }
 
 function handleFilterClick(event) {

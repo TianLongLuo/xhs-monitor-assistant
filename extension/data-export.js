@@ -49,7 +49,8 @@
     const quote = (value, dataType = "text") => {
       let result = value && typeof value === "object" ? JSON.stringify(value) : String(value ?? "");
       // Spreadsheet programs must not execute comment text as a formula.
-      if (dataType !== "number" && /^[\s]*[=+@-]/.test(result)) result = "'" + result;
+      const numeric = dataType === "number" && /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(result.trim()) && Number.isFinite(Number(result));
+      if (!numeric && /^[\s]*[=+@-]/.test(result)) result = "'" + result;
       return `"${result.replace(/"/g, '""')}"`;
     };
     const lines = [columns.map((column) => quote(column.label || column.key)).join(",")];

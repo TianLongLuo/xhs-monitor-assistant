@@ -61,6 +61,7 @@ class Element {
     this.value = (this.options.find((option) => option.selected) || this.options[0])?.value || "";
   }
   get options() { return this.children.filter((child) => child.tagName === "OPTION"); }
+  get isConnected() { return this.tagName === "BODY" || !!this.parentNode?.isConnected; }
   append(...children) {
     for (const child of children) {
       child.remove();
@@ -90,6 +91,7 @@ class Element {
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) {
     if (name.startsWith("data-")) return this.dataset[name.slice(5).replace(/-([a-z])/g, (_, char) => char.toUpperCase())];
+    if (name === "type") return this.type;
     return this.attributes.get(name);
   }
   matches(selector) {
@@ -123,6 +125,13 @@ class Element {
     const event = { type, target: this, preventDefault() {}, stopPropagation() {}, ...extra };
     return Promise.all((this.listeners.get(type) || []).map((listener) => listener(event)));
   }
+  dispatchEvent(event) {
+    const path = [this];
+    if (event.bubbles) for (let node = this.parentNode; node; node = node.parentNode) path.push(node);
+    return !dispatchFixtureEvent(event.type, path, { ...event, target: this }).defaultPrevented;
+  }
+  focus(options) { (this.focusCalls ||= []).push(options); }
+  scrollIntoView(options) { (this.scrollIntoViewCalls ||= []).push(options); }
   click() {
     if (this.disabled) return;
     this.onClick?.();
@@ -157,6 +166,7 @@ function fixtureSchema() {
     operators: [
       { id: "eq", label: "equals", types: ["text", "datetime", "boolean"] },
       { id: "contains", label: "contains", types: ["text"] },
+      { id: "in", label: "one of", types: ["text", "datetime", "boolean", "number"] },
       { id: "between", label: "between", types: ["datetime"] },
       { id: "is_false", label: "false", types: ["boolean"] },
     ],
@@ -166,7 +176,7 @@ function fixtureSchema() {
   };
 }
 
-async function harness(t, saved) {
+async function harness(t, saved, { valueOptions = [], extraFields = {} } = {}) {
   const storage = new Map(saved ? [[STORAGE_KEY, JSON.stringify(saved)]] : []);
   const ids = new Map();
   const body = new Element("body");
@@ -176,8 +186,12 @@ async function harness(t, saved) {
   let nextFrame = 0, frameTime = 0;
   const requestAnimationFrame = (callback) => { animationFrames.set(++nextFrame, callback); return nextFrame; };
   const cancelAnimationFrame = (id) => animationFrames.delete(id);
-  let nextTimer = 0, nextId = 0, queryHandler;
+  let nextTimer = 0, nextId = 0, queryHandler, exportHandler;
   const schema = fixtureSchema();
+  for (const [dataset, additions] of Object.entries(extraFields)) {
+    const fields = schema.datasets[dataset].fields;
+    for (const item of additions) fields.push({ ...item, displayOrder: fields.length });
+  }
   const buttons = Object.fromEntries(["notes", "comments"].map((dataset) => {
     const button = new Element("button");
     button.className = "dataset-button";
@@ -191,6 +205,7 @@ async function harness(t, saved) {
       if (!ids.has(id)) {
         const element = new Element();
         element.hidden = ["pageFind", "columnFilterPopover", "filterPanel", "fieldPanel", "sortPanel"].includes(id);
+        if (id === "exportFormat") element.value = "csv";
         if (id === "tableEmpty") element.append(new Element("strong"), new Element("p"));
         ids.set(id, element);
         body.append(element);
@@ -206,8 +221,10 @@ async function harness(t, saved) {
     addEventListener: (...args) => body.addEventListener(...args),
   };
   const context = vm.createContext({
+    atob: value => Buffer.from(value, "base64").toString("binary"),
     document, window: Object.assign(new Element("window"), { requestAnimationFrame, cancelAnimationFrame }), Blob,
     requestAnimationFrame, cancelAnimationFrame,
+    Event: class { constructor(type, options = {}) { this.type = type; this.bubbles = !!options.bubbles; } },
     crypto: { randomUUID: () => "fixture-id-" + ++nextId },
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)) },
     setTimeout: (callback, delay = 0) => { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
@@ -219,7 +236,11 @@ async function harness(t, saved) {
     chrome: { runtime: { sendMessage(message, callback) {
       messages.push(plain(message));
       if (message.type === "getDataOverviewSchema") return callback(schema);
-      if (message.type === "getDataOverviewValues") return callback({ ok: true, values: [], truncated: false, snapshotToken: SNAPSHOT });
+      if (message.type === "getDataOverviewValues") return callback({ ok: true, values: plain(valueOptions), truncated: false, snapshotToken: SNAPSHOT });
+      if (message.type === "exportDataOverview" && exportHandler) {
+        Promise.resolve().then(() => exportHandler(plain(message.payload))).then(callback, error => callback({ok:false,error:error.message}));
+        return;
+      }
       if (message.type !== "queryDataOverview" || !queryHandler) {
         unexpected.push(plain(message));
         return callback({ ok: false, error: "Unexpected fixture runtime request" });
@@ -232,9 +253,12 @@ async function harness(t, saved) {
   t.after(() => assert.deepEqual(unexpected, [], "all runtime traffic must have an explicit in-memory fixture"));
   for (const script of scripts) script.runInContext(context, { timeout: 1000 });
   const api = vm.runInContext(`({
-    state, elements, queryPayload, renderCell, exportCurrentPage,
+    state, elements, queryPayload, renderCell, exportCurrentPage, applyColumnPins, syncColumnPins, renderColumnPinOptions, rowVisualState,
     currentVisibleFields, tableLayoutFields, orderedDatasetFields, renderTable, renderFieldOptions, renderFilters, renderSorts,
     loadSchema, runQuery, resetCurrentView, filterDraftProblem, validateFilterDraft, makeValueInput, scheduleQuery,
+    writeFilterInput, readFilterInput, attachMultiValueOptions, splitFilterValues, openColumnFilter,
+    locatePostInDatabase, returnToCommentPosition, runTableAction,
+    getCommentReturnPoint: () => commentReturnPoint,
     reorderColumn: typeof reorderColumn === "function" ? reorderColumn : undefined,
     resetColumnOrder: typeof resetColumnOrder === "function" ? resetColumnOrder : undefined,
   })`, context);
@@ -244,6 +268,7 @@ async function harness(t, saved) {
   return {
     ...api, schema, document, window: context.window, buttons, storage, downloads, blobs, revoked, queries, messages, timers,
     respondWith(handler) { queryHandler = handler; },
+    respondExportWith(handler) { exportHandler = handler; },
     flushAnimationFrames() {
       // Execute queued callbacks, rather than hiding deferred work with a no-op.
       for (let batch = 0; animationFrames.size && batch < 10; batch += 1) {
@@ -372,10 +397,10 @@ function assertCanonicalMenus(h) {
     assert.deepEqual(menu.options.map((option) => option.value), canonical.filter((item) => item[property]).map((item) => item.key));
   }
 }
-function assertTableColumns(h, keys) {
+function assertTableColumns(h, keys, { includesActions = false } = {}) {
   const token = (cell) => cell.classList.contains("select-column") ? "$select"
     : cell.classList.contains("row-number-column") ? "$number" : cell.dataset.field;
-  const expected = ["$select", "$number", ...keys, ...(h.state.dataset === "comments" ? ["__overview_comment_actions"] : [])];
+  const expected = ["$select", "$number", ...keys, ...(h.state.dataset === "comments" && !includesActions ? ["__overview_comment_actions"] : [])];
   assert.deepEqual(h.elements.tableHead.children.map(token), expected);
   assert.ok(h.elements.tableHead.children[0].querySelector('[data-role="select-loaded"]'));
   assert.equal(h.elements.tableHead.children[1].textContent, "#");
@@ -595,7 +620,7 @@ test("query payload adds available date metadata exactly once without changing v
     h.state.visibleFields[dataset] = [...dates, dates[0] + "_raw", ...observed];
     const before = plain(h.state.visibleFields);
     const payload = plain(h.queryPayload(3));
-    const expected = [...required, ...observed,
+    const expected = [...required, ...observed, ...["is_deleted", "post_status", "comment_status", "analysis_is_negative", "post__is_deleted", "post__post_status"].filter(key => h.schema.datasets[dataset].fields.some(f => f.key === key)),
       ...dates.flatMap((key) => [key, ...["raw", "precision", "status"].map((suffix) => key + "_" + suffix)])]
       .filter((key) => key !== absent);
     assert.deepEqual([...new Set(payload.fields)].sort(), expected.sort(), dataset);
@@ -764,11 +789,11 @@ test("export is blocked during a debounced reset, a queued query, loading or an 
   assert.deepEqual(h.blobs, []);
 });
 
-test("column order: legacy preferences migrate to v4 and a reorder survives a fresh VM reload", async (t) => {
+test("column order: legacy preferences migrate to v5 and a reorder survives a fresh VM reload", async (t) => {
   const h = await harness(t, preferences());
   requireColumnOrder(h);
   assert.deepEqual(plain(h.state.columnOrder), { notes: [], comments: [] });
-  assert.equal(stored(h).version, 4);
+  assert.equal(stored(h).version, 5);
   const visibleBefore = plain(h.state.visibleFields);
   renderLoadedRows(h, [{ note_id: "n1", title: "first note" }]);
   const before = localSnapshot(h);
@@ -784,7 +809,7 @@ test("column order: legacy preferences migrate to v4 and a reorder survives a fr
   requireColumnOrder(reloaded);
   assert.deepEqual(visualKeys(reloaded), expected);
   assert.deepEqual(plain(reloaded.state.columnOrder), plain(h.state.columnOrder));
-  assert.equal(stored(reloaded).version, 4);
+  assert.equal(stored(reloaded).version, 5);
 
   const dirty = stored(h);
   dirty.columnOrder.notes.push("title", "", null, 7, "x".repeat(161), "removed_schema_key");
@@ -968,7 +993,7 @@ test("column order: resetCurrentView clears active order but retains the other d
   assert.deepEqual(stored(h).savedViews.comments, { ...saved.savedViews.comments, semanticSearch: false });
   assert.deepEqual(stored(h).visibleFields.comments, saved.visibleFields.comments);
   const reloaded = await harness(t, stored(h));
-  assert.equal(stored(reloaded).version, 4);
+  assert.equal(stored(reloaded).version, 5);
   assert.deepEqual(plain(reloaded.state.columnOrder), { notes: [], comments: saved.columnOrder.comments });
   await reloaded.buttons.comments.emit("click");
   assert.deepEqual(visualKeys(reloaded), saved.columnOrder.comments);
@@ -1335,4 +1360,927 @@ test("date draft validation follows Beijing calendar, zones, fractions and text 
   assert.equal(h.filterDraftProblem(),"");
   rule.value="2026-02-30";
   assert.match(h.filterDraftProblem(),/有效/);
+});
+
+
+test("column pins: defaults empty, checkbox is local-only and persistent, clear restores all", async t => {
+  const h = await harness(t, orderedPreferences("comments"));
+  renderLoadedRows(h, [{comment_id:"reply-1",note_id:"note-1",content:"preview",thread_root_id:"reply-1",thread_root_content:"root"}]);
+  assert.deepEqual(plain(h.state.pinnedColumns), {notes:[],comments:[]});
+  for (const row of [h.elements.tableHead, ...h.elements.tableBody.children])
+    assert.ok(row.children.every(c => c.dataset.pinned !== "true"));
+  const before = localSnapshot(h);
+  const input = h.elements.columnPinOptions.querySelector('input[data-pin-field="content"]');
+  assert.ok(input); input.checked = true;
+  await h.elements.columnPinOptions.emit("change", {target:input});
+  assertLocalUnchanged(h, before);
+  assert.deepEqual(JSON.parse(h.storage.get(STORAGE_KEY)).pinnedColumns.comments, ["content"]);
+  assert.equal(h.elements.tableHead.querySelector('[data-field="content"]').dataset.pinned, "true");
+  assert.equal(h.elements.tableBody.children[0].querySelector('[data-field="content"]').style.left, "0px");
+  assert.notEqual(h.elements.tableHead.querySelector('[data-field="__overview_comment_actions"]').dataset.pinned, "true");
+  await h.elements.clearColumnPins.click();
+  assert.deepEqual(plain(h.state.pinnedColumns.comments), []);
+  assert.equal(h.elements.tableBody.children[0].querySelector('[data-field="content"]').style.left, "");
+});
+
+test("column pins: offsets follow actual selected widths and ignore non-pinned columns", async t => {
+  const prefs = orderedPreferences("comments");
+  prefs.pinnedColumns = {notes:["title"],comments:["__selection", "content", "comment_id"]};
+  const h = await harness(t, prefs);
+  renderLoadedRows(h, [{comment_id:"reply-1",note_id:"note-1",content:"text",thread_root_content:"root"}]);
+  const head=h.elements.tableHead;
+  head.children[0].getBoundingClientRect=()=>({width:42});
+  head.querySelector('[data-field="content"]').getBoundingClientRect=()=>({width:350});
+  h.applyColumnPins();
+  assert.equal(head.querySelector('[data-field="content"]').style.left,"42px");
+  assert.equal(head.querySelector('[data-field="comment_id"]').style.left,"392px");
+  head.querySelector('[data-field="content"]').getBoundingClientRect=()=>({width:600});
+  h.applyColumnPins();
+  assert.equal(head.querySelector('[data-field="comment_id"]').style.left,"642px");
+  assert.deepEqual(plain(h.state.pinnedColumns.notes),["title"]);
+  h.state.pinnedColumns.comments = ["missing-column"];
+  h.applyColumnPins();
+  assert.ok(head.children.every(c=>c.dataset.pinned!=="true"));
+});
+
+
+async function setColumnPinned(h, key, checked) {
+  const input = h.elements.columnPinOptions.querySelector('input[data-pin-field="' + key + '"]');
+  assert.ok(input, "real pin checkbox exists: " + key);
+  input.checked = checked;
+  // Dispatch synchronously: callers can assert the new slots before any rAF/query.
+  const changed = h.elements.columnPinOptions.emit("change", { target: input });
+  return changed;
+}
+
+function assertPinnedSlots(h, keys) {
+  assert.deepEqual(plain(h.tableLayoutFields()).map(field => field.key), keys);
+  assertTableColumns(h, keys, { includesActions: true });
+}
+
+function retainedColumnNodes(h) {
+  const rows = [h.elements.tableHead, ...h.elements.tableBody.children].map(row => ({ row, cells: [...row.children] }));
+  return () => rows.forEach(({ row, cells }, index) => {
+    assert.equal(index ? h.elements.tableBody.children[index - 1] : h.elements.tableHead, row);
+    assert.equal(row.children.length, cells.length);
+    cells.forEach(cell => assert.equal(cell.parentNode, row, "pinning moves existing nodes"));
+    assert.equal(row.children[0], cells[0], "selection stays in utility slot 0");
+    assert.equal(row.children[1], cells[1], "row number stays in utility slot 1");
+  });
+}
+
+test("column pins regression: trailing comment action moves immediately to first data slot and unpin restores saved order", async t => {
+  const h = await harness(t, orderedPreferences("comments"));
+  h.state.selectedIds.add("c1");
+  renderLoadedRows(h, rowsForExport(2));
+  Object.assign(h.elements.tableViewport, { scrollTop: 137, scrollLeft: 415 });
+  const action = "__overview_comment_actions", keys = visualKeys(h);
+  const before = localSnapshot(h), savedBefore = stored(h), payload = plain(h.queryPayload());
+  const retained = retainedColumnNodes(h);
+  const actionCells = [h.elements.tableHead, ...h.elements.tableBody.children].map(row => row.children.at(-1));
+  const change = setColumnPinned(h, action, true);
+  assertPinnedSlots(h, [action, ...keys]); // No await, rerender or animation-frame flush.
+  [h.elements.tableHead, ...h.elements.tableBody.children].forEach((row, index) => {
+    assert.equal(row.children[2], actionCells[index]);
+    assert.equal(actionCells[index].dataset.pinned, "true");
+    assert.equal(actionCells[index].style.left, "0px");
+    assert.equal(Number(actionCells[index].rowSpan || 1), 1);
+  });
+  await change;
+  h.syncColumnPins(); h.flushAnimationFrames();
+  assertLocalUnchanged(h, before); retained();
+  assert.deepEqual(visualKeys(h), keys);
+  assert.deepEqual(plain(h.queryPayload()), payload);
+  assert.deepEqual(stored(h), { ...savedBefore, pinnedColumns: { ...savedBefore.pinnedColumns, comments: [action] } });
+  assert.equal(h.elements.tableBody.children[1].querySelector('[data-role="select-row"]').checked, true);
+  const unpin = setColumnPinned(h, action, false);
+  assertTableColumns(h, keys);
+  [h.elements.tableHead, ...h.elements.tableBody.children].forEach((row, index) => {
+    assert.equal(row.children.at(-1), actionCells[index]);
+    assert.equal(actionCells[index].style.left, "");
+    assert.notEqual(actionCells[index].dataset.pinned, "true");
+  });
+  await unpin; h.flushAnimationFrames();
+  assertLocalUnchanged(h, before); retained();
+  assert.deepEqual(stored(h), savedBefore);
+});
+
+test("column pins regression: multiple pins preserve logical rowspan slots across an in-flight append", { timeout: 3000 }, async t => {
+  const saved = orderedPreferences("comments");
+  saved.savedViews.comments.groupThreads = true;
+  const h = await harness(t, saved);
+  const action = "__overview_comment_actions", keys = visualKeys(h);
+  const all = rowsForExport(4).map((row, index) => ({ ...row, thread_root_id: index < 3 ? "root-a" : "root-b" }));
+  h.state.selectedIds.add("c1");
+  renderLoadedRows(h, all.slice(0, 2), { total: 4, pageSize: 2 });
+  const retained = retainedColumnNodes(h), savedOrder = stored(h).columnOrder;
+  const root = h.elements.tableBody.children[0].querySelector('[data-field="thread_root_content"]');
+  assert.equal(root.rowSpan, 2);
+  let release;
+  h.respondWith(() => new Promise(resolve => { release = resolve; }));
+  const appending = h.runQuery({ append: true });
+  await Promise.resolve();
+  const before = localSnapshot(h), payload = plain(h.queryPayload());
+  // Toggle in reverse order: pin click chronology must not replace saved field order.
+  for (const key of [action, "thread_root_content", "content", "__row_number", "__selection"]) await setColumnPinned(h, key, true);
+  const expected = ["content", "thread_root_content", action, ...keys.filter(key => !["content", "thread_root_content"].includes(key))];
+  assertPinnedSlots(h, expected);
+  assertLocalUnchanged(h, before); retained();
+  assert.deepEqual(plain(h.queryPayload()), payload);
+  assert.deepEqual(stored(h).columnOrder, savedOrder);
+  const head = h.elements.tableHead;
+  head.children.forEach((cell, index) => { cell.getBoundingClientRect = () => ({ width: [42, 42, 350, 200, 96][index] || 160 }); });
+  h.syncColumnPins();
+  assert.equal(head.children[2].style.left, "84px");
+  assert.equal(root.style.left, "434px");
+  assert.equal(head.querySelector('[data-field="' + action + '"]').style.left, "634px");
+  release(pageResult(h.queries[0], all));
+  await appending; h.flushAnimationFrames();
+  assert.equal(h.queries.length, 1, "pin changes never replace the pending query");
+  assert.deepEqual(h.queries[0].fields, payload.fields);
+  assert.equal(root.rowSpan, 3);
+  assertPinnedSlots(h, expected); retained();
+  assert.equal(h.elements.tableBody.children[2].querySelector('[data-field="thread_root_content"]'), null);
+  assert.equal(h.elements.tableBody.children[1].querySelector('[data-role="select-row"]').checked, true);
+  assert.deepEqual([...h.state.selectedIds], ["c1"]);
+  const afterAppend = localSnapshot(h);
+  await setColumnPinned(h, "thread_root_content", false);
+  assertPinnedSlots(h, ["content", action, ...keys.filter(key => key !== "content")]);
+  await h.elements.clearColumnPins.click();
+  assertTableColumns(h, keys); retained();
+  assert.equal(root.rowSpan, 3);
+  assertLocalUnchanged(h, afterAppend);
+  assert.deepEqual(stored(h).columnOrder, savedOrder);
+});
+
+test("column pins regression: real drag keeps action pinned and unpin reveals the new explicit saved order", async t => {
+  const h = await gestureHarness(t), action = "__overview_comment_actions";
+  const retained = retainedColumnNodes(h), originalOrder = stored(h).columnOrder;
+  await setColumnPinned(h, action, true);
+  await setColumnPinned(h, "content", true);
+  assert.deepEqual(stored(h).columnOrder, originalOrder);
+  const before = localSnapshot(h);
+  const point = (header, fraction) => {
+    const rect = header.getBoundingClientRect();
+    return { clientX: rect.left + rect.width * fraction, clientY: rect.top + rect.height / 2 };
+  };
+  dispatchFixtureEvent("dragstart", h.eventPath, { target: h.source.querySelector(".column-grip"), dataTransfer: h.dataTransfer, ...point(h.source, 0.5) });
+  const enter = dispatchFixtureEvent("dragenter", h.eventPath, { target: h.target, dataTransfer: h.dataTransfer, ...point(h.target, 0.25) });
+  assert.equal(enter.defaultPrevented, true);
+  const drop = dispatchFixtureEvent("drop", h.eventPath, { target: h.target, dataTransfer: h.dataTransfer, ...point(h.target, 0.25) });
+  assert.equal(drop.defaultPrevented, true);
+  h.flushAnimationFrames(); assertDragFinished(h);
+  const keys = ["thread_root_content", "comment_id", "note_id", "post_locator", "content", "published_at"];
+  assert.deepEqual(visualKeys(h), keys);
+  assertPinnedSlots(h, ["content", action, ...keys.filter(key => key !== "content")]);
+  assertLocalUnchanged(h, before); retained();
+  const savedKeys = h.schema.datasets.comments.fields.map(field => field.key).filter(key => key !== "thread_root_content");
+  savedKeys.unshift("thread_root_content");
+  assert.deepEqual(stored(h).columnOrder.comments, savedKeys);
+  assert.deepEqual(stored(h).columnOrder.notes, originalOrder.notes);
+  const draggedOrder = stored(h).columnOrder;
+  await h.elements.clearColumnPins.click();
+  assertTableColumns(h, keys); retained(); assertLocalUnchanged(h, before);
+  assert.deepEqual(stored(h).columnOrder, draggedOrder, "only explicit drag, never pin/unpin, changes saved order");
+});
+
+test("column pins regression: pinned layout never changes export field order or includes action fields", async t => {
+  const h = await harness(t, orderedPreferences("comments"));
+  const rows = rowsForExport(2);
+  renderLoadedRows(h, rows);
+  h.respondWith(request => pageResult(request, rows));
+  await h.exportCurrentPage();
+  const exportBefore = await h.blobs[0].text(), payloadBefore = plain(h.queries[0]);
+  const savedOrder = stored(h).columnOrder, keys = visualKeys(h);
+  await setColumnPinned(h, "__overview_comment_actions", true);
+  await setColumnPinned(h, "published_at", true);
+  assertPinnedSlots(h, ["published_at", "__overview_comment_actions", ...keys.filter(key => key !== "published_at")]);
+  await h.exportCurrentPage();
+  assert.equal(h.queries.length, 2);
+  assert.deepEqual(h.queries[1], payloadBefore);
+  assert.equal(await h.blobs[1].text(), exportBefore);
+  assert.doesNotMatch(exportBefore, /__overview_comment_actions/);
+  assert.deepEqual(visualKeys(h), keys);
+  assert.deepEqual(stored(h).columnOrder, savedOrder);
+});
+
+test("row colors use published conclusion and explicit deletion, independently", async t => {
+  const h = await harness(t, orderedPreferences("comments"));
+  const check=(row,expected,dataset="comments")=>assert.deepEqual(plain(h.rowVisualState(row,dataset)),expected);
+  check({analysis_is_negative:"是"},{negative:true,deleted:false});
+  check({analysis_is_negative:"否",is_deleted:"0",access_status:"check_failed",is_negative:1,risk_level:"high"},{negative:false,deleted:false});
+  check({is_deleted:1,analysis_is_negative:"是"},{negative:true,deleted:true});
+  check({comment_status:"已删除"},{negative:false,deleted:true});
+  check({post__post_status:"已删除"},{negative:false,deleted:true});
+  check({post_status:"已删除"},{negative:false,deleted:true},"notes");
+  renderLoadedRows(h, [{comment_id:"one",note_id:"note",content:"text",analysis_is_negative:"是",is_deleted:1}]);
+  assert.equal(h.elements.tableBody.children[0].dataset.rowNegative,"true");
+  assert.equal(h.elements.tableBody.children[0].dataset.rowDeleted,"true");
+});
+
+test("row colors query hidden status fields without changing visible or export columns", async t=>{
+  const h=await harness(t, orderedPreferences("comments"));
+  h.schema.datasets.comments.fields.push(field("is_deleted",{dataType:"boolean"}),field("analysis_is_negative"),field("post__is_deleted",{dataType:"boolean"}));
+  const before=plain(h.currentVisibleFields());
+  const payload=h.queryPayload();
+  for(const key of ["is_deleted","analysis_is_negative","post__is_deleted"])assert.ok(payload.fields.includes(key));
+  assert.deepEqual(plain(h.currentVisibleFields()),before);
+});
+
+test("Excel export sends frozen full-result query and downloads xlsx, not loaded subset", async t=>{
+  const h=await harness(t,orderedPreferences("comments"));
+  renderLoadedRows(h,rowsForExport(3),{total:401});
+  h.elements.exportFormat.value="xlsx";
+  h.state.search="specific";h.state.filters=[{id:"f",field:"content",operator:"contains",value:"x"}];
+  let received;
+  h.respondExportWith(p=>{received=p;return {ok:true,dataset:p.dataset,total:401,snapshotToken:p.snapshotToken,consistentSnapshot:true,contentBase64:Buffer.from([80,75,3,4,1,2,3]).toString("base64")};});
+  await h.exportCurrentPage();
+  assert.equal(received.expectedTotal,401);assert.equal(received.search,"specific");assert.equal(received.filter.children[0].value,"x");
+  assert.equal(h.queries.length,0);assert.equal(h.downloads.length,1);assert.match(h.downloads[0].filename,/filtered-401\.xlsx$/);
+  assert.equal(h.blobs[0].type,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+});
+
+test("Excel export rejects changed totals, changed snapshot and invalid workbook without downloads", async t=>{
+  for(const bad of [{total:1},{snapshotToken:"changed"},{contentBase64:"YmFk"}]){
+    const h=await harness(t,orderedPreferences("comments"));renderLoadedRows(h,rowsForExport(2));h.elements.exportFormat.value="xlsx";
+    h.respondExportWith(p=>({ok:true,total:2,dataset:p.dataset,snapshotToken:p.snapshotToken,consistentSnapshot:true,contentBase64:"UEsDBA==",...bad}));
+    await h.exportCurrentPage();assert.equal(h.downloads.length,0);assert.equal(h.state.exporting,false);
+  }
+});
+
+const MULTI_VALUES = ["Alpha, West", "上海，北京", "第一行\n第二行", "0"];
+function multiValuePreferences(values = MULTI_VALUES, operator = "in") {
+  const saved = preferences("comments");
+  saved.savedViews.comments.filters = [{ id: "multi", field: "content", operator, value: values, value2: "" }];
+  return saved;
+}
+const settleValueOptions = () => new Promise(resolve => setImmediate(resolve));
+const filterValueControl = h => h.elements.filterRows.querySelector('input[data-role="value"]');
+const valueEntries = values => values.map((value, i) => ({ value, label: value, count: i + 1 }));
+
+test("multi-value input: make/write/read preserve complete comma and newline values without aliasing", async t => {
+  const h = await harness(t);
+  for (const dataType of ["text", "number", "datetime", "boolean"]) {
+    const original = [...MULTI_VALUES];
+    const input = h.makeValueInput(field("value", { dataType }), original, "value", "in");
+    assert.equal(input.type, "text", dataType);
+    assert.deepEqual(JSON.parse(input.value), MULTI_VALUES, "ambiguous separators require JSON representation");
+    original.push("caller mutation");
+    const read = h.readFilterInput(input);
+    assert.deepEqual(plain(read), MULTI_VALUES);
+    read.push("reader mutation");
+    assert.deepEqual(plain(h.readFilterInput(input)), MULTI_VALUES, "reads return independent arrays");
+    h.writeFilterInput(input, ["上海", "北京", 0]);
+    assert.equal(input.value, "上海, 北京, 0");
+    assert.deepEqual(plain(h.readFilterInput(input)), ["上海", "北京", "0"]);
+    h.writeFilterInput(input, []);
+    assert.equal(input.value, ""); assert.deepEqual(plain(h.readFilterInput(input)), []);
+  }
+});
+
+test("multi-value input: editing invalidates cached selections and supports JSON or legacy delimiters", async t => {
+  const h = await harness(t), input = h.makeValueInput(field("value"), MULTI_VALUES, "value", "in");
+  input.value = '  ["new, whole", "沪，京", 0, "new, whole"]  ';
+  assert.equal(h.readFilterInput(input), input.value, "typed text takes precedence over old cached array");
+  assert.deepEqual(plain(h.splitFilterValues(h.readFilterInput(input))), ["new, whole", "沪，京", "0"]);
+  input.value = " 上海， 北京,0\n上海 , ";
+  assert.deepEqual(plain(h.splitFilterValues(h.readFilterInput(input))), ["上海", "北京", "0"]);
+  assert.deepEqual(plain(h.splitFilterValues(MULTI_VALUES)), MULTI_VALUES);
+  assert.deepEqual(plain(h.splitFilterValues("[]")), []);
+});
+
+test("multi-value preferences: arrays survive save, dataset switches, schema refresh and reload", async t => {
+  const saved = multiValuePreferences(), h = await harness(t, saved);
+  assert.equal(h.state.filters[0].operator, "in");
+  assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES);
+  assert.deepEqual(plain(h.readFilterInput(filterValueControl(h))), MULTI_VALUES);
+  h.scheduleQuery(0);
+  assert.deepEqual(stored(h).savedViews.comments.filters[0].value, MULTI_VALUES);
+  await h.buttons.notes.emit("click");
+  assert.deepEqual(plain(h.state.filters), saved.savedViews.notes.filters);
+  await h.buttons.comments.emit("click");
+  assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES);
+  await h.loadSchema();
+  assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES);
+  const again = await harness(t, stored(h));
+  assert.deepEqual(plain(again.state.filters[0].value), MULTI_VALUES);
+  assert.deepEqual(plain(again.queryPayload().filter.children[0]), {
+    field: "content", operator: "in", value: MULTI_VALUES, value2: ""
+  });
+});
+
+test("multi-value picker: eq and in use checkbox details; commit upgrades eq and bubbles input to persistence", async t => {
+  const values = ["Alpha, West", "上海，北京", "0"];
+  const h = await harness(t, multiValuePreferences(values[0], "eq"), { valueOptions: valueEntries(values) });
+  await settleValueOptions();
+  const row = h.elements.filterRows.children[0], menu = row.querySelector("details.filter-multi-menu");
+  assert.ok(menu, "an eq field supporting in gets the multiselect picker");
+  assert.equal(row.querySelector("select.filter-value-options"), null);
+  const checkboxes = menu.querySelectorAll('input[type="checkbox"]');
+  assert.deepEqual(checkboxes.map(box => box.value), values);
+  assert.deepEqual(checkboxes.map(box => box.checked), [true, false, false]);
+  let bubbledInputs = 0;
+  h.elements.filterRows.addEventListener("input", event => {
+    assert.equal(event.target, filterValueControl(h)); bubbledInputs++;
+  });
+  checkboxes[1].checked = true; await checkboxes[1].emit("change");
+  assert.equal(bubbledInputs, 1);
+  assert.equal(h.state.filters[0].operator, "in");
+  assert.equal(row.querySelector('[data-role="operator"]').value, "in");
+  assert.deepEqual(plain(h.state.filters[0].value), values.slice(0, 2));
+  assert.deepEqual(stored(h).savedViews.comments.filters[0].value, values.slice(0, 2));
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 360), "real delegated input handler scheduled the query");
+  assert.deepEqual(plain(h.queryPayload().filter.children[0].value), values.slice(0, 2));
+  checkboxes[1].checked = true; await checkboxes[1].emit("change");
+  assert.deepEqual(plain(h.state.filters[0].value), values.slice(0, 2), "duplicate selection is idempotent");
+  h.renderFilters(); await settleValueOptions();
+  assert.ok(h.elements.filterRows.querySelector("details.filter-multi-menu"), "in rerender retains the picker");
+  assert.deepEqual(h.elements.filterRows.querySelectorAll('input[type="checkbox"]').map(box => box.checked), [true, true, false]);
+  assert.equal(h.queries.length, 0, "selecting values queues rather than immediately submits the query");
+});
+
+test("multi-value picker: removing chips preserves remaining exact values and final removal blocks requests", async t => {
+  const h = await harness(t, multiValuePreferences(MULTI_VALUES.slice(0, 2)), { valueOptions: valueEntries(MULTI_VALUES) });
+  await settleValueOptions();
+  renderLoadedRows(h, rowsForExport(2));
+  const previousRows = h.state.rows;
+  await h.elements.filterRows.querySelector(".filter-value-chip").click();
+  assert.deepEqual(plain(h.state.filters[0].value), [MULTI_VALUES[1]]);
+  assert.deepEqual(stored(h).savedViews.comments.filters[0].value, [MULTI_VALUES[1]]);
+  await h.elements.filterRows.querySelector(".filter-value-chip").click();
+  assert.deepEqual(plain(h.state.filters[0].value), []);
+  assert.equal(h.state.filters[0].operator, "in");
+  assert.deepEqual(stored(h).savedViews.comments.filters[0].value, []);
+  assert.equal(h.elements.filterDraftNotice.hidden, false);
+  assert.equal(h.elements.exportCurrent.disabled, true);
+  assert.equal(h.elements.infiniteSentinel.hidden, true);
+  assert.ok(![...h.timers.values()].some(timer => timer.delay === 360), "last removal cancels the pending prior selection query");
+  await h.runQuery(); await h.exportCurrentPage();
+  assert.equal(h.queries.length, 0); assert.equal(h.downloads.length, 0); assert.equal(h.state.rows, previousRows);
+});
+
+test("multi-value operators: switching a selected array to eq never silently joins several values", async t => {
+  for (const values of [MULTI_VALUES, [MULTI_VALUES[0]], []]) {
+    const h = await harness(t, multiValuePreferences(values));
+    const operator = h.elements.filterRows.querySelector('[data-role="operator"]');
+    operator.value = "eq"; await h.elements.filterRows.emit("change", { target: operator });
+    const expected = values.length === 1 ? values[0] : "";
+    assert.equal(h.state.filters[0].operator, "eq");
+    assert.equal(h.state.filters[0].value, expected);
+    assert.equal(filterValueControl(h).value, expected);
+    assert.equal(stored(h).savedViews.comments.filters[0].value, expected);
+    assert.equal(h.queryPayload().filter.children[0].value, expected);
+    assert.equal(h.validateFilterDraft(), values.length === 1);
+    if (values.length !== 1) {
+      h.state.queryReady = true; await h.runQuery();
+      assert.equal(h.queries.length, 0, "cleared multi-value draft must pause instead of running a joined equality");
+    }
+  }
+});
+
+test("multi-value query: runtime payload receives arrays with intact commas, no UI IDs and no alias to state", async t => {
+  const h = await harness(t, multiValuePreferences()), all = rowsForExport(3);
+  renderLoadedRows(h, all);
+  h.respondWith(request => pageResult(request, all));
+  const projected = h.queryPayload();
+  projected.filter.children[0].value.push("query copy only");
+  assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES);
+  await h.runQuery();
+  assert.equal(h.queries.length, 1);
+  assert.deepEqual(h.queries[0].filter.children, [{ field: "content", operator: "in", value: MULTI_VALUES, value2: "" }]);
+});
+
+test("multi-value export: CSV pages keep the exact queried in array after the live draft changes", async t => {
+  const h = await harness(t, multiValuePreferences()), all = rowsForExport(237);
+  renderLoadedRows(h, all.slice(0, 100), { total: all.length });
+  h.respondWith(request => pageResult(request, all));
+  await h.runQuery();
+  const queriedFilter = h.queries[0].filter;
+  h.respondWith(request => {
+    h.state.filters[0].value.push("later selection");
+    return pageResult(request, all);
+  });
+  h.elements.exportFormat.value = "csv";
+  await h.exportCurrentPage();
+  assert.equal(h.downloads.length, 1);
+  assert.ok(h.queries.length >= 3, "exercise multiple export pages, not only the initial screen");
+  for (const request of h.queries.slice(1)) assert.deepEqual(request.filter, queriedFilter);
+  assert.deepEqual(queriedFilter.children[0].value, MULTI_VALUES);
+  assert.ok((await h.blobs[0].text()).includes("filtered-236"));
+});
+
+test("multi-value export: Excel request carries the same complete in filter as query and storage", async t => {
+  const h = await harness(t, multiValuePreferences()), all = rowsForExport(3);
+  renderLoadedRows(h, all); h.scheduleQuery(0);
+  const savedFilter = stored(h).savedViews.comments.filters[0];
+  h.respondWith(request => pageResult(request, all)); await h.runQuery();
+  let received;
+  h.respondExportWith(request => {
+    received = request;
+    h.state.filters[0].value.push("later selection");
+    return { ok: true, dataset: request.dataset, total: all.length, snapshotToken: request.snapshotToken,
+      consistentSnapshot: true, contentBase64: "UEsDBA==" };
+  });
+  h.elements.exportFormat.value = "xlsx"; await h.exportCurrentPage();
+  assert.equal(h.downloads.length, 1);
+  assert.deepEqual(received.filter, h.queries[0].filter);
+  assert.equal(received.filter.children[0].operator, "in");
+  assert.deepEqual(received.filter.children[0].value, savedFilter.value);
+  assert.deepEqual(received.filter.children[0].value, MULTI_VALUES);
+});
+
+test("multi-value empty draft: no query or export runs, old rows remain and array persistence survives reload", async t => {
+  const h = await harness(t, multiValuePreferences([]));
+  renderLoadedRows(h, rowsForExport(2)); const rows = h.state.rows;
+  assert.match(h.filterDraftProblem(), /尚未填写完整/);
+  h.scheduleQuery(0);
+  await h.runQuery(); await h.runQuery({ append: true }); await h.exportCurrentPage();
+  assert.equal(h.queries.length, 0); assert.equal(h.downloads.length, 0);
+  assert.equal(h.state.rows, rows); assert.equal(h.state.resetScheduled, true);
+  assert.equal(h.elements.filterDraftNotice.hidden, false);
+  assert.match(h.elements.filterDraftNotice.textContent, /上次结果/);
+  assert.ok(![...h.timers.values()].some(timer => timer.delay === 0));
+  const again = await harness(t, stored(h));
+  assert.equal(again.state.filters[0].operator, "in");
+  assert.deepEqual(plain(again.state.filters[0].value), []);
+  assert.equal(again.validateFilterDraft(), false);
+});
+
+test("multi-value empty text: JSON empty arrays and delimiter-only input pause just like an empty selection", async t => {
+  const h = await harness(t, multiValuePreferences());
+  for (const value of ["[]", " ,，\n "]) {
+    const input = filterValueControl(h); input.value = value;
+    input.dispatchEvent({ type: "input", bubbles: true });
+    assert.deepEqual(plain(h.splitFilterValues(h.state.filters[0].value)), []);
+    assert.equal(h.validateFilterDraft(), false, `empty parsed in value must block: ${JSON.stringify(value)}`);
+    assert.equal(h.elements.filterDraftNotice.hidden, false);
+    assert.ok(![...h.timers.values()].some(timer => timer.delay === 360));
+    h.state.queryReady = true; await h.runQuery(); assert.equal(h.queries.length, 0);
+  }
+});
+
+test("multi-value operators: manually edited JSON arrays cannot become a literal JSON equality", async t => {
+  for (const values of [["Alpha, West", "上海，北京"], ["Alpha, West"]]) {
+    const h = await harness(t, multiValuePreferences());
+    const input = filterValueControl(h); input.value = JSON.stringify(values);
+    input.dispatchEvent({ type: "input", bubbles: true });
+    assert.deepEqual(plain(h.queryPayload().filter.children[0].value), values);
+    const operator = h.elements.filterRows.querySelector('[data-role="operator"]');
+    operator.value = "eq"; await h.elements.filterRows.emit("change", { target: operator });
+    assert.equal(h.state.filters[0].value, values.length === 1 ? values[0] : "",
+      "operator conversion must use interpreted in values, not the JSON display string");
+  }
+});
+
+test("multi-value boundary matrix: builder and column share limits; eq-to-in preserves one complete value", async t => {
+  const hundred = Array.from({ length: 100 }, (_, i) => `value-${i}`);
+  const cases = [
+    { name: "empty JSON", value: "[]", valid: false },
+    { name: "only separators", value: " ,，\n ", valid: false },
+    { name: "101 selected values", value: [...hundred, "overflow"], valid: false },
+    { name: "101 JSON values", value: JSON.stringify([...hundred, "overflow"]), valid: false },
+    { name: "101 comma-separated values", value: [...hundred, "overflow"].join(","), valid: false },
+    { name: "exactly 100 values", value: hundred, valid: true },
+    { name: "100 unique values plus duplicate", value: [...hundred, hundred[0]], valid: true },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async sub => {
+      const builder = await harness(sub, multiValuePreferences(["original"]));
+      builder.state.filters[0].value = entry.value;
+      assert.equal(builder.validateFilterDraft(), entry.valid, "builder validates parsed unique cardinality");
+      if (!entry.valid) {
+        builder.scheduleQuery(0); builder.state.queryReady = true; await builder.runQuery();
+        assert.equal(builder.queries.length, 0);
+        assert.equal(builder.elements.exportCurrent.disabled, true);
+      } else assert.equal(builder.queryPayload().filter.children[0].value.length, 100);
+
+      const column = await harness(sub, multiValuePreferences(["original"]));
+      const previousFilters = plain(column.state.filters), previousStored = stored(column);
+      column.openColumnFilter("content", null);
+      assert.equal(column.elements.columnFilterOperator.value, "in");
+      const input = column.elements.columnFilterValueWrap.querySelector('[data-role="value"]');
+      let focused = false; input.focus = () => { focused = true; };
+      column.writeFilterInput(input, entry.value);
+      await column.elements.applyColumnFilter.click();
+      assert.equal(column.elements.columnFilterPopover.hidden, entry.valid, "invalid column draft stays open");
+      if (!entry.valid) {
+        assert.equal(focused, true);
+        assert.deepEqual(plain(column.state.filters), previousFilters, "rejected apply preserves existing rules");
+        assert.deepEqual(stored(column), previousStored, "rejected apply does not persist a replacement");
+        assert.equal(column.state.resetScheduled, false);
+      } else {
+        assert.equal(column.state.filters.length, 1);
+        assert.equal(column.state.filters[0].operator, "in");
+        assert.deepEqual(plain(column.queryPayload().filter.children[0].value), hundred);
+        assert.equal(column.state.resetScheduled, true);
+      }
+      assert.equal(column.queries.length, 0);
+    });
+  }
+  for (const value of [...MULTI_VALUES, '["literal JSON-looking single value"]']) {
+    await t.test(`eq-to-in ${JSON.stringify(value)}`, async sub => {
+      const h = await harness(sub, multiValuePreferences(value, "eq"));
+      const operator = h.elements.filterRows.querySelector('[data-role="operator"]');
+      operator.value = "in"; await h.elements.filterRows.emit("change", { target: operator });
+      assert.equal(h.state.filters[0].operator, "in");
+      assert.deepEqual(plain(h.state.filters[0].value), [value]);
+      assert.deepEqual(plain(h.readFilterInput(filterValueControl(h))), [value]);
+      assert.deepEqual(plain(h.queryPayload().filter.children[0].value), [value]);
+      assert.deepEqual(stored(h).savedViews.comments.filters[0].value, [value]);
+    });
+  }
+});
+
+function pendingResponse() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
+async function commentReturnHarness(t, { semantic = false, notice = false } = {}) {
+  const h = await harness(t, multiValuePreferences());
+  h.schema.queryReady = true;
+  h.state.visibleFields.comments.push("post_locator");
+  h.state.semanticSearch = semantic; h.state.semanticAwaitingSubmit = false;
+  h.state.groupThreads = true;
+  const rows = rowsForExport(237).map(row => ({ ...row, post_locator: row.note_id }));
+  renderLoadedRows(h, rows, { total: 450, pageSize: 100 });
+  h.state.page = 3; h.state.hasMore = true;
+  h.state.selectedIds = new Set(["c1", "c203"]);
+  h.elements.semanticStatus.textContent = semantic ? "语义检索 · fixture-model · 相关度降序" : "普通搜索 · 关键词匹配";
+  h.elements.filterDraftNotice.hidden = !notice;
+  h.elements.filterDraftNotice.textContent = notice ? "上次请求未完成，保留此前结果" : "";
+  h.elements.tableViewport.scrollTop = 8123; h.elements.tableViewport.scrollLeft = 417;
+  h.window.scrollY = 250; h.window.scrollX = 19;
+  h.window.scrollCalls = [];
+  h.window.scrollTo = function (options) {
+    this.scrollCalls.push(plain(options)); this.scrollY = options.top; this.scrollX = options.left;
+  };
+  h.respondWith(request => pageResult(request, [{ note_id: "fixture-note", title: "parent post" }]));
+  return h;
+}
+function returnState(h) {
+  return plain({ view: activeView(h.state), semanticSearch: h.state.semanticSearch,
+    semanticAwaitingSubmit: h.state.semanticAwaitingSubmit, rows: h.state.rows,
+    total: h.state.total, page: h.state.page, pageSize: h.state.pageSize, hasMore: h.state.hasMore,
+    selectedIds: [...h.state.selectedIds], semanticStatus: h.elements.semanticStatus.textContent,
+    draftNoticeHidden: h.elements.filterDraftNotice.hidden, draftNotice: h.elements.filterDraftNotice.textContent });
+}
+
+test("comment return: clicked source restores all loaded pages, selection and both scroll surfaces without a first-page query", async t => {
+  const h = await commentReturnHarness(t), before = returnState(h);
+  assert.equal(h.elements.returnToComments.hidden, true);
+  const source = h.elements.tableBody.querySelector('tr[data-record-id="c203"]');
+  const button = source.querySelector('[data-action="locate_post"]');
+  assert.ok(button, "use the rendered row action so its comment ID is passed through production");
+  assert.equal(button.disabled, false, "fixture must include the backend-projected post_locator value");
+  assert.equal(button.dataset.value, "fixture-note");
+  await h.runTableAction(button);
+  assert.equal(h.state.dataset, "notes"); assert.equal(h.elements.returnToComments.hidden, false);
+  assert.equal(h.getCommentReturnPoint().commentId, "c203");
+  assert.equal(h.queries.length, 1); assert.equal(h.queries[0].dataset, "notes");
+  assert.equal(h.queries[0].filter.children[0].value, "fixture-note");
+  h.elements.tableViewport.scrollTop = 0; h.elements.tableViewport.scrollLeft = 0;
+  h.window.scrollY = 0; h.window.scrollX = 0;
+  const click = h.elements.returnToComments.click();
+  assert.equal(h.state.dataset, "comments", "cache restore is synchronous before the click promise resolves");
+  await click; h.flushAnimationFrames();
+  assert.deepEqual(returnState(h), before);
+  assert.equal(h.elements.tableBody.querySelectorAll("tr[data-record-id]").length, 237);
+  assert.equal(h.elements.tableViewport.scrollTop, 8123); assert.equal(h.elements.tableViewport.scrollLeft, 417);
+  assert.equal(h.window.scrollY, 250); assert.equal(h.window.scrollX, 19);
+  assert.equal(h.window.scrollCalls.length, 2, "both animation frames restore document scroll");
+  const restoredSource = h.elements.tableBody.querySelector('tr[data-record-id="c203"]');
+  assert.equal(restoredSource.classList.contains("return-comment-highlight"), true);
+  assert.equal(restoredSource.querySelector('[data-action="locate_post"]').focusCalls.at(-1).preventScroll, true);
+  assert.equal(h.elements.returnToComments.hidden, true); assert.equal(h.getCommentReturnPoint(), null);
+  assert.equal(h.queries.length, 1, "return never refetches the first comments batch");
+  assert.ok(!JSON.stringify(stored(h)).includes('"rows"'), "bookmark rows remain memory-only");
+});
+
+test("comment return: committed semantic search, array filters, sort, grouping and draft notice survive notes navigation", async t => {
+  const h = await commentReturnHarness(t, { semantic: true, notice: true }), before = returnState(h);
+  await h.locatePostInDatabase("fixture-note", "c203");
+  assert.equal(h.state.semanticSearch, false);
+  assert.equal(h.queries[0].semanticSearch, false);
+  h.state.savedViews.comments.filters[0].value.push("unrelated later edit");
+  h.returnToCommentPosition(); h.flushAnimationFrames();
+  assert.deepEqual(returnState(h), before);
+  assert.equal(h.elements.globalSearch.value, before.view.search);
+  assert.equal(h.state.semanticAwaitingSubmit, false, "restored committed semantic results are not marked unsubmitted");
+  assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES);
+  assert.deepEqual(stored(h).savedViews.comments.filters[0].value, MULTI_VALUES);
+  assert.equal(h.elements.exportCurrent.disabled, true, "restored draft notice keeps export paused");
+  assert.equal(h.queries.length, 1);
+});
+
+test("comment return: returning during a pending notes query cancels debounce and rejects late rows, loading and locate scroll", async t => {
+  const h = await commentReturnHarness(t), before = returnState(h), pending = pendingResponse();
+  h.respondWith(() => pending.promise);
+  const locating = h.locatePostInDatabase("fixture-note", "c203");
+  assert.equal(h.state.loading, true);
+  await h.runQuery(); assert.equal(h.state.queryPending, true);
+  h.scheduleQuery(180); assert.equal(h.state.resetScheduled, true);
+  const oldSerial = h.state.querySerial;
+  h.returnToCommentPosition(); h.flushAnimationFrames();
+  assert.ok(h.state.querySerial > oldSerial);
+  assert.equal(h.state.loading, false); assert.equal(h.state.queryPending, false); assert.equal(h.state.resetScheduled, false);
+  assert.ok(![...h.timers.values()].some(timer => timer.delay === 180));
+  assert.deepEqual(returnState(h), before);
+  const currentRows = h.state.rows, currentNodes = [...h.elements.tableBody.children], toast = h.elements.toast.textContent;
+  pending.resolve(pageResult(h.queries[0], [{ note_id: "late-parent", title: "late note" }]));
+  await locating; await settleValueOptions(); h.flushAnimationFrames();
+  assert.equal(h.state.rows, currentRows); assert.deepEqual([...h.elements.tableBody.children], currentNodes);
+  assert.deepEqual(returnState(h), before); assert.equal(h.queries.length, 1);
+  assert.equal(h.elements.toast.textContent, toast, "late locate completion must not replace the return message");
+  assert.ok(currentNodes.every(row => !row.scrollIntoViewCalls?.length), "late note completion must not scroll the restored comments");
+  assert.equal(h.elements.dataSurface.getAttribute("aria-busy"), "false");
+});
+
+test("comment return: in-flight comment append is cancelled and never injected into the restored cached pages", async t => {
+  const h = await commentReturnHarness(t), before = returnState(h), pending = pendingResponse();
+  h.respondWith(request => request.dataset === "comments" ? pending.promise
+    : pageResult(request, [{ note_id: "fixture-note", title: "parent" }]));
+  const appending = h.runQuery({ append: true });
+  assert.equal(h.queries[0].page, 4); assert.equal(h.state.loading, true);
+  await h.locatePostInDatabase("fixture-note", "c203");
+  assert.equal(h.state.dataset, "notes");
+  h.returnToCommentPosition(); h.flushAnimationFrames();
+  assert.deepEqual(returnState(h), before);
+  pending.resolve({ ok: true, dataset: "comments", snapshotToken: SNAPSHOT, page: 4, pageSize: 100,
+    total: 450, rows: [{ comment_id: "late-append", note_id: "fixture-note", content: "late row" }] });
+  await appending; await settleValueOptions(); h.flushAnimationFrames();
+  assert.deepEqual(returnState(h), before);
+  assert.equal(h.queries.length, 2);
+  assert.equal(h.state.loading, false); assert.equal(h.state.queryPending, false);
+});
+
+test("comment return: token changes, explicit staleness or lost readiness restore a read-only cache", async t => {
+  for (const reason of ["token", "stale", "not-ready"]) {
+    await t.test(reason, async sub => {
+      const h = await commentReturnHarness(sub), before = returnState(h);
+      await h.locatePostInDatabase("fixture-note", "c203");
+      if (reason === "token") h.state.snapshotToken = "new-snapshot";
+      if (reason === "stale") h.state.snapshotStale = true;
+      if (reason === "not-ready") h.state.queryReady = false;
+      const liveToken = h.state.snapshotToken;
+      h.returnToCommentPosition(); h.flushAnimationFrames();
+      assert.deepEqual(plain(h.state.rows), before.rows);
+      assert.equal(h.state.page, 3); assert.equal(h.state.snapshotToken, liveToken, "return must not rewind the live snapshot token");
+      assert.equal(h.state.snapshotStale, true); assert.equal(h.elements.snapshotNotice.hidden, false);
+      assert.match(h.elements.snapshotNoticeText.textContent, /离开时的记录/);
+      assert.equal(h.state.selectedIds.size, 0);
+      assert.equal(h.elements.exportCurrent.disabled, true);
+      assert.equal(h.elements.deleteSelected.disabled, true); assert.equal(h.elements.confirmDelete.disabled, true);
+      assert.ok(h.elements.tableBody.querySelectorAll('[data-role="select-row"]').every(input => input.disabled));
+      const requests = h.messages.length;
+      await h.runQuery(); await h.exportCurrentPage(); await h.elements.deleteSelected.click();
+      assert.equal(h.messages.length, requests); assert.equal(h.downloads.length, 0);
+      assert.equal(h.elements.tableViewport.scrollTop, 8123); assert.equal(h.elements.tableViewport.scrollLeft, 417);
+    });
+  }
+});
+
+test("comment return: unresolved drafts and destructive/export operations prevent bookmark capture", async t => {
+  for (const flag of ["resetScheduled", "queryPending", "semanticAwaitingSubmit", "deletePending", "exporting", "snapshotStale"]) {
+    const h = await commentReturnHarness(t), before = returnState(h);
+    h.state[flag] = true;
+    const serial = h.state.querySerial;
+    await h.locatePostInDatabase("fixture-note", "c203");
+    assert.equal(h.state.dataset, "comments", flag);
+    assert.equal(h.getCommentReturnPoint(), null, flag);
+    assert.equal(h.state.querySerial, serial, flag);
+    assert.equal(h.queries.length, 0, flag);
+    assert.deepEqual(plain(h.state.rows), before.rows, flag);
+    assert.deepEqual(plain(h.state.filters[0].value), MULTI_VALUES, flag);
+  }
+});
+
+test("comment return: manual comments switch discards the bookmark rather than reviving old cached pages later", async t => {
+  const h = await commentReturnHarness(t);
+  h.respondWith(request => pageResult(request, request.dataset === "notes"
+    ? [{ note_id: "fixture-note", title: "parent" }] : [{ comment_id: "fresh-comment", note_id: "fixture-note", content: "fresh" }]));
+  await h.locatePostInDatabase("fixture-note", "c203");
+  await h.buttons.comments.emit("click"); await settleValueOptions();
+  assert.equal(h.getCommentReturnPoint(), null);
+  assert.equal(h.elements.returnToComments.hidden, true);
+  assert.equal(h.state.rows[0].comment_id, "fresh-comment");
+  await h.buttons.notes.emit("click"); await settleValueOptions();
+  const rows = h.state.rows, requests = h.queries.length;
+  h.returnToCommentPosition();
+  assert.equal(h.state.dataset, "notes"); assert.equal(h.state.rows, rows); assert.equal(h.queries.length, requests);
+});
+
+test("comment return: deletion, export or schema refresh blocks return without consuming the bookmark", async t => {
+  for (const flag of ["deletePending", "exporting", "refreshSchema"]) {
+    const h = await commentReturnHarness(t);
+    await h.locatePostInDatabase("fixture-note", "c203");
+    const point = h.getCommentReturnPoint(), rows = h.state.rows, serial = h.state.querySerial;
+    if (flag === "refreshSchema") h.elements.refreshSchema.disabled = true;
+    else h.state[flag] = true;
+    h.returnToCommentPosition();
+    assert.equal(h.state.dataset, "notes", flag); assert.equal(h.state.rows, rows, flag);
+    assert.equal(h.state.querySerial, serial, flag); assert.equal(h.getCommentReturnPoint(), point, flag);
+    if (flag === "refreshSchema") h.elements.refreshSchema.disabled = false;
+    else h.state[flag] = false;
+    h.returnToCommentPosition(); h.flushAnimationFrames();
+    assert.equal(h.state.dataset, "comments"); assert.equal(h.state.rows.length, 237);
+    assert.equal(h.getCommentReturnPoint(), null); assert.equal(h.queries.length, 1);
+  }
+});
+
+test("comment return: a second navigation before animation frames prevents stale scroll restoration", async t => {
+  const h = await commentReturnHarness(t);
+  await h.locatePostInDatabase("fixture-note", "c203");
+  h.returnToCommentPosition();
+  await h.locatePostInDatabase("another-note", "c1");
+  h.elements.tableViewport.scrollTop = 91; h.elements.tableViewport.scrollLeft = 23;
+  h.window.scrollY = 17; h.window.scrollX = 5;
+  h.flushAnimationFrames();
+  assert.equal(h.state.dataset, "notes");
+  assert.equal(h.elements.tableViewport.scrollTop, 91); assert.equal(h.elements.tableViewport.scrollLeft, 23);
+  assert.equal(h.window.scrollY, 17); assert.equal(h.window.scrollX, 5);
+  assert.equal(h.window.scrollCalls.length, 0);
+  assert.equal(h.elements.tableBody.querySelector(".return-comment-highlight"), null);
+  assert.equal(h.queries.length, 2);
+});
+
+const IP_FIELDS = { notes: [field("source_ip_location", { suggestValues: true })], comments: [
+  field("ip_location", { suggestValues: true }), field("post__source_ip_location", { suggestValues: true })
+] };
+function ipEmptyPreferences({ dataset = "comments", key = "ip_location", value = ["广东"], includeEmpty = true, operator = "in" } = {}) {
+  const saved = preferences(dataset);
+  saved.savedViews[dataset].filters = [{ id: "ip", field: key, operator, value, value2: "", ...(includeEmpty ? { includeEmpty: true } : {}) }];
+  return saved;
+}
+const ipEmptyHarness = (t, saved = ipEmptyPreferences(), values = ["广东", "上海"]) =>
+  harness(t, saved, { extraFields: IP_FIELDS, valueOptions: valueEntries(values) });
+const ipValueOrEmpty = (key = "ip_location", value = ["广东"]) => ({ logic: "or", children: [
+  { field: key, operator: "in", value, value2: "" }, { field: key, operator: "is_empty" }
+] });
+
+test("IP empty picker: only the three IP fields show a fixed empty row below search without extra count queries", async t => {
+  for (const [dataset, key] of [["comments", "ip_location"], ["comments", "post__source_ip_location"], ["notes", "source_ip_location"]]) {
+    const h = await ipEmptyHarness(t, ipEmptyPreferences({ dataset, key, includeEmpty: false, operator: "eq", value: "广东" }));
+    await settleValueOptions();
+    const menu = h.elements.filterRows.querySelector("details.filter-multi-menu");
+    const empty = menu.querySelector(".filter-empty-checkbox"), search = menu.querySelector(".filter-options-search");
+    assert.ok(empty, key); assert.equal(empty.dataset.emptyValue, "true");
+    assert.equal(empty.getAttribute("value"), undefined, "empty selection has no fabricated option value attribute");
+    assert.equal(empty.parentNode.hidden, false); assert.equal(empty.parentNode.textContent, "未显示（空值）");
+    assert.equal(empty.parentNode.querySelector("small"), null, "no fabricated empty-value count is displayed");
+    assert.equal(menu.children[menu.children.indexOf(search) + 1], empty.parentNode);
+    assert.equal(empty.parentNode.parentNode, menu, "empty row is outside the replaceable options result list");
+    assert.equal(h.messages.filter(m => m.type === "getDataOverviewValues").length, 1);
+    assert.equal(h.queries.length, 0);
+    search.value = "不存在的属地"; await search.emit("input"); h.fireTimer(250); await settleValueOptions();
+    assert.equal(menu.querySelector(".filter-empty-checkbox"), empty); assert.equal(empty.parentNode.hidden, false);
+    const requests = h.messages.filter(m => m.type === "getDataOverviewValues");
+    assert.equal(requests.length, 2, "search adds only the ordinary options request, never an empty-count query");
+    assert.equal(requests[1].payload.search, search.value); assert.equal(requests[1].payload.field, key);
+    empty.checked = true; await empty.emit("change");
+    assert.equal(h.state.filters[0].operator, "in"); assert.equal(h.state.filters[0].includeEmpty, true);
+    assert.deepEqual(plain(h.state.filters[0].value), ["广东"]);
+    assert.deepEqual(plain(h.queryPayload().filter.children[0]), ipValueOrEmpty(key));
+    assert.equal(h.messages.filter(m => m.type === "getDataOverviewValues").length, 2);
+  }
+  const other = await harness(t, multiValuePreferences()); await settleValueOptions();
+  assert.equal(other.elements.filterRows.querySelector(".filter-empty-checkbox"), null, "ordinary content field must not expose IP-only wording");
+});
+
+test("IP empty query: value-or-empty stays a single subgroup under either global AND or OR", async t => {
+  for (const logic of ["and", "or"]) {
+    const h = await ipEmptyHarness(t);
+    h.state.filterLogic = logic;
+    h.state.filters.push({ id: "other", field: "content", operator: "contains", value: "投诉", value2: "" });
+    const expected = { logic, children: [ipValueOrEmpty(), { field: "content", operator: "contains", value: "投诉", value2: "" }] };
+    assert.deepEqual(plain(h.queryPayload().filter), expected);
+    assert.equal(h.validateFilterDraft(), true);
+    h.state.queryReady = true; h.respondWith(request => pageResult(request, rowsForExport(2)));
+    await h.runQuery(); assert.equal(h.queries.length, 1);
+    assert.deepEqual(h.queries[0].filter, expected);
+    assert.doesNotMatch(JSON.stringify(h.queries[0].filter), /includeEmpty|"id"|未显示/, "UI metadata and empty labels never leak into filter values");
+    assert.equal(h.state.filters[0].includeEmpty, true, "compilation does not consume the display flag");
+  }
+});
+
+test("IP empty-only: empty selection compiles to is_empty and removing it restores incomplete-draft protection", async t => {
+  const h = await ipEmptyHarness(t, ipEmptyPreferences({ value: [] })); await settleValueOptions();
+  assert.equal(h.filterDraftProblem(), ""); assert.equal(h.validateFilterDraft(), true);
+  assert.deepEqual(plain(h.queryPayload().filter.children), [{ field: "ip_location", operator: "is_empty" }]);
+  assert.deepEqual(plain(h.readFilterInput(filterValueControl(h))), []);
+  h.scheduleQuery(0);
+  const again = await ipEmptyHarness(t, stored(h));
+  assert.equal(again.state.filters[0].includeEmpty, true);
+  assert.deepEqual(plain(again.state.filters[0].value), []);
+  assert.deepEqual(plain(again.queryPayload().filter.children[0]), { field: "ip_location", operator: "is_empty" });
+  h.state.queryReady = true; h.respondWith(request => pageResult(request, rowsForExport(2)));
+  await h.runQuery(); assert.equal(h.queries.length, 1);
+  const chip = h.elements.filterRows.querySelector(".filter-value-chip");
+  assert.equal(chip.textContent, "未显示（空值） ×"); await chip.click();
+  assert.equal(h.state.filters[0].includeEmpty, undefined);
+  assert.deepEqual(plain(h.state.filters[0].value), []);
+  assert.equal(h.validateFilterDraft(), false); assert.equal(h.elements.exportCurrent.disabled, true);
+  await h.runQuery(); assert.equal(h.queries.length, 1, "unchecking the last selection cannot execute an empty in condition");
+});
+
+test("IP empty preferences: flag and exact arrays survive dataset changes and reload; non-in and nonboolean flags do not", async t => {
+  const h = await ipEmptyHarness(t, ipEmptyPreferences({ value: ["广东", "地区,完整值"] }));
+  h.scheduleQuery(0);
+  assert.equal(stored(h).savedViews.comments.filters[0].includeEmpty, true);
+  await h.buttons.notes.emit("click"); await h.buttons.comments.emit("click");
+  assert.equal(h.state.filters[0].includeEmpty, true);
+  assert.deepEqual(plain(h.state.filters[0].value), ["广东", "地区,完整值"]);
+  const again = await ipEmptyHarness(t, stored(h)); await settleValueOptions();
+  assert.equal(again.elements.filterRows.querySelector(".filter-empty-checkbox").checked, true);
+  assert.deepEqual(plain(again.queryPayload().filter.children[0]), ipValueOrEmpty("ip_location", ["广东", "地区,完整值"]));
+  for (const overrides of [{ includeEmpty: "true" }, { includeEmpty: true, operator: "eq", value: "广东" }]) {
+    const saved = ipEmptyPreferences(); Object.assign(saved.savedViews.comments.filters[0], overrides);
+    const invalidFlag = await ipEmptyHarness(t, saved);
+    assert.equal(invalidFlag.state.filters[0].includeEmpty, undefined, "only boolean true on in survives normalization");
+    assert.equal(invalidFlag.queryPayload().filter.children[0].logic, undefined);
+  }
+});
+
+test("IP empty column: apply and reopen retain empty choice; builder chip removes empty without removing Guangdong", async t => {
+  const h = await ipEmptyHarness(t, ipEmptyPreferences({ includeEmpty: false }));
+  h.openColumnFilter("ip_location", null); await settleValueOptions();
+  const check = h.elements.columnFilterValueWrap.querySelector(".filter-empty-checkbox");
+  check.checked = true; await check.emit("change");
+  assert.equal(h.state.filters[0].includeEmpty, undefined, "column selection remains draft until apply");
+  await h.elements.applyColumnFilter.click();
+  assert.equal(h.elements.columnFilterPopover.hidden, true);
+  assert.equal(h.state.filters.length, 1); assert.equal(h.state.filters[0].includeEmpty, true);
+  assert.deepEqual(plain(h.queryPayload().filter.children[0]), ipValueOrEmpty());
+  h.openColumnFilter("ip_location", null); await settleValueOptions();
+  assert.equal(h.elements.columnFilterValueWrap.querySelector(".filter-empty-checkbox").checked, true);
+  assert.deepEqual(plain(h.readFilterInput(h.elements.columnFilterValueWrap.querySelector('[data-role="value"]'))), ["广东"]);
+  await h.elements.closeColumnFilter.click();
+  const chips = h.elements.filterRows.querySelectorAll(".filter-value-chip");
+  await chips.find(chip => chip.textContent === "未显示（空值） ×").click();
+  assert.equal(h.state.filters[0].includeEmpty, undefined);
+  assert.deepEqual(plain(h.queryPayload().filter.children[0]), { field: "ip_location", operator: "in", value: ["广东"], value2: "" });
+  assert.equal(stored(h).savedViews.comments.filters[0].includeEmpty, undefined);
+});
+
+test("IP empty column: empty-only apply succeeds and selecting a non-in operator clears the flag", async t => {
+  const h = await ipEmptyHarness(t, ipEmptyPreferences({ value: [], includeEmpty: false }));
+  h.openColumnFilter("ip_location", null); await settleValueOptions();
+  const check = h.elements.columnFilterValueWrap.querySelector(".filter-empty-checkbox");
+  check.checked = true; await check.emit("change"); await h.elements.applyColumnFilter.click();
+  assert.equal(h.elements.columnFilterPopover.hidden, true); assert.equal(h.validateFilterDraft(), true);
+  assert.deepEqual(plain(h.queryPayload().filter.children[0]), { field: "ip_location", operator: "is_empty" });
+  h.openColumnFilter("ip_location", null);
+  h.elements.columnFilterOperator.value = "eq"; await h.elements.columnFilterOperator.emit("change");
+  const value = h.elements.columnFilterValueWrap.querySelector('[data-role="value"]'); value.value = "广东";
+  await h.elements.applyColumnFilter.click();
+  assert.equal(h.state.filters[0].includeEmpty, undefined);
+  assert.deepEqual(plain(h.queryPayload().filter.children[0]), { field: "ip_location", operator: "eq", value: "广东", value2: "" });
+  h.state.filters[0].operator = "in"; h.state.filters[0].value = ["广东"]; h.state.filters[0].includeEmpty = true; h.renderFilters();
+  const operator = h.elements.filterRows.querySelector('[data-role="operator"]'); operator.value = "eq";
+  await h.elements.filterRows.emit("change", { target: operator });
+  assert.equal(h.state.filters[0].includeEmpty, undefined); assert.equal(h.state.filters[0].value, "广东");
+});
+
+test("empty-only serialization: date and number skip value validation only for explicit true; limits still apply", async t => {
+  const h = await ipEmptyHarness(t);
+  h.schema.datasets.comments.fields.push(field("fixture_number", { dataType: "number" }));
+  for (const key of ["published_at", "fixture_number"]) {
+    h.state.filters = [{ id: "empty", field: key, operator: "in", value: [], value2: "", includeEmpty: true }];
+    assert.equal(h.filterDraftProblem(), "", key);
+    assert.deepEqual(plain(h.queryPayload().filter.children[0]), { field: key, operator: "is_empty" });
+    h.state.filters[0].includeEmpty = "true";
+    assert.notEqual(h.filterDraftProblem(), "", "a truthy string cannot bypass validation");
+    h.state.filters[0].includeEmpty = true; h.state.filters[0].value = ["invalid-number-or-date"];
+    assert.notEqual(h.filterDraftProblem(), "", "empty choice does not excuse malformed nonempty values");
+  }
+  h.state.filters = [{ id: "limit", field: "ip_location", operator: "in", value: Array.from({ length: 101 }, (_, i) => String(i)), includeEmpty: true }];
+  assert.match(h.filterDraftProblem(), /100/);
+});
+
+test("IP empty export: CSV and Excel preserve mixed or empty-only queries even if the live empty choice changes", async t => {
+  for (const [format, values] of [["csv", ["广东"]], ["xlsx", ["广东"]], ["csv", []], ["xlsx", []]]) {
+    const h = await ipEmptyHarness(t, ipEmptyPreferences({ value: values })), all = rowsForExport(237);
+    h.state.filterLogic = "and";
+    h.state.filters.push({ id: "content", field: "content", operator: "contains", value: "filtered", value2: "" });
+    renderLoadedRows(h, all.slice(0, 100), { total: all.length });
+    h.respondWith(request => pageResult(request, all)); await h.runQuery();
+    const queriedFilter = h.queries[0].filter;
+    const mutate = () => { delete h.state.filters[0].includeEmpty; h.state.filters[0].value.push("later-only"); };
+    h.respondWith(request => { mutate(); return pageResult(request, all); });
+    let workbookRequest;
+    h.respondExportWith(request => {
+      workbookRequest = request; mutate();
+      return { ok: true, dataset: request.dataset, total: all.length, snapshotToken: request.snapshotToken,
+        consistentSnapshot: true, contentBase64: "UEsDBA==" };
+    });
+    h.elements.exportFormat.value = format; await h.exportCurrentPage();
+    assert.equal(h.downloads.length, 1, format);
+    assert.deepEqual(queriedFilter.children[0], values.length ? ipValueOrEmpty() : { field: "ip_location", operator: "is_empty" });
+    assert.equal(queriedFilter.logic, "and"); assert.equal(queriedFilter.children.length, 2);
+    const exportRequests = format === "xlsx" ? [workbookRequest] : h.queries.slice(1);
+    assert.ok(exportRequests.length > 0);
+    for (const request of exportRequests) assert.deepEqual(request.filter, queriedFilter, format);
+    assert.doesNotMatch(JSON.stringify(exportRequests.map(r => r.filter)), /includeEmpty|未显示|later-only/);
+    if (format === "csv") assert.ok((await h.blobs[0].text()).includes("filtered-236"));
+  }
 });

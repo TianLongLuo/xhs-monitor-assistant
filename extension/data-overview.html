@@ -46,28 +46,11 @@
       </aside>
 
       <main class="workspace">
-        <header class="workspace-header">
-          <div>
-            <span class="workspace-kicker">LOCAL DATABASE VIEW</span>
-            <h1 id="datasetTitle">帖子数据库</h1>
-            <p id="datasetSubtitle">从本地业务总表、SQLite 与素材快照读取一致的数据。</p>
-          </div>
-          <div class="header-actions">
-            <button id="deleteSelected" class="danger-button" type="button" disabled>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"/></svg>
-              删除选中 <i id="selectedCount">0</i>
-            </button>
-            <button id="exportCurrent" class="quiet-button" type="button" disabled>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
-              <span id="exportLabel">导出筛选结果</span>
-            </button>
-            <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
-            </button>
-          </div>
+        <header class="workspace-header" hidden>
+          <h1 id="datasetTitle">帖子数据库</h1><p id="datasetSubtitle"></p>
         </header>
 
-        <section id="lineageRibbon" class="lineage-ribbon" data-state="checking" aria-live="polite">
+        <section id="lineageRibbon" hidden class="lineage-ribbon" data-state="checking" aria-live="polite">
           <div class="lineage-node"><i></i><span><small>来源</small><strong>业务 CSV</strong></span></div>
           <b></b>
           <div class="lineage-node"><i></i><span><small>查询</small><strong>SQLite 快照</strong></span></div>
@@ -78,11 +61,24 @@
         </section>
 
         <section class="query-toolbar" aria-label="数据筛选工具">
-          <label class="search-control">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16.2 16.2 4 4"/></svg>
-            <input id="globalSearch" type="search" placeholder="搜索标题、正文、作者或 ID" autocomplete="off">
-            <kbd>⌘ K</kbd>
-          </label>
+          <button id="returnToComments" class="toolbar-button return-comments-button" type="button" hidden title="返回定位原帖前的评论，恢复筛选、已加载记录和滚动位置">← 返回评论位置</button>
+          <div class="search-control">
+            <details id="searchOptions" class="search-options">
+              <summary title="搜索模式与快捷语义查询"><span id="searchModeLabel">关键词</span><span aria-hidden="true">⌄</span></summary>
+        <section class="semantic-toolbar" aria-label="搜索模式与语义快捷查询">
+          <label class="semantic-switch"><input id="semanticSearch" type="checkbox" aria-describedby="semanticStatus">语义检索</label>
+          <span class="semantic-shortcuts" aria-label="填入语义查询，按搜索执行">
+            <button type="button" data-semantic-query="差评">差评</button>
+            <button type="button" data-semantic-query="强硬销售">强硬销售</button>
+            <button type="button" data-semantic-query="价格差异">价格差异</button>
+            <button type="button" data-semantic-query="过敏">过敏</button>
+          </span>
+          <small id="semanticStatus" role="status" aria-live="polite">普通搜索 · 关键词匹配</small>
+        </section>
+            </details>
+            <input id="globalSearch" type="search" placeholder="搜索标题、正文、作者或 ID" autocomplete="off" aria-label="搜索标题、正文、作者或 ID">
+            <button id="searchSubmit" class="search-submit" type="button" aria-label="搜索" title="搜索（Enter）"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="m15 15 5 5"/></svg></button>
+          </div>
           <button id="toggleFilters" class="toolbar-button" type="button" aria-expanded="false">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
             筛选 <i id="filterCount" hidden>0</i>
@@ -101,19 +97,25 @@
             重置
           </button>
           <div class="result-counter"><strong id="resultCount">—</strong><span id="resultLabel">条结果</span></div>
+          <div class="header-actions">
+            <button id="deleteSelected" class="danger-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"/></svg>
+              删除选中 <i id="selectedCount">0</i>
+            </button>
+            <select id="exportFormat" class="export-format" aria-label="导出格式" title="Excel 含成组评论与全部原始字段；CSV 导出当前可见字段。两种格式均导出全部筛选结果。">
+              <option value="xlsx">Excel（成组）</option><option value="csv">CSV（当前字段）</option>
+            </select>
+            <button id="exportCurrent" class="quiet-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
+              <span id="exportLabel">导出筛选结果</span>
+            </button>
+            <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+            </button>
+          </div>
         </section>
 
-        <section class="semantic-toolbar" aria-label="搜索模式与语义快捷查询">
-          <label class="semantic-switch"><input id="semanticSearch" type="checkbox" aria-describedby="semanticStatus">语义检索</label>
-          <button id="searchSubmit" class="toolbar-button" type="button">搜索</button>
-          <span class="semantic-shortcuts" aria-label="填入语义查询，按搜索执行">
-            <button type="button" data-semantic-query="差评">差评</button>
-            <button type="button" data-semantic-query="强硬销售">强硬销售</button>
-            <button type="button" data-semantic-query="价格差异">价格差异</button>
-            <button type="button" data-semantic-query="过敏">过敏</button>
-          </span>
-          <small id="semanticStatus" role="status" aria-live="polite">普通搜索 · 关键词匹配</small>
-        </section>
+
 
         <section id="pageFind" class="page-find" hidden aria-label="在筛选结果中查找">
           <label><span>查找</span><input id="pageFindInput" type="search" placeholder="在筛选结果中定位内容" autocomplete="off"></label>
@@ -153,6 +155,12 @@
           <label><span>查找字段</span><input id="fieldSearch" type="search" placeholder="输入字段名称"></label>
           <div class="field-panel__actions"><button id="selectDefaultFields" type="button">默认字段</button><button id="selectAllFields" type="button">显示全部</button><button id="restoreColumnOrder" type="button" title="只恢复列顺序，保留筛选、显示字段和排序规则">恢复列顺序</button><button id="restoreColumnWidths" type="button" title="只恢复当前数据库的列宽，保留筛选、显示字段和列顺序">恢复列宽</button></div>
           <div id="fieldOptions" class="field-options"></div>
+          <section class="column-pin-settings" aria-label="列固定设置">
+            <header><strong>列固定</strong><button id="clearColumnPins" type="button">取消全部固定</button></header>
+            <p>默认全部不固定。勾选后立即移入左侧冻结区，横向滚动时保持可见；取消后恢复原顺序。</p>
+            <div id="columnPinOptions" class="column-pin-options"></div>
+          </section>
+        <div class="row-status-legend" aria-label="行颜色说明"><span><i class="legend-deleted"></i>已删除</span><span><i class="legend-negative"></i>语义差评</span><small>同时命中：粉底＋绿边</small></div>
         </section>
 
         <section id="sortPanel" class="builder-panel sort-panel" hidden>
@@ -177,6 +185,7 @@
         </section>
 
         <aside id="snapshotNotice" class="snapshot-notice" hidden role="status"><span id="snapshotNoticeText"></span><button id="refreshSnapshot" type="button">更新数据</button></aside>
+
 
         <section id="dataSurface" class="data-surface" aria-busy="false">
           <div id="tableViewport" class="table-viewport" tabindex="0" aria-label="数据表格，可上下和左右滚动">

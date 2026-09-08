@@ -59,3 +59,8 @@ test("empty results and CSV escaping are explicit", async () => {
   assert.ok(csv.includes('""原文""'));
   assert.ok(csv.includes("2026-09-03 09:30:00"));
 });
+
+test("CSV guards formula strings even in numeric columns while retaining numeric negatives", () => {
+  const csv = toCsv([{n:"=1+2"},{n:"@SUM(1)"},{n:-12.5}], [{key:"n",dataType:"number"}]);
+  assert.ok(csv.includes("'=1+2"));assert.ok(csv.includes("'@SUM(1)"));assert.ok(csv.includes('"-12.5"'));
+});

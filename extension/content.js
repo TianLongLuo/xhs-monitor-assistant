@@ -1,6 +1,6 @@
 (function () {
   "use strict";
-const CONTENT_VERSION = "0.34.7";
+const CONTENT_VERSION = "0.34.14";
   const existingProcessPanels = Array.from(document.querySelectorAll(".xhs-monitor-process"));
   if (globalThis.__XHS_MONITOR_CONTENT_VERSION__ === CONTENT_VERSION) {
     existingProcessPanels.slice(1).forEach((panel) => panel.remove());
@@ -2470,8 +2470,10 @@ const CONTENT_VERSION = "0.34.7";
           const status = panel.querySelector(`.${PROCESS_PANEL_CLASS}__status`);
           const count = panel.querySelector(`.${PROCESS_PANEL_CLASS}__comment-count`);
           const total = progress.expectedCountKnown || progress.expectedCount > 0 ? progress.expectedCount : "?";
-          if (status) status.textContent = `评论 ${progress.count}/${total} 条${progress.pass > 1 ? ` · 第 ${progress.pass} 轮自动补读` : " · 正在展开与核验"}`;
-          if (count) count.textContent = `${progress.count} 条`;
+          const statusText = `评论 ${progress.count}/${total} 条${progress.pass > 1 ? ` · 第 ${progress.pass} 轮自动补读` : " · 正在展开与核验"}`;
+          const countText = `${progress.count} 条`;
+          if (status && status.textContent !== statusText) status.textContent = statusText;
+          if (count && count.textContent !== countText) count.textContent = countText;
         }
       });
       let collection;
@@ -3205,6 +3207,12 @@ const CONTENT_VERSION = "0.34.7";
       return false;
     }
     if (message.type === "batchSyncNoteProgress") {
+      // A delayed writer acknowledgement must never recreate the preceding
+      // post's panel after the single reader has navigated to the next post.
+      if (message.onlyIfCurrent && processPanel?.dataset.noteId !== clean(message.noteId || message.note?.noteId, 128)) {
+        sendResponse({ ok: true, skipped: true });
+        return false;
+      }
       const note = {
         ...(processPanel?._processNote || {}),
         ...(message.note || {}),

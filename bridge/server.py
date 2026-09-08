@@ -43,6 +43,7 @@ try:
     from .time_fields import NOTE_TIME_HEADERS, COMMENT_TIME_HEADERS, enrich_time_payload, csv_time_fields, latest_observation_reference
     from .snapshot_validation import validate_snapshot_identity
     from .overview_media import read_overview_media, read_comment_target
+    from .overview_export_service import export_filtered_workbook
     from .semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 except ImportError:  # Native Host runs this module as a top-level script.
     import agent_analysis
@@ -52,10 +53,11 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from time_fields import NOTE_TIME_HEADERS, COMMENT_TIME_HEADERS, enrich_time_payload, csv_time_fields, latest_observation_reference
     from snapshot_validation import validate_snapshot_identity
     from overview_media import read_overview_media, read_comment_target
+    from overview_export_service import export_filtered_workbook
     from semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 
 
-VERSION = "0.34.7"
+VERSION = "0.34.14"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )
@@ -3276,6 +3278,18 @@ class MonitorStore:
         if not isinstance(raw_comments, list):
             raise ValueError("comments must be an array")
         raw_comments = self._normalize_snapshot_comments(note_id, raw_comments)
+        return self._compare_normalized_comments(payload, note_id, raw_comments)
+
+    def _compare_normalized_comments(
+        self, payload: dict[str, Any], note_id: str, raw_comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compare freshly normalized rows, never a cached browser preview.
+
+        Only validated in-process callers supply these rows. The public preview
+        still validates and normalizes; sync reuses its write-stage normalization
+        while holding pull_lock, before any snapshot writes. No payload flag can
+        opt a client out of validation or normalization.
+        """
         current_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
         for item in raw_comments:
             if not isinstance(item, dict) or not text(item.get("content"), 8000):
@@ -3529,7 +3543,7 @@ class MonitorStore:
         with self.pull_lock:
             self._normalize_csv_cross_store_fields()
             comments = self._normalize_snapshot_comments(note_id, comments)
-            comparison = self.compare_comments({**payload, "comments": comments})
+            comparison = self._compare_normalized_comments({**payload, "comments": comments}, note_id, comments)
             with self.lock, self._session() as db:
                 stored = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
             if stored is None:
@@ -5261,6 +5275,9 @@ class MonitorStore:
                              "minimumScore": float(payload.get("semanticMinScore", 0.5)),
                              "note": "向量相关度不是情绪分类或事实置信度；返回阈值以上最相关记录"} if semantic else None,
             }
+
+    def export_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return export_filtered_workbook(self, payload)
 
     def data_overview_values(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return distinct canonical values for one whitelisted field and approved snapshot."""
@@ -8448,19 +8465,40 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "stateHash": state_hash, "storeHashes": store_hashes,
         }
 
+    def _batch_csv_verification_context(self):
+        """Internal-only scope, entered after every batch write/material refresh."""
+        if __package__:
+            from .csv_verification_context import verification_batch
+        else:
+            from csv_verification_context import verification_batch
+        return verification_batch(
+            self, self._csv_paths(), (NOTE_CSV_HEADERS, COMMENT_CSV_HEADERS),
+            lambda row: valid_note_id(row.get("笔记ID")), csv_comment_note_id,
+            lambda row: text(row.get("笔记评论ID"), 256),
+        )
+
     def _verify_note_store_consistency(
         self, note_id: str, media_dir: str = "", verify_fields: bool = True
     ) -> dict[str, Any]:
+        if __package__:
+            from .csv_verification_context import active_for
+        else:
+            from csv_verification_context import active_for
         notes_path, comments_path = self._csv_paths()
-        _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
-        _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-        matching_note_rows = [row for row in note_rows if valid_note_id(row.get("笔记ID")) == note_id]
+        csv_context = active_for(self, (notes_path, comments_path))
+        if csv_context is None:
+            _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            matching_note_rows = [row for row in note_rows if valid_note_id(row.get("笔记ID")) == note_id]
+            target_comment_rows = [row for row in comment_rows if csv_comment_note_id(row) == note_id]
+        else:
+            matching_note_rows = [dict(row) for row in csv_context.notes.get(note_id, ())]
+            target_comment_rows = [dict(row) for row in csv_context.comments.get(note_id, ())]
         note_matches = len(matching_note_rows)
         csv_post_status = post_status_label(matching_note_rows[0].get("帖子状态")) if note_matches == 1 else ""
         csv_access_status = {
             "可打开": "ok", "待复核": "check_failed", "打不开": "unreachable", "": ""
         }.get(text(matching_note_rows[0].get("访问状态"), 100), "__invalid__") if note_matches == 1 else ""
-        target_comment_rows = [row for row in comment_rows if csv_comment_note_id(row) == note_id]
         target_comment_ids = [
             text(row.get("笔记评论ID"), 256) for row in target_comment_rows
             if text(row.get("笔记评论ID"), 256)
@@ -8501,10 +8539,13 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             )
         if csv_status != db_status:
             raise ValueError("本地一致性校验失败：评论 CSV 与 SQLite 的存在/已删除状态不一致")
-        cross_note_ids = {
+        cross_note_ids = ({
             text(row.get("笔记评论ID"), 256) for row in comment_rows
             if text(row.get("笔记评论ID"), 256) in db_ids and csv_comment_note_id(row) != note_id
-        }
+        } if csv_context is None else {
+            comment_id for comment_id in db_ids
+            if csv_context.owners.get(comment_id, frozenset()) - {note_id}
+        })
         if cross_note_ids:
             raise ValueError("本地一致性校验失败：评论 ID 同时出现在其他帖子")
         material_ids: set[str] | None = None
@@ -9211,12 +9252,13 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                             f"SELECT note_id,media_dir FROM notes WHERE note_id IN ({placeholders})", note_ids
                         ).fetchall()
                     }
-                for item in result_items:
-                    verified.append(self._verify_note_store_consistency(
-                        item["noteId"], media_by_id.get(item["noteId"], ""), verify_fields=True
-                    ))
-                if len(verified) != len(note_ids):
-                    raise ValueError("批量状态同步未完成全部帖子的一致性校验")
+                with self._batch_csv_verification_context():
+                    for item in result_items:
+                        verified.append(self._verify_note_store_consistency(
+                            item["noteId"], media_by_id.get(item["noteId"], ""), verify_fields=True
+                        ))
+                    if len(verified) != len(note_ids):
+                        raise ValueError("批量状态同步未完成全部帖子的一致性校验")
                 output = {**result, "consistencyVerified": True, "verified": verified}
             except Exception as exc:
                 if not mutation_started:
@@ -10312,7 +10354,7 @@ Write-Output $openedWith
 
 class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "XhsMonitorBridge/0.7"
-    _overview_read_paths = frozenset({"/api/data-overview/media", "/api/data-overview/comment-target"})
+    _overview_read_paths = frozenset({"/api/data-overview/media", "/api/data-overview/comment-target", "/api/data-overview/export"})
 
     def _overview_origin_allowed(self) -> bool:
         origins = self.headers.get_all("Origin", [])
@@ -10479,6 +10521,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": str(exc)})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/data-overview/export" and not self._overview_origin_allowed():
+            self._send_json(403, {"ok": False, "error": "untrusted overview Origin"})
+            return
         try:
             payload = self._read_json()
             if self.path.startswith("/api/agent-analysis/"):
@@ -10513,6 +10558,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.repair_csv_relationships(payload)
             elif self.path == "/api/data-overview/query":
                 result = self.store.query_data_overview(payload)
+            elif self.path == "/api/data-overview/export":
+                result = self.store.export_data_overview(payload)
             elif self.path == "/api/data-overview/values":
                 result = self.store.data_overview_values(payload)
             elif self.path == "/api/data-overview/delete":

@@ -15,14 +15,31 @@
     } catch (_error) { return ""; }
   }
 
+  // Available width is the strip's content width. Every thumbnail needs one
+  // trailing gap because the count button is always retained, even at capacity 0.
+  function thumbnailCapacity(width, total, countWidth = 48, thumbnailWidth = 54, gap = 6) {
+    const available = Number(width), count = Number(total), reserved = Number(countWidth);
+    const size = Number(thumbnailWidth), spacing = Number(gap);
+    if (![available, count, reserved, size, spacing].every(Number.isFinite)
+      || available <= 0 || count <= 0 || reserved < 0 || size <= 0 || spacing < 0) return 0;
+    return Math.min(Math.floor(count), Math.max(0, Math.floor((available - reserved) / (size + spacing))));
+  }
+
   function create({ request, onError = () => {} }) {
     let epoch = 0, active = 0, queue = [], dialog = null, viewerSerial = 0;
     const metadata = new Map();
+    const mounts = new Map(), resizeTargets = new Map();
+    const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(entries => {
+      for (const entry of entries) resizeTargets.get(entry.target)?.(entry);
+    }) : null;
     const observer = typeof IntersectionObserver === "function" ? new IntersectionObserver(entries => {
-      for (const entry of entries) if (entry.isIntersecting) {
-        observer.unobserve(entry.target); entry.target._loadMedia?.();
+      for (const entry of entries) {
+        const state = mounts.get(entry.target);
+        if (!state) continue;
+        state.visible = entry.isIntersecting;
+        if (state.visible) { state.load(); state.update?.(); }
       }
-    }, { rootMargin: "160px" }) : null;
+    }, { rootMargin: "0px" }) : null;
 
     function drain() {
       while (active < 3 && queue.length) {
@@ -36,7 +53,9 @@
       return new Promise((resolve, reject) => { queue.push({ run, resolve, reject, epoch }); drain(); });
     }
     function reset() {
-      epoch++; observer?.disconnect(); metadata.clear();
+      epoch++; observer?.disconnect(); resizeObserver?.disconnect(); metadata.clear();
+      for (const state of mounts.values()) state.dispose();
+      mounts.clear(); resizeTargets.clear();
       for (const task of queue.splice(0)) task.resolve(null);
       closeViewer();
     }
@@ -54,14 +73,16 @@
       }
       return metadata.get(key);
     }
-    async function imageSource(record, listing, item) {
+    async function imageSource(record, listing, item, shouldLoad = () => true) {
       if (item.source === "remote") {
         const url = safeImageUrl(item.url);
         if (!url) throw new Error("图片来源不受支持");
         return url;
       }
       if (item.source !== "local") throw new Error("素材来源不明确");
-      const result = await limited(() => request({ dataset: record.dataset, recordId: record.recordId, index: item.index, revision: listing.revision }));
+      const skipped = {};
+      const result = await limited(() => shouldLoad() ? request({ dataset: record.dataset, recordId: record.recordId, index: item.index, revision: listing.revision }) : skipped);
+      if (result === skipped) return null;
       if (!result) return "";
       const url = safeImageUrl(result.dataUrl, true);
       if (!result.ok || !url) throw new Error(result.error || "本地图片读取失败");
@@ -73,13 +94,14 @@
       return img;
     }
     async function openViewer(record, listing, position, opener) {
+      if (opener?.hidden) opener = opener.parentElement?.querySelector(".media-count") || opener;
       const serial = ++viewerSerial, currentEpoch = epoch;
       if (!dialog) {
         dialog = document.createElement("dialog"); dialog.className = "media-viewer";
         dialog.setAttribute("aria-label", "素材图片预览"); document.body.append(dialog);
         dialog.addEventListener("click", event => { if (event.target === dialog) closeViewer(); });
         dialog.addEventListener("cancel", () => { viewerSerial++; });
-        dialog.addEventListener("close", () => { if (dialog._opener?.isConnected) dialog._opener.focus(); });
+        dialog.addEventListener("close", () => { if (dialog._opener?.isConnected) dialog._opener.focus({ preventScroll: true }); });
       }
       dialog._opener = opener; dialog.replaceChildren();
       const header = document.createElement("header"), title = document.createElement("strong");
@@ -110,16 +132,26 @@
       } catch (error) { if (valid()) stage.textContent = `${error.message}；请刷新数据后重试。`; }
     }
     function mount(cell, record, { layout = "table", previewLimit = 3, eager = false } = {}) {
+      mounts.get(cell)?.dispose();
       const currentEpoch = epoch;
-      const valid = () => epoch === currentEpoch && cell.isConnected;
+      const state = { visible: eager || !observer, loading: false, loaded: false, targets: [] };
+      mounts.set(cell, state);
+      const valid = () => epoch === currentEpoch && mounts.get(cell) === state && cell.isConnected;
+      state.dispose = () => {
+        observer?.unobserve(cell);
+        for (const target of state.targets) { resizeObserver?.unobserve(target); resizeTargets.delete(target); }
+        if (cell._loadMedia === load) delete cell._loadMedia;
+      };
       cell.classList.add("media-cell"); cell.textContent = "等待图片…";
-      if (layout === "detail") cell.classList.add("media-detail");
+      cell.classList.toggle("media-detail", layout === "detail");
       const limit = Math.max(1, Math.min(12, Number(previewLimit) || 3));
       async function load() {
-        if (!valid()) return;
+        if (!valid() || state.loading || state.loaded) return;
+        state.loading = true;
         try {
           const listing = await readMetadata(record);
           if (!valid() || !listing) return;
+          state.loaded = true;
           cell.replaceChildren();
           if (!listing.items.length) {
             const label = document.createElement("span"); label.className = "media-empty";
@@ -128,33 +160,75 @@
           }
           const strip = document.createElement("div"); strip.className = "media-strip";
           cell.append(strip);
-          listing.items.slice(0, limit).forEach((item, position) => {
+          const thumbs = [];
+          (layout === "detail" ? listing.items.slice(0, limit) : listing.items).forEach((item, position) => {
             const button = document.createElement("button"); button.type = "button"; button.className = "media-thumb";
+            button.hidden = layout !== "detail";
             button.textContent = "加载中"; button.setAttribute("aria-label", `查看第 ${position + 1} 张图片，共 ${listing.items.length} 张`);
             button.addEventListener("click", event => { event.stopPropagation(); openViewer(record, listing, position, button); });
             button.addEventListener("dblclick", event => event.stopPropagation()); strip.append(button);
-            imageSource(record, listing, item).then(url => {
-              if (!valid() || !url) return;
-              const img = makeImage(`图片 ${position + 1}`); img.loading = "lazy";
-              img.onerror = () => { if (valid()) { button.textContent = "图片失效"; button.title = "重新同步可补充最新图片地址"; } };
-              img.src = url; button.replaceChildren(img);
-            }).catch(error => { if (valid()) { button.textContent = "重试"; button.title = error.message; } });
+            let started = false;
+            const shouldLoad = () => valid() && state.visible && !button.hidden;
+            const ensureImage = () => {
+              if (started || !shouldLoad()) return;
+              started = true;
+              imageSource(record, listing, item, shouldLoad).then(url => {
+                if (!url) {
+                  started = false;
+                  // Visibility can change again between a queued task being
+                  // skipped and its completion microtask; do not miss that reveal.
+                  if (url === null && shouldLoad()) ensureImage();
+                  return;
+                }
+                if (!valid()) return;
+                const img = makeImage(`图片 ${position + 1}`); img.loading = "lazy";
+                img.onerror = () => { if (valid()) { button.textContent = "图片失效"; button.title = "重新同步可补充最新图片地址"; } };
+                img.src = url; button.replaceChildren(img);
+              }).catch(error => { if (valid()) { button.textContent = "重试"; button.title = error.message; } });
+            };
+            thumbs.push({ button, ensureImage });
           });
           const count = document.createElement("button"); count.type = "button"; count.className = "media-count";
           count.textContent = `${listing.items.length} 张`; count.title = "打开大图，使用左右方向键切换";
           count.addEventListener("click", event => { event.stopPropagation(); openViewer(record, listing, 0, count); });
           strip.append(count);
+          let observedWidth;
+          state.update = entry => {
+            if (!valid()) return;
+            if (entry?.target === strip) observedWidth = entry.contentRect.width;
+            const capacity = layout === "detail" ? thumbs.length : thumbnailCapacity(
+              observedWidth ?? strip.clientWidth,
+              thumbs.length,
+              Math.max(count.getBoundingClientRect().width, count.scrollWidth) || 48
+            );
+            for (const [position, thumb] of thumbs.entries()) {
+              const hidden = position >= capacity;
+              if (hidden && !thumb.button.hidden) {
+                if (thumb.button.contains(document.activeElement)) count.focus({ preventScroll: true });
+                // A modal may still be open when its original thumbnail disappears.
+                if (dialog?._opener === thumb.button) dialog._opener = count;
+              }
+              thumb.button.hidden = hidden;
+              thumb.ensureImage();
+            }
+          };
+          if (layout !== "detail" && resizeObserver) {
+            for (const target of [strip, count]) {
+              state.targets.push(target); resizeTargets.set(target, state.update); resizeObserver.observe(target);
+            }
+          }
+          state.update();
         } catch (error) {
           if (!valid()) return;
           const retry = document.createElement("button"); retry.type = "button"; retry.className = "cell-action";
           retry.textContent = "重新读取图片"; retry.title = error.message;
           retry.addEventListener("click", event => { event.stopPropagation(); load(); }); cell.replaceChildren(retry);
-        }
+        } finally { state.loading = false; }
       }
-      cell._loadMedia = load;
+      state.load = load; cell._loadMedia = load;
       if (observer && !eager) observer.observe(cell); else load();
     }
     return { mount, reset, close: closeViewer };
   }
-  return { create, safeImageUrl };
+  return { create, safeImageUrl, thumbnailCapacity };
 });

@@ -465,6 +465,7 @@ async function harness(t, saved) {
       if (!ids.has(id)) {
         const element = new Element();
         element.hidden = ["pageFind", "columnFilterPopover", "filterPanel", "fieldPanel", "sortPanel"].includes(id);
+        if (id === "exportFormat") element.value = "csv";
         if (id === "tableEmpty") element.append(new Element("strong"), new Element("p"));
         ids.set(id, element);
         body.append(element);

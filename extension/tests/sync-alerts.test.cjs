@@ -243,6 +243,7 @@ test("a muted mismatch remains in every full-sync run and fresh visible comments
   const before = plain(note);
   let round = 0;
   Object.assign(h.context, {
+    getConfig: async () => ({ bridgeUrl: "http://127.0.0.1:17881" }),
     getNotes: async () => ({ ok: true, notes: [note] }),
     acquireReaderTab: async () => ({ id: 1 }),
     readPulledNoteInReader: async (_, current) => {

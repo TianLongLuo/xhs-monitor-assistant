@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "location-utils.js", "comment-utils.js", "comment-collector.js", "process-layout.js", "comment-locator.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.34.7";
+const CONTENT_SCRIPT_VERSION = "0.34.14";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const SYNC_ALERT_PREFERENCES_KEY = "syncAlertPreferencesV1";
 const syncAlerts = globalThis.XhsMonitorSyncAlerts;
@@ -1027,13 +1027,13 @@ async function setNoteAccessStatus(noteId, status, error = "") {
   return requireConsistencyVerified(result, "访问状态同步");
 }
 
-async function setNoteAccessStatuses(items = [], runId = 0) {
+async function setNoteAccessStatuses(items = [], runId = 0, expectedBridgeUrl = "") {
   const updates = Array.isArray(items) ? items.filter((item) => item?.noteId) : [];
   if (!updates.length) return { ok: true, updated: 0, items: [], consistencyVerified: true, verified: [] };
   const result = await bridgeApi("/api/notes/access-status/batch", {
     method: "POST",
     body: JSON.stringify({ items: updates, runId: Number(runId) || 0 }),
-    timeoutMs: 120000
+    expectedBridgeUrl, timeoutMs: 120000
   });
   return requireConsistencyVerified(result, "批量访问状态同步");
 }
@@ -1153,7 +1153,7 @@ async function auditCurrentNoteComments(note, preferredTabId = null) {
   return { ...comparison, snapshot };
 }
 
-async function syncCurrentNoteComments(payload) {
+async function syncCurrentNoteComments(payload, expectedBridgeUrl = "", shouldCancel = null) {
   const snapshot = payload?.snapshot || {};
   const noteId = payload?.noteId || snapshot.note?.noteId || "";
   const result = await bridgeApi("/api/comments/sync", {
@@ -1168,7 +1168,7 @@ async function syncCurrentNoteComments(payload) {
       status: snapshot.status || "partial",
       runId: Number(payload?.runId) || 0
     }),
-    timeoutMs: 120000
+    expectedBridgeUrl, shouldCancel, timeoutMs: 120000
   });
   requireConsistencyVerified(result, "评论同步");
   if (result?.ok) {
@@ -1524,14 +1524,25 @@ async function readPulledNoteInReader(tabId, note) {
   throw error;
 }
 
-async function syncPulledNoteInReader(tabId, note, runId = 0) {
+async function syncPulledNoteInReader(tabId, note, runId = 0, pipeline = null) {
   let extracted;
   try {
-    extracted = await readPulledNoteInReader(tabId, note);
+    extracted = pipeline ? pipeline.extracted : await readPulledNoteInReader(tabId, note);
+    if (extracted?.note?.noteId && extracted.note.noteId !== note.noteId) {
+      throw new Error("读取结果与目标帖子 ID 不一致，已停止写入");
+    }
   } catch (error) {
     error.syncStage = "open";
     throw error;
   }
+  const progress = (message) => {
+    if (pipeline && !pipeline.isCurrent()) return Promise.resolve();
+    return sendTabMessage(tabId, { ...message, onlyIfCurrent: Boolean(pipeline) }).catch(() => {});
+  };
+  const assertNotCancelled = () => {
+    if (pipeline?.isCancelled()) throw new Error("同步已取消，未提交的读取结果已丢弃");
+  };
+  assertNotCancelled();
   const snapshot = {
     note: extracted.note || note,
     comments: Array.isArray(extracted.comments) ? extracted.comments : [],
@@ -1542,7 +1553,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     collectionEvidence: extracted.collectionEvidence || {},
     status: extracted.status || "partial"
   };
-  await sendTabMessage(tabId, {
+  await progress({
     type: "batchSyncNoteProgress",
     noteId: note.noteId,
     note: snapshot.note,
@@ -1556,7 +1567,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     comparison = await bridgeApi("/api/comments/compare", {
       method: "POST",
       body: JSON.stringify({ noteId: note.noteId, ...snapshot }),
-      timeoutMs: 60000
+      expectedBridgeUrl: pipeline?.bridgeUrl || "", timeoutMs: 60000
     });
   } catch (error) {
     error.syncStage = "compare";
@@ -1571,7 +1582,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
   // Every successful read is written through all local stores even when the
   // business-facing result remains “无变化”. This repairs drift without
   // counting volatile post metadata as a comment change.
-  await sendTabMessage(tabId, {
+  await progress({
     type: "batchSyncNoteProgress",
     noteId: note.noteId,
     note: snapshot.note,
@@ -1584,7 +1595,8 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
   }).catch(() => {});
   let synced;
   try {
-    synced = await syncCurrentNoteComments({ noteId: note.noteId, snapshot, runId });
+    assertNotCancelled();
+    synced = await syncCurrentNoteComments({ noteId: note.noteId, snapshot, runId }, pipeline?.bridgeUrl || "", pipeline?.isCancelled || null);
   } catch (error) {
     error.syncStage = "sync";
     throw error;
@@ -1599,10 +1611,11 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
     error.syncStage = "comments";
     error.opened = true;
     error.savedComparison = comparison;
+    error.syncCommitted = true;
     error.commentRead = syncAlerts.commentFailure(note.noteId, snapshot, synced, error.message).commentRead;
     throw error;
   }
-  await sendTabMessage(tabId, {
+  await progress({
     type: "batchSyncNoteProgress",
     noteId: note.noteId,
     note: snapshot.note,
@@ -1620,6 +1633,7 @@ async function syncPulledNoteInReader(tabId, note, runId = 0) {
 }
 
 async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
+  const batchBridgeUrl = (await getConfig()).bridgeUrl;
   const source = await getNotes("", 1000);
   if (!source?.ok) throw new Error(source?.error || "已拉取帖子列表读取失败");
   const selection = Array.isArray(selectedNoteIds) && selectedNoteIds.length
@@ -1632,7 +1646,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const ignoredNotes = pulledCandidates.filter((note) => note.status === "ignored");
   for (const note of ignoredNotes) {
     const reconciled = await bridgeApi("/api/ignore", {
-      method: "POST", body: JSON.stringify({ noteId: note.noteId }), timeoutMs: 60000
+      method: "POST", body: JSON.stringify({ noteId: note.noteId }), expectedBridgeUrl: batchBridgeUrl, timeoutMs: 60000
     });
     if (!reconciled?.ok || !reconciled.consistencyVerified) {
       throw new Error("已忽略帖子状态同步失败：" + (note.title || note.noteId));
@@ -1661,11 +1675,31 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const runStarted = await bridgeApi("/api/sync-runs/start", {
     method: "POST",
     body: JSON.stringify({ runType: "batch", totalNotes: notes.length, detail: { mode } }),
-    timeoutMs: 30000
+    expectedBridgeUrl: batchBridgeUrl, timeoutMs: 30000
   }).catch(() => ({ ok: false, runId: 0 }));
   const syncRunId = Number(runStarted?.runId) || 0;
   const accessUpdates = [];
+  let pendingRead = null;
+  let readerNoteId = "";
+  // One reader, one in-flight commit, at most one fully detached next snapshot.
+  // Attach a rejection handler immediately: a prefetched read can fail while
+  // the preceding write is still pending and must not become unhandled.
+  const queueRead = (note, wait = false) => (async () => {
+    if (wait) await delay(420);
+    if (batchCommentSyncCancelled) return { cancelled: true };
+    if ((await getConfig()).bridgeUrl !== batchBridgeUrl) {
+      throw new Error("本地连接配置已变更，本批次停止读取");
+    }
+    if (batchCommentSyncCancelled) return { cancelled: true };
+    readerNoteId = note.noteId;
+    const extracted = await readPulledNoteInReader(reader.id, note);
+    return { extracted: JSON.parse(JSON.stringify(extracted)) };
+  })().catch(error => {
+    error.syncStage = "open";
+    return { error };
+  });
   try {
+    pendingRead = queueRead(notes[0]);
     for (let index = 0; index < notes.length; index += 1) {
       if (batchCommentSyncCancelled) break;
       const note = notes[index];
@@ -1674,7 +1708,18 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
         currentTitle: note.title || "未命名帖子"
       });
       try {
-        const result = await syncPulledNoteInReader(reader.id, note, syncRunId);
+        const captured = await pendingRead;
+        pendingRead = null;
+        if (batchCommentSyncCancelled || captured.cancelled) break;
+        // Navigation starts only AFTER all extraction, identity and evidence
+        // capture for the current page have completed. Commits stay serial.
+        if (index + 1 < notes.length) pendingRead = queueRead(notes[index + 1], true);
+        if (captured.error) throw captured.error;
+        const result = await syncPulledNoteInReader(reader.id, note, syncRunId, {
+          extracted: captured.extracted, bridgeUrl: batchBridgeUrl,
+          isCurrent: () => readerNoteId === note.noteId,
+          isCancelled: () => batchCommentSyncCancelled
+        });
         const comparison = result.comparison || {};
         accessUpdates.push({ noteId: note.noteId, status: "ok", result: "opened" });
         await publishBatchCommentSync({
@@ -1688,7 +1733,9 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           changedComments: batchCommentSyncState.changedComments + Number(comparison.changedCount || 0)
         });
       } catch (error) {
-        if (batchCommentSyncCancelled) break;
+        // A confirmed partial commit (or lost write acknowledgement) must be
+        // accounted for even if the user cancelled while that write settled.
+        if (batchCommentSyncCancelled && !error?.syncCommitted && !error?.outcomeUnknown) break;
         const opened = Boolean(error?.opened || (error?.syncStage && error.syncStage !== "open"));
         const accessStatus = opened ? "ok" : (error?.accessStatus === "unreachable" ? "unreachable" : "check_failed");
         const markedUnreachable = accessStatus === "unreachable";
@@ -1725,8 +1772,8 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           accessEvidence: error?.accessEvidence || []
         };
         const alert = syncAlerts.annotateFailure(failure, await getSyncAlertPreferences().catch(() => null)).alert;
-        await sendTabMessage(reader.id, {
-          type: "batchSyncNoteProgress", noteId: note.noteId, note,
+        if (readerNoteId === note.noteId) await sendTabMessage(reader.id, {
+          type: "batchSyncNoteProgress", noteId: note.noteId, note, onlyIfCurrent: true,
           phase: error?.syncStage === "open" ? "open" : "excel", done: true,
           error: alert.suppressed ? "" : (error?.message || "本帖同步失败"),
           title: alert.suppressed ? `可见评论已同步；${alert.label}已忽略，帖子仍继续同步` : "本帖同步暂停，已记录失败原因",
@@ -1744,11 +1791,13 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
           failures: [...batchCommentSyncState.failures, failure].slice(-1000)
         });
       }
-      if (!batchCommentSyncCancelled) await delay(420);
     }
   } finally {
+    // Drain/cancel the reader before closing the tab or final status writes.
+    // A prefetched result is never implicitly committed during cleanup.
+    if (pendingRead) await pendingRead;
     if (accessUpdates.length) {
-      const accessResult = await setNoteAccessStatuses(accessUpdates, syncRunId).catch((error) => ({
+      const accessResult = await setNoteAccessStatuses(accessUpdates, syncRunId, batchBridgeUrl).catch((error) => ({
         ok: false,
         error: error?.message || "访问状态写入失败"
       }));
@@ -1789,13 +1838,13 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
         changedComments: batchCommentSyncState.changedComments,
         detail: { mode, failures: batchCommentSyncState.failures || [] }
       }),
-      timeoutMs: 30000
+      expectedBridgeUrl: batchBridgeUrl, timeoutMs: 30000
     }).catch(() => null);
   }
   let weeklyReport = null;
   if (mode === "all" && !cancelled) {
     weeklyReport = await bridgeApi("/api/reports/weekly", {
-      method: "POST", body: JSON.stringify({ auto: true }), timeoutMs: 120000
+      method: "POST", body: JSON.stringify({ auto: true }), expectedBridgeUrl: batchBridgeUrl, timeoutMs: 120000
     }).catch(() => null);
   }
   return publishBatchCommentSync({
@@ -1998,7 +2047,7 @@ function isReadOnlyBridgeRequest(path, options = {}) {
   const method = String(options.method || "GET").toUpperCase();
   if (method === "GET" || method === "HEAD") return true;
   return method === "POST" && [
-    "/api/comments/compare", "/api/data-overview/query", "/api/data-overview/values"
+    "/api/comments/compare", "/api/data-overview/query", "/api/data-overview/values", "/api/data-overview/export"
   ].includes(String(path).split("?")[0]);
 }
 
@@ -2011,7 +2060,10 @@ async function bridgeApi(path, options = {}) {
   }
   try {
     const config = await getConfig();
-    const { timeoutMs = REQUEST_TIMEOUT_MS, noRecovery = false, ...fetchOptions } = options || {};
+    const { timeoutMs = REQUEST_TIMEOUT_MS, noRecovery = false, expectedBridgeUrl = "", shouldCancel = null, ...fetchOptions } = options || {};
+    if (expectedBridgeUrl && config.bridgeUrl !== expectedBridgeUrl) {
+      throw new Error("本地连接配置已变更，本批次停止提交，请重新同步");
+    }
     const endpoint = bridgeEndpoint(config.bridgeUrl, path);
     // Warm up a known-offline bridge BEFORE sending a write, never by replaying
     // an ambiguous request whose response may have been lost after commit.
@@ -2021,7 +2073,7 @@ async function bridgeApi(path, options = {}) {
       const latest = await getConfig();
       if (latest.bridgeUrl !== config.bridgeUrl) throw new Error("本地连接配置已变更，本次写入尚未提交，请重新操作");
     }
-    const shareable = readOnly && !bridgeWritesInFlight && !fetchOptions.signal;
+    const shareable = readOnly && !bridgeWritesInFlight && !fetchOptions.signal && !shouldCancel;
     const key = shareable ? JSON.stringify([
       bridgeReadGeneration, endpoint, String(fetchOptions.method || "GET").toUpperCase(),
       fetchOptions.body || "", fetchOptions.headers || {}, timeoutMs, noRecovery
@@ -2030,6 +2082,13 @@ async function bridgeApi(path, options = {}) {
     if (!task) {
       task = (async () => {
         try {
+          // Check at the actual send boundary, after config/startup awaits.
+          // Already-sent writes are never aborted/replayed; they drain normally.
+          if (typeof shouldCancel === "function" && shouldCancel()) {
+            const error = new Error("同步已取消，本次写入尚未提交");
+            error.code = "BATCH_SYNC_CANCELLED";
+            throw error;
+          }
           return await fetchJson(endpoint, fetchOptions, timeoutMs);
         } catch (firstError) {
           if (noRecovery || !isBridgeConnectivityError(firstError)) throw firstError;
@@ -2454,6 +2513,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "queryDataOverview") {
       return bridgeApi("/api/data-overview/query", {
         method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: message.payload?.semanticSearch ? 300000 : 60000
+      });
+    }
+    if (message.type === "exportDataOverview") {
+      return bridgeApi("/api/data-overview/export", {
+        method: "POST", body: JSON.stringify(message.payload || {}), timeoutMs: 300000
       });
     }
     if (message.type === "getDataOverviewValues") {

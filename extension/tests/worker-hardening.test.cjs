@@ -178,3 +178,38 @@ test("passive broadcasts send one notification per XHS tab and never reload or i
   assert.equal(events.length, 1); assert.equal(sent.length, 2);
   assert.ok(sent.every(x => x.message.type === "localNoteStateChanged"));
 });
+
+test("workbook export is a read-only POST and routes through the new endpoint", async () => {
+  const h=harness();
+  assert.equal(h.context.isReadOnlyBridgeRequest("/api/data-overview/export",{method:"POST"}),true);
+  assert.match(source,/message\.type === "exportDataOverview"[\s\S]*?bridgeApi\("\/api\/data-overview\/export"/);
+  await h.run("/api/data-overview/export",{method:"POST",body:'{"expectedTotal":401}'});
+  assert.equal(h.calls.length,1);assert.equal(h.context.bridgeWritesInFlight,0);
+});
+
+test('batch endpoint binding rejects changed configuration before submitting a request', async () => {
+  const h = harness();
+  await assert.rejects(h.run('/api/comments/sync', {method:'POST',expectedBridgeUrl:'http://127.0.0.1:17882'}), /配置已变更/);
+  assert.equal(h.calls.length,0);assert.equal(h.context.bridgeWritesInFlight,0);
+  await h.run('/api/comments/sync',{method:'POST',expectedBridgeUrl:h.url});
+  assert.equal(h.calls.length,1);assert.equal('expectedBridgeUrl' in h.calls[0][1],false);
+});
+
+test('cancel while configuration is pending blocks the actual POST send',async()=>{
+  const h=harness(),gate=deferred();let cancelled=false;
+  h.context.getConfig=()=>gate.promise;
+  const pending=h.run('/api/comments/sync',{method:'POST',shouldCancel:()=>cancelled});
+  cancelled=true;gate.resolve({bridgeUrl:h.url});
+  await assert.rejects(pending,e=>e.code==='BATCH_SYNC_CANCELLED');assert.equal(h.calls.length,0);
+  assert.equal(h.context.bridgeWritesInFlight,0);
+});
+test('cancel during offline bridge startup sends nothing; started writes drain unchanged',async()=>{
+  const h=harness(),gate=deferred();let cancelled=false;
+  h.context.bridgeState.status='offline';h.recover=()=>gate.promise;
+  const pending=h.run('/api/comments/sync',{method:'POST',shouldCancel:()=>cancelled});await tick();
+  cancelled=true;gate.resolve({ok:true});await assert.rejects(pending,e=>e.code==='BATCH_SYNC_CANCELLED');assert.equal(h.calls.length,0);
+  const live=harness(),write=deferred();cancelled=false;live.fetch=()=>write.promise;
+  const sent=live.run('/api/comments/sync',{method:'POST',shouldCancel:()=>cancelled});await tick();assert.equal(live.calls.length,1);
+  cancelled=true;write.resolve({ok:true,consistencyVerified:true});assert.equal((await sent).ok,true);assert.equal(live.calls.length,1);
+  assert.equal('shouldCancel' in live.calls[0][1],false);
+});
