@@ -79,7 +79,7 @@ const drawerGallery = globalThis.XhsMonitorOverviewMedia?.create({
 const COMMENT_ACTION_FIELD = "__overview_comment_actions";
 const COMMENT_ACTION_COLUMN = Object.freeze({ key: COMMENT_ACTION_FIELD, label: "操作", dataType: "text", action: "locate_comment" });
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
-const DATA_OVERVIEW_VERSION = "0.34.16";
+const DATA_OVERVIEW_VERSION = "0.34.19";
 const INFINITE_BATCH_SIZE = 100;
 const TIME_COLUMNS = {
   published_at: ["published_at_raw", "published_at_precision", "published_at_status"],
@@ -2349,7 +2349,7 @@ async function openDrawer(record) {
     if (!full || !current()) return;
     state.currentRecord = full;
     elements.drawerTitle.textContent = (dataset === "notes" ? full.title : full.author) || recordId;
-    XhsMonitorRecordDetails.render(elements.drawerFields, {
+    const detailView = XhsMonitorRecordDetails.render(elements.drawerFields, {
       dataset, record: full, fields, snapshotToken, gallery: drawerGallery,
       onAction: button => { if (current()) runTableAction(button); }
     });
@@ -2358,6 +2358,14 @@ async function openDrawer(record) {
     elements.openRecordLink.dataset.url = url;
     elements.copyRecord.disabled = false;
     elements.deleteDrawerRecord.disabled = state.semanticAwaitingSubmit;
+    // Keep the main record immediately usable. All local comments are read in
+    // bounded pages under this exact detail snapshot, independent of list filters.
+    void XhsMonitorRecordDetails.loadComments(detailView.commentsContainer, {
+      noteId: full.note_id, snapshotToken, currentCommentId: dataset === "comments" ? full.comment_id : "",
+      isCurrent: current, gallery: drawerGallery,
+      request: payload => sendRuntime({ type: "queryDataOverview", payload }),
+      onAction: button => { if (current()) runTableAction(button); },
+    });
   } catch (error) {
     if (!current()) return;
     state.currentRecord = null;

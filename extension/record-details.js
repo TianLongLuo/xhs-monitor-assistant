@@ -68,6 +68,146 @@
     return result;
   }
 
+  const COMMENT_FIELDS = Object.freeze([
+    "comment_id", "note_id", "author", "content", "published_at", "ip_location", "like_count",
+    "comment_status", "is_deleted", "comment_level", "parent_comment_id", "thread_root_author", "is_post_author",
+  ]);
+
+  async function fetchComments({ noteId, snapshotToken, request, isCurrent = () => true, onPage = () => {} }) {
+    if (typeof noteId !== "string" || !noteId || typeof snapshotToken !== "string" || !snapshotToken
+        || typeof request !== "function") throw new Error("请先完成数据校验再读取评论");
+    const rows = [], ids = new Set();
+    let total = null;
+    for (let page = 1; ; page += 1) {
+      if (!isCurrent()) return null;
+      const response = await request({
+        dataset: "comments", snapshotToken, fields: [...COMMENT_FIELDS], search: "",
+        filter: { logic: "and", children: [{ field: "note_id", operator: "eq", value: noteId }] },
+        sort: [{ field: "published_at", direction: "asc" }],
+        groupThreads: true, threadSortMode: "root", page, pageSize: 200,
+      });
+      if (!isCurrent()) return null;
+      if (!response?.ok || response.consistentSnapshot !== true || response.dataset !== "comments"
+          || response.snapshotToken !== snapshotToken) throw new Error("评论快照已变化，请刷新校验后重新打开详情");
+      if (!Number.isSafeInteger(response.total) || response.total < 0
+          || (total !== null && response.total !== total)) throw new Error("评论总数已变化，请刷新后重试");
+      total = response.total;
+      const expected = Math.min(200, total - rows.length);
+      if (!Array.isArray(response.rows) || response.rows.length !== expected
+          || (response.page !== undefined && response.page !== page)) throw new Error("评论分页读取不完整，请刷新后重试");
+      const pageIds = new Set();
+      for (const row of response.rows) {
+        if (!row || row.note_id !== noteId || typeof row.comment_id !== "string" || !row.comment_id
+            || ids.has(row.comment_id) || pageIds.has(row.comment_id)
+            || COMMENT_FIELDS.some(key => !Object.prototype.hasOwnProperty.call(row, key))) {
+          throw new Error("评论身份或字段校验未通过，已停止加载");
+        }
+        pageIds.add(row.comment_id);
+      }
+      for (const id of pageIds) ids.add(id);
+      rows.push(...response.rows);
+      onPage({ rows: response.rows, total, loaded: rows.length });
+      if (!isCurrent()) return null;
+      if (rows.length === total) return { rows, total };
+    }
+  }
+
+  async function loadComments(container, { noteId, snapshotToken, currentCommentId = "", request,
+    isCurrent = () => true, gallery, onAction = () => {} }) {
+    if (!isCurrent()) return null;
+    const node = (tag, className, text) => {
+      const element = document.createElement(tag); element.className = className || "";
+      if (text !== undefined) element.textContent = text;
+      return element;
+    };
+    container.replaceChildren();
+    const title = node("h3", "", "全部本地评论");
+    const hint = node("p", "detail-meta", "包含已删除评论及各级回复，不受左侧表格筛选影响。仅显示已采集到本地的记录。");
+    const progress = node("p", "detail-comments-progress", "正在读取评论…");
+    progress.setAttribute("role", "status");
+    const list = node("div", "detail-comment-list");
+    const controls = node("div", "detail-comments-controls");
+    container.append(title, hint, controls, progress, list);
+    let selected = null, jump = null, deleted = 0, loaded = 0;
+    if (currentCommentId) {
+      jump = node("button", "detail-action", "定位当前评论"); jump.type = "button"; jump.disabled = true;
+      jump.addEventListener("click", () => {
+        if (!isCurrent() || !selected) return;
+        selected.scrollIntoView({ block: "nearest" }); selected.focus({ preventScroll: true });
+      });
+      controls.append(jump);
+    }
+    try {
+      const result = await fetchComments({ noteId, snapshotToken, request, isCurrent, onPage: batch => {
+        if (!isCurrent()) return;
+        for (const row of batch.rows) {
+          const isDeleted = row.comment_status === "已删除" || [true, 1, "1"].includes(row.is_deleted);
+          const isReply = Number(row.comment_level) >= 2 || Boolean(row.parent_comment_id);
+          const article = node("article", "detail-comment" + (isReply ? " detail-comment-reply" : ""));
+          article.dataset.commentId = row.comment_id;
+          article.dataset.deleted = String(isDeleted);
+          if (row.comment_id === currentCommentId) {
+            article.dataset.current = "true"; article.tabIndex = -1;
+            article.setAttribute("aria-label", "当前选中的评论"); selected = article; jump.disabled = false;
+          }
+          const header = node("div", "detail-comment-header");
+          header.append(node("strong", "", row.author || "作者未记录"));
+          if (row.comment_id === currentCommentId) header.append(node("span", "detail-comment-current", "当前评论"));
+          if ([true, 1, "1"].includes(row.is_post_author)) header.append(node("span", "detail-comment-role", "帖主"));
+          if (isDeleted) { header.append(node("span", "detail-comment-deleted", "已删除")); deleted += 1; }
+          article.append(header);
+          article.append(node("p", "detail-meta", [row.published_at && `${row.published_at}（北京时间）`,
+            row.ip_location && `IP 属地：${row.ip_location}`, `点赞 ${display(row.like_count)}`].filter(Boolean).join(" · ")));
+          if (isReply) {
+            const parent = row.thread_root_author ? `回复 @${row.thread_root_author}` : "回复 · 上级评论未采集或作者未记录";
+            article.append(node("p", "detail-comment-parent", parent));
+          }
+          article.append(node("p", "detail-prose", row.content || "（无文字评论）"));
+          const actions = node("div", "detail-comment-actions");
+          const locate = node("button", "detail-action", "定位原评论 ↗"); locate.type = "button";
+          locate.dataset.action = "locate_comment"; locate.dataset.value = row.comment_id;
+          locate.addEventListener("click", () => { if (isCurrent()) onAction(locate); });
+          actions.append(locate);
+          if (gallery) {
+            const photos = node("details", "detail-comment-photos");
+            photos.append(node("summary", "", "查看评论图片"));
+            const album = node("div", "detail-album"); photos.append(album);
+            let mounted = false;
+            photos.addEventListener("toggle", () => {
+              if (!photos.open || mounted || !isCurrent()) return;
+              mounted = true;
+              gallery.mount(album, { dataset: "comments", recordId: row.comment_id, title: row.author || "评论图片" },
+                { layout: "detail", previewLimit: 3, eager: true });
+            });
+            actions.append(photos);
+          }
+          article.append(actions); list.append(article);
+        }
+        loaded = batch.loaded;
+        title.textContent = `全部本地评论 · ${batch.total} 条`;
+        progress.textContent = `已读取 ${batch.loaded} / ${batch.total} 条`;
+      } });
+      if (!result || !isCurrent()) return null;
+      if (currentCommentId && !selected) throw new Error("当前评论未在同帖列表中找到，请刷新校验后重试");
+      progress.textContent = result.total ? `已加载全部 ${result.total} 条 · 现存 ${result.total - deleted} · 已删除 ${deleted}`
+        : "本地尚未采集到这篇帖子的评论。";
+      return result;
+    } catch (error) {
+      if (!isCurrent()) return null;
+      title.textContent = "本地评论 · 加载未完成";
+      progress.className = "detail-load-error"; progress.setAttribute("role", "alert");
+      progress.textContent = `${loaded ? `已读取 ${loaded} 条，尚未完整加载。` : ""}${error.message || "评论读取失败"}`;
+      const retry = node("button", "detail-action", "重试读取评论"); retry.type = "button";
+      retry.addEventListener("click", () => {
+        if (!isCurrent() || retry.disabled) return;
+        retry.disabled = true;
+        void loadComments(container, { noteId, snapshotToken, currentCommentId, request, isCurrent, gallery, onAction });
+      });
+      controls.append(retry);
+      return null;
+    }
+  }
+
   function render(container, { dataset, record, fields, snapshotToken, gallery, onAction = () => {} }) {
     const node = (tag, className, value) => {
       const element = document.createElement(tag);
@@ -129,6 +269,7 @@
       const stat = node("div"); stat.append(node("strong", "", display(record[key])), node("span", "", label)); stats.append(stat);
     }
     container.append(stats);
+    const commentsContainer = section("全部本地评论", "detail-comments");
     const actions = node("div", "detail-actions");
     if (isComment) {
       actions.append(action("定位原评论 ↗", "locate_comment", id), action("定位帖子数据库", "locate_post", record.note_id));
@@ -192,7 +333,8 @@
     container.append(all);
     const provenance = node("p", "detail-provenance", `完整记录 · 校验快照 ${snapshotToken.slice(0, 14).toUpperCase()}\n仅查看，不修改数据库；图片按记录 ID 与素材版本单独校验。`);
     container.append(provenance);
+    return { commentsContainer };
   }
 
-  return Object.freeze({ fetchRecord, render, safeLink, fieldGroup, display });
+  return Object.freeze({ fetchRecord, fetchComments, loadComments, COMMENT_FIELDS, render, safeLink, fieldGroup, display });
 });
