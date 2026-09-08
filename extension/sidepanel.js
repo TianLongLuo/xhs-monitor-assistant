@@ -52,6 +52,9 @@ const elements = {
   batchSyncFailures: document.getElementById("batchSyncFailures"),
   batchSyncFailureCount: document.getElementById("batchSyncFailureCount"),
   batchSyncFailureList: document.getElementById("batchSyncFailureList"),
+  batchSyncMutedFailures: document.getElementById("batchSyncMutedFailures"),
+  batchSyncMutedCount: document.getElementById("batchSyncMutedCount"),
+  batchSyncMutedList: document.getElementById("batchSyncMutedList"),
   ignoreAllBatchFailures: document.getElementById("ignoreAllBatchFailures"),
   cancelBatchSync: document.getElementById("cancelBatchSync"),
   retryBatchFailures: document.getElementById("retryBatchFailures"),
@@ -96,9 +99,15 @@ const elements = {
   pendingList: document.getElementById("pendingList"),
   pendingEmpty: document.getElementById("pendingEmpty"),
   operationsCenter: document.getElementById("operationsCenter"),
+  openDataOverview: document.getElementById("openDataOverview"),
+  dataOverviewSummary: document.getElementById("dataOverviewSummary"),
   ignoredOperations: document.getElementById("ignoredOperations"),
   ignoredOperationsCount: document.getElementById("ignoredOperationsCount"),
   ignoredOperationsList: document.getElementById("ignoredOperationsList"),
+  syncAlertRules: document.getElementById("syncAlertRules"),
+  syncAlertRulesCount: document.getElementById("syncAlertRulesCount"),
+  syncAlertRulesList: document.getElementById("syncAlertRulesList"),
+  syncAlertRulesHint: document.getElementById("syncAlertRulesHint"),
   refreshOperations: document.getElementById("refreshOperations"),
   healthScore: document.getElementById("healthScore"),
   healthSummary: document.getElementById("healthSummary"),
@@ -187,6 +196,11 @@ let batchSyncViewState = {
   error: "", startedAt: "", finishedAt: ""
 };
 let batchSyncCompletionNotified = "";
+let batchFailureRenderSignature = "";
+let syncAlertRules = [];
+let syncAlertRulesRenderSignature = "";
+const syncAlertPending = new Set();
+let syncAlertSettingsRevision = 0;
 let unreachableNotes = [];
 let unreachableDeleteRunning = false;
 let panelView = "overview";
@@ -208,7 +222,7 @@ const STATUS_VIEWS = {
   new: { title: "新相关未拉取", kicker: "NEW & RELEVANT", hint: "与 XHS-Monitor 品牌相关，但本地笔记 CSV 中还没有" },
   known: { title: "CSV 已有", kicker: "IN LOCAL CSV", hint: "这些帖子已经存在于本地笔记 CSV" },
   confirmed: { title: "待加入 CSV", kicker: "MARKED", hint: "已人工标记，但当前仍未写入 CSV" },
-  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "不再参与批量同步，可随时恢复" }
+  ignored: { title: "已忽略帖子", kicker: "IGNORED", hint: "本地记录保留，帖子与关联评论标记已删除；恢复后重新参与同步" }
 };
 
 const PANEL_VIEWS = new Set(["overview", "posts", "tools"]);
@@ -342,17 +356,72 @@ function showToast(message, variant = "success") {
   }, 2000);
 }
 
+function batchFailureAlert(failure = {}) {
+  // Eligibility belongs to the shared module; an alert flag alone never hides
+  // an access, CSV, or other non-comment error. Legacy records stay actionable.
+  const issue = globalThis.XhsMonitorSyncAlerts?.describeIssue?.(failure);
+  if (!issue) return null;
+  const alert = failure.alert;
+  const scope = alert?.issueType === issue.issueType && alert.suppressed === true
+    && ["once", "issue"].includes(alert.scope) ? alert.scope : "";
+  return { ...issue, suppressed: Boolean(scope), scope };
+}
+
+function batchFailureCounts(state = {}) {
+  const failures = Array.isArray(state.failures) ? state.failures : [];
+  const raw = Math.max(0, Number(state.failedPosts) || 0, failures.length);
+  const count = (value, fallback) => value !== null && value !== undefined && value !== ""
+    && Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : fallback;
+  return {
+    raw,
+    // Do not recompute server policy. Older backgrounds fall back to raw count.
+    active: count(state.activeFailureCount, raw),
+    muted: count(state.mutedFailureCount, failures.filter(item => batchFailureAlert(item)?.suppressed).length)
+  };
+}
+
+function onlyMutedBatchAlerts(state = {}) {
+  const counts = batchFailureCounts(state);
+  return counts.active === 0 && counts.muted > 0 && !state.error && state.ok !== false
+    && !Number(state.statusSyncFailures) && !state.cancelled
+    && !["failed", "interrupted", "status-write-failed", "cancelled"].includes(state.phase);
+}
+
+function mutedBatchSyncMessage(state) {
+  return `已同步可见内容，${batchFailureCounts(state).muted}条告警已忽略，帖子仍继续同步`;
+}
+
+function mergeBatchSyncViewState(state = {}) {
+  const next = { ...batchSyncViewState, ...state };
+  if (Object.prototype.hasOwnProperty.call(state, "failures")
+      || Object.prototype.hasOwnProperty.call(state, "failedPosts")) {
+    for (const key of ["activeFailureCount", "mutedFailureCount"]) {
+      if (!Object.prototype.hasOwnProperty.call(state, key)) delete next[key];
+    }
+  }
+  batchSyncViewState = next;
+  return next;
+}
+
 function batchSyncPhaseLabel(state) {
   if (state.cancelled || state.phase === "cancelled") return "同步已停止";
   if (state.phase === "stopping") return "正在停止";
   if (state.phase === "interrupted") return "上次同步已中断";
   if (state.phase === "status-write-failed") return "访问状态写入失败";
   if (state.phase === "failed") return "批量同步失败";
-  if (state.phase === "failed-note") return "当前帖子读取失败";
+  if (state.done) {
+    if (onlyMutedBatchAlerts(state)) return "已同步可见内容";
+    return batchFailureCounts(state).active || Number(state.statusSyncFailures) || state.error || state.ok === false
+      ? "批量同步已结束（仍有未完成项）" : "全部同步完成";
+  }
+  if (state.phase === "failed-note") {
+    const latest = (state.failures || []).slice(-1)[0];
+    if (batchFailureAlert(latest)?.suppressed) return "已同步可见内容（告警已忽略）";
+    return batchFailureAlert(latest) ? "当前帖子评论待核验" : "当前帖子读取失败";
+  }
   if (state.phase === "synced") return "当前帖子已更新";
   if (state.phase === "unchanged") return "当前帖子无变化";
   if (state.phase === "reading") return "正在打开帖子并展开评论";
-  if (state.done) return "全部同步完成";
   return "正在准备批量同步";
 }
 
@@ -362,7 +431,41 @@ function batchSyncSummary(state) {
   const unreachable = Math.max(0, Number(state.unreachablePosts) || 0);
   const processing = Math.max(0, Number(state.processingFailedPosts) || 0);
   const writeFailures = Math.max(0, Number(state.statusSyncFailures) || 0);
-  return `有变化 ${Number(state.changedPosts) || 0} · 无变化 ${Number(state.unchangedPosts) || 0} · 可打开 ${accessible} · 待复核 ${review} · 已确认失效 ${unreachable} · 读取未完成 ${processing}${writeFailures ? ` · 状态未写入 ${writeFailures}` : ""}`;
+  const counts = batchFailureCounts(state);
+  return `待处理 ${counts.active} · 已忽略告警 ${counts.muted} · 原始未完成 ${counts.raw} · 有变化 ${Number(state.changedPosts) || 0} · 无变化 ${Number(state.unchangedPosts) || 0} · 可打开 ${accessible} · 待复核 ${review} · 已确认失效 ${unreachable} · 读取未完成 ${processing}${writeFailures ? ` · 状态未写入 ${writeFailures}` : ""}`;
+}
+
+function batchFailureDiagnosis(failure = {}) {
+  const diagnosis = failure.diagnosis || {};
+  const syncStage = failure.syncStage || failure.stage || "unknown";
+  if (failure.markedUnreachable || failure.unreachable || failure.accessStatus === "unreachable"
+      || diagnosis.code === "confirmed_unreachable") {
+    return { ...diagnosis, code: "confirmed_unreachable", label: "已确认失效",
+      summary: diagnosis.code === "confirmed_unreachable" && diagnosis.summary
+        ? diagnosis.summary : "至少两个独立详情入口明确显示已删除、下架或不存在" };
+  }
+  // Reclassify saved failures without changing their stored data or actual error.
+  if (syncStage === "comments") {
+    return { ...diagnosis, code: "comments_unverified", label: "可打开，评论待核验",
+      summary: "正文已读取，帖子可访问；评论计数或完整性尚未核验，不属于失效帖子" };
+  }
+  if (syncStage === "compare" || syncStage === "sync") {
+    return { ...diagnosis, code: "accessible_sync_failed", label: "可打开，本地同步未完成",
+      summary: "正文已读取，帖子可访问；本地比对或同步未完成，不属于失效帖子" };
+  }
+  return diagnosis;
+}
+
+function isManualDeleteCandidate(failure = {}) {
+  if (!failure?.noteId) return false;
+  const evidence = Array.isArray(failure.accessEvidence) ? failure.accessEvidence : [failure.accessEvidence];
+  // Keep this predicate aligned with the service worker's manual-delete guard.
+  return !failure.markedUnreachable && !failure.unreachable && !failure.opened
+    && failure.accessStatus !== "unreachable" && failure.accessStatus !== "ok"
+    && !["comments", "compare", "sync"].includes(failure.syncStage || failure.stage)
+    && !["confirmed_unreachable", "comments_unverified", "accessible_sync_failed", "accessible_extraction_failed"]
+      .includes(failure.diagnosis?.code)
+    && !evidence.some((item) => item?.state === "ok" || item?.state === "accessible_surface");
 }
 
 function failureNoteUrl(failure = {}) {
@@ -372,49 +475,199 @@ function failureNoteUrl(failure = {}) {
   return noteId ? `https://www.xiaohongshu.com/explore/${encodeURIComponent(noteId)}` : "";
 }
 
-async function ignoreBatchFailureItems(items = [], confirmMany = false) {
-  const targets = (Array.isArray(items) ? items : []).filter((item) => item?.noteId);
-  if (!targets.length) return null;
-  if (confirmMany && !confirm(`确定一键忽略 ${targets.length} 篇未完成帖子吗？\n\n忽略后不再参与“同步全部”，可在运营页面展开并恢复。`)) return null;
+function confirmWholePostIgnore(items = []) {
+  const titles = items.slice(0, 6).map(item => `• ${item.title || item.noteId || "未命名帖子"}`).join("\n");
+  return confirm(`忽略整个帖子（停止同步）\n\n确定忽略以下 ${items.length} 篇帖子吗？\n${titles}${items.length > 6 ? "\n…" : ""}\n\n帖子将停止参与后续同步；帖子与关联评论会标记为删除态，本地记录保留，可在运营页恢复。\n\n如果只想关闭评论告警，请取消并使用“告警设置”；告警忽略不改变数据状态，帖子仍继续同步。`);
+}
+
+async function ignoreBatchFailureItems(items = []) {
+  const targets = [...new Map((Array.isArray(items) ? items : [])
+    .filter(item => item?.noteId).map(item => [item.noteId, item])).values()];
+  if (!targets.length || batchSyncViewState.running || !confirmWholePostIgnore(targets)) return null;
   const result = await sendRuntime({ type: "ignoreBatchFailures", noteIds: targets.map((item) => item.noteId) });
   if (result?.state) renderBatchSync(result.state);
   if (!result?.ok) throw new Error(result?.error || "忽略失败");
-  setStatus(`已忽略 ${result.ignoredCount || targets.length} 篇帖子，可在运营页面恢复`, "success");
-  showToast("帖子已移入运营页的“已忽略帖子”");
+  setStatus(`已忽略整个帖子 ${result.ignoredCount || targets.length} 篇并停止同步；帖子与关联评论已标记为删除态，可在运营页恢复`, "warning");
+  showToast("整帖同步已停止，可在运营页的“已忽略帖子”恢复", "neutral");
   await Promise.all([refreshStats(), refreshIgnoredOperations(), refreshUnreachableNotes()]);
   return result;
+}
+
+async function changeSyncAlertDisposition(item, scope) {
+  const result = await sendRuntime({
+    type: "setSyncAlertDisposition", noteId: item.noteId, issueType: item.issueType,
+    scope, runStartedAt: item.runStartedAt || ""
+  });
+  // Apply only the returned projection: no optimistic failure removal and no
+  // business-store writes. A rejection may also carry an updated batch state.
+  if (result?.state) renderBatchSync(result.state);
+  if (!result?.ok) throw new Error(result?.error || "告警设置保存失败");
+  if (Array.isArray(result.rules)) renderSyncAlertRules(result.rules);
+  const counts = batchFailureCounts(batchSyncViewState);
+  const hasErrors = counts.active > 0 || Number(batchSyncViewState.statusSyncFailures)
+    || batchSyncViewState.error || batchSyncViewState.ok === false;
+  const action = scope === "restore" ? "已恢复此帖的同类告警提醒"
+    : scope === "once" ? "仅忽略本次告警，下个批次重新提醒" : "已持续忽略此帖的同类告警";
+  const remaining = [counts.active ? `${counts.active} 项待处理` : "",
+    Number(batchSyncViewState.statusSyncFailures) ? `${batchSyncViewState.statusSyncFailures} 项状态未写入` : "",
+    batchSyncViewState.error || (batchSyncViewState.ok === false ? "批量同步失败" : "")].filter(Boolean).join("；");
+  const message = onlyMutedBatchAlerts(batchSyncViewState) && batchSyncViewState.done
+    ? mutedBatchSyncMessage(batchSyncViewState)
+    : `${action}；帖子仍继续同步${hasErrors ? `；${remaining}` : ""}`;
+  setStatus(message, hasErrors ? "warning" : "idle");
+  showToast(message, hasErrors ? "error" : "neutral");
+  return result;
+}
+
+function createSyncAlertButton(item, scope, label) {
+  // Bind the displayed batch, not the batch that happens to be current when a
+  // delayed click fires. Restore is intentionally batch-independent server-side.
+  const operation = { ...item, runStartedAt: batchSyncViewState.startedAt || "" };
+  const key = JSON.stringify([item.noteId, item.issueType]);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "sync-alert-button";
+  button.textContent = label;
+  button.dataset.noteId = item.noteId;
+  button.dataset.issueType = item.issueType;
+  button.dataset.scope = scope;
+  button.disabled = !item.noteId || syncAlertPending.has(key);
+  button.setAttribute("aria-label", `${label} · ${item.title || item.noteId}`);
+  button.addEventListener("click", async () => {
+    if (syncAlertPending.has(key)) return;
+    const hadFocus = document.activeElement === button;
+    const fromRules = elements.syncAlertRulesList?.contains(button);
+    const controls = () => [...document.querySelectorAll(".sync-alert-button")]
+      .filter(node => node.dataset.noteId === item.noteId && node.dataset.issueType === item.issueType);
+    syncAlertPending.add(key);
+    syncAlertSettingsRevision += 1;
+    controls().forEach(node => { node.disabled = true; });
+    button.disabled = true;
+    button.textContent = scope === "restore" ? "恢复中…" : "保存中…";
+    try {
+      await changeSyncAlertDisposition(operation, scope);
+    } catch (error) {
+      setStatus(error.message || "告警设置保存失败", "error");
+    } finally {
+      syncAlertPending.delete(key);
+      controls().forEach(node => { node.disabled = !node.dataset.noteId; });
+      button.disabled = !item.noteId;
+      button.textContent = label;
+      if (hadFocus) {
+        if (button.isConnected) button.focus();
+        else {
+          const summary = fromRules ? elements.syncAlertRules?.querySelector("summary")
+            : scope !== "restore" ? elements.batchSyncMutedFailures?.querySelector("summary")
+              : controls()[0]?.closest("details")?.querySelector("summary");
+          summary?.focus();
+        }
+      }
+    }
+  });
+  return button;
 }
 
 function renderBatchFailures(failures = []) {
   if (!elements.batchSyncFailures || !elements.batchSyncFailureList) return;
   const items = Array.isArray(failures) ? failures.filter((item) => item?.noteId || item?.url) : [];
-  elements.batchSyncFailures.hidden = items.length === 0;
-  if (elements.batchSyncFailureCount) elements.batchSyncFailureCount.textContent = `${items.length} 篇`;
+  const counts = batchFailureCounts({ ...batchSyncViewState, failures });
+  const signature = JSON.stringify({
+    running: Boolean(batchSyncViewState.running),
+    startedAt: batchSyncViewState.startedAt || "", counts,
+    items: items.map((item) => [
+      item.noteId || "", item.url || "", item.title || "", item.error || "",
+      item.syncStage || "", item.stage || "", item.accessStatus || "", Boolean(item.unreachable),
+      item.markedUnreachable === true, item.diagnosis?.code || "",
+      item.diagnosis?.label || "", item.diagnosis?.summary || "", item.diagnosis?.localSummary || "",
+      batchFailureAlert(item)
+    ])
+  });
+  if (signature === batchFailureRenderSignature) return;
+  batchFailureRenderSignature = signature;
+  const activeItems = items.filter(item => !batchFailureAlert(item)?.suppressed);
+  const mutedItems = items.filter(item => batchFailureAlert(item)?.suppressed);
+  elements.batchSyncFailures.hidden = counts.active === 0 && activeItems.length === 0;
+  if (elements.batchSyncFailureCount) {
+    const countLabel = `${counts.active} 项`;
+    if (elements.batchSyncFailureCount.textContent !== countLabel) elements.batchSyncFailureCount.textContent = countLabel;
+  }
   if (elements.ignoreAllBatchFailures) {
-    elements.ignoreAllBatchFailures.hidden = items.length === 0;
-    elements.ignoreAllBatchFailures.disabled = batchSyncViewState.running || !items.some((item) => item?.noteId);
+    elements.ignoreAllBatchFailures.hidden = activeItems.length === 0;
+    elements.ignoreAllBatchFailures.disabled = batchSyncViewState.running || !activeItems.some((item) => item?.noteId);
+    elements.ignoreAllBatchFailures.title = `忽略当前未忽略列表中的 ${new Set(activeItems.filter(item => item.noteId).map(item => item.noteId)).size} 篇整帖；停止同步并改变帖子与关联评论状态`;
   }
   const fragment = document.createDocumentFragment();
-  items.forEach((failure, index) => {
+  const mutedFragment = document.createDocumentFragment();
+  if (elements.batchSyncMutedFailures) elements.batchSyncMutedFailures.hidden = mutedItems.length === 0;
+  if (elements.batchSyncMutedCount) elements.batchSyncMutedCount.textContent = `${counts.muted} 条`;
+  let activeIndex = 0;
+  let mutedIndex = 0;
+  items.forEach((failure) => {
+    const alert = batchFailureAlert(failure);
     const item = document.createElement("li");
     item.className = "batch-sync-failure";
+    item.dataset.suppressed = alert?.suppressed ? "true" : "false";
+    item.dataset.noteId = failure.noteId || "";
+    item.dataset.issueType = alert?.issueType || "";
     const url = failureNoteUrl(failure);
     const number = document.createElement("span");
     number.className = "batch-sync-failure__number";
-    number.textContent = String(index + 1).padStart(2, "0");
-    const copy = document.createElement("span");
+    number.textContent = String(alert?.suppressed ? ++mutedIndex : ++activeIndex).padStart(2, "0");
+    const copy = document.createElement("div");
     copy.className = "batch-sync-failure__copy";
-    const diagnosis = failure.diagnosis || {};
+    const diagnosis = batchFailureDiagnosis(failure);
     item.dataset.diagnosis = diagnosis.code || "unknown";
     const badge = document.createElement("span");
     badge.className = "batch-sync-failure__badge";
-    badge.textContent = diagnosis.label || (failure.markedUnreachable ? "已确认失效" : "同步未完成");
+    badge.textContent = alert?.suppressed
+      ? `${alert.label} · ${alert.scope === "once" ? "仅本次已忽略" : "持续忽略同类"}`
+      : alert?.label || diagnosis.label || (failure.markedUnreachable ? "已确认失效" : "同步未完成");
     const title = document.createElement("strong");
     title.textContent = failure.title || "未命名帖子";
     const reason = document.createElement("small");
-    reason.textContent = [diagnosis.summary, diagnosis.localSummary, failure.error].filter(Boolean).join(" · ") || "等待重新核验";
+    reason.className = "batch-sync-failure__reason";
+    reason.textContent = String(failure.error || "").trim() || diagnosis.summary || "等待重新核验";
     reason.title = reason.textContent;
     copy.append(badge, title, reason);
+    const detailsText = [...new Set([diagnosis.summary, diagnosis.localSummary]
+      .map((value) => String(value || "").trim()).filter((value) => value && value !== reason.textContent))].join("\n");
+    if (detailsText) {
+      const details = document.createElement("details");
+      details.className = "batch-sync-failure__details";
+      const summary = document.createElement("summary");
+      summary.textContent = "诊断与本地记录";
+      const context = document.createElement("small");
+      context.textContent = detailsText;
+      details.append(summary, context);
+      copy.append(details);
+    }
+    let alertControls = null;
+    let alertSettings = null;
+    if (alert) {
+      alertControls = document.createElement("div");
+      alertControls.className = "sync-alert-controls";
+      const settings = document.createElement("details");
+      alertSettings = settings;
+      settings.className = "sync-alert-settings";
+      const summary = document.createElement("summary");
+      summary.textContent = "告警设置";
+      const hint = document.createElement("small");
+      hint.textContent = alert.suppressed
+        ? `${alert.scope === "once" ? "仅当前批次静音，下个批次重新提醒" : "持续忽略此帖的同类告警"}；帖子仍继续同步，采集完整性及数据状态不变。`
+        : "只调整此帖的这类提醒，帖子仍继续同步；不改变采集完整性，不改变或删除历史数据。";
+      const target = { noteId: failure.noteId, title: failure.title, ...alert };
+      settings.append(summary, hint);
+      if (alert.suppressed) {
+        // Keep restore directly reachable in the expanded muted list.
+        alertControls.append(settings, createSyncAlertButton(target, "restore", "恢复提醒"));
+      } else {
+        settings.append(
+          createSyncAlertButton(target, "once", "仅忽略本次告警"),
+          createSyncAlertButton(target, "issue", `忽略此帖的${alert.label}（继续同步）`)
+        );
+        alertControls.append(settings);
+      }
+    }
     const actions = document.createElement("span");
     actions.className = "batch-sync-failure__actions";
     const open = document.createElement("a");
@@ -456,30 +709,44 @@ function renderBatchFailures(failures = []) {
     const ignore = document.createElement("button");
     ignore.type = "button";
     ignore.className = "batch-sync-failure__ignore";
-    ignore.textContent = "忽略";
-    ignore.title = "忽略后不再参与批量同步，可在运营页面恢复";
-    ignore.disabled = !failure.noteId;
+    ignore.textContent = "忽略整个帖子（停止同步）";
+    ignore.setAttribute("aria-label", `忽略整个帖子（停止同步） · ${failure.title || failure.noteId}`);
+    ignore.title = "停止后续同步，帖子与关联评论标记为删除态；需要确认，可在运营页面恢复";
+    ignore.disabled = !failure.noteId || batchSyncViewState.running;
     ignore.addEventListener("click", async () => {
       ignore.disabled = true;
       ignore.textContent = "忽略中";
       try {
         await ignoreBatchFailureItems([failure]);
       } catch (error) {
-        ignore.disabled = false;
-        ignore.textContent = "重试";
         setStatus(error.message || "忽略失败", "error");
+      } finally {
+        ignore.disabled = !failure.noteId || batchSyncViewState.running;
+        ignore.textContent = "忽略整个帖子（停止同步）";
       }
     });
-    actions.append(open, excel, ignore);
+    actions.append(open, excel);
+    // Non-destructive alert scopes get the whole card width. The destructive
+    // whole-post choice lives after them, rather than competing beside the
+    // warning or squeezing the useful option below a narrow scroll viewport.
+    if (alertSettings) alertSettings.append(ignore);
+    else actions.append(ignore);
     item.append(number, copy, actions);
-    fragment.append(item);
+    if (alertControls) item.append(alertControls);
+    (alert?.suppressed ? mutedFragment : fragment).append(item);
   });
   elements.batchSyncFailureList.replaceChildren(fragment);
+  elements.batchSyncMutedList?.replaceChildren(mutedFragment);
 }
 
 function renderBatchSync(state = {}, notify = false) {
-  batchSyncViewState = { ...batchSyncViewState, ...(state || {}) };
-  const view = batchSyncViewState;
+  const setStableText = (node, value) => {
+    const next = String(value ?? "");
+    if (node && node.textContent !== next) node.textContent = next;
+  };
+  const view = mergeBatchSyncViewState(state || {});
+  const counts = batchFailureCounts(view);
+  if (Array.isArray(state?.alertRules)) renderSyncAlertRules(state.alertRules);
   const total = Math.max(0, Number(view.total) || 0);
   const rawCurrent = Math.max(0, Number(view.current) || 0);
   const current = total ? Math.min(total, rawCurrent) : rawCurrent;
@@ -491,23 +758,28 @@ function renderBatchSync(state = {}, notify = false) {
   elements.syncAllPulled?.classList.toggle("is-running", running);
   if (elements.syncAllPulled) elements.syncAllPulled.disabled = running;
   if (elements.syncAllPulledLabel) {
-    elements.syncAllPulledLabel.textContent = running
+    setStableText(elements.syncAllPulledLabel, running
       ? `正在同步 ${current}/${total || "?"}`
-      : "同步全部已拉取帖子";
+      : "同步全部已拉取帖子");
   }
-  if (elements.batchSyncTitle) elements.batchSyncTitle.textContent = batchSyncPhaseLabel(view);
-  if (elements.batchSyncCount) elements.batchSyncCount.textContent = `${current} / ${total}`;
+  setStableText(elements.batchSyncTitle, batchSyncPhaseLabel(view));
+  setStableText(elements.batchSyncCount, `${current} / ${total}`);
   if (elements.batchSyncBar) elements.batchSyncBar.style.width = `${percent}%`;
   if (elements.batchSyncCurrent) {
-    const failures = Array.isArray(view.failures) ? view.failures : [];
+    const failures = Array.isArray(view.failures) ? view.failures.filter(item => !batchFailureAlert(item)?.suppressed) : [];
     const failure = failures[failures.length - 1] || null;
-    elements.batchSyncCurrent.textContent = view.error
-      || (view.currentTitle ? `当前：${view.currentTitle}` : "")
-      || (failure ? `${failure.title}：${failure.error}` : "")
-      || (view.done ? "已完成所有可访问帖子的评论核对" : "正在读取已拉取帖子列表…");
+    setStableText(elements.batchSyncCurrent, view.error
+      || (running && view.currentTitle ? `当前：${view.currentTitle}` : "")
+      || (view.done && onlyMutedBatchAlerts(view) ? mutedBatchSyncMessage(view) : "")
+      || (failure ? `${failure.title || "未命名帖子"}：${failure.error || batchFailureDiagnosis(failure).summary || "等待重新核验"}` : "")
+      || (view.done
+        ? (counts.active || Number(view.statusSyncFailures) || view.ok === false
+          ? "批量同步已结束；成功项已校验，失败项未提交或等待复核"
+          : "帖子、评论及存续状态已写入并通过一致性校验")
+        : "正在读取已拉取帖子列表…"));
   }
   if (elements.batchSyncStats) {
-    elements.batchSyncStats.textContent = `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`;
+    setStableText(elements.batchSyncStats, `${batchSyncSummary(view)} · 新增 ${Number(view.newComments) || 0} · 标记删除 ${Number(view.removedComments) || 0} · 修改 ${Number(view.changedComments) || 0}`);
   }
   renderBatchFailures(view.failures);
   if (elements.cancelBatchSync) {
@@ -516,17 +788,16 @@ function renderBatchSync(state = {}, notify = false) {
     elements.cancelBatchSync.textContent = view.phase === "stopping" ? "正在停止…" : "停止同步";
   }
   if (elements.retryBatchFailures) {
-    const failedCount = Math.max(0, Number(view.failedPosts) || 0);
+    const failedCount = counts.active;
     elements.retryBatchFailures.hidden = running || failedCount === 0;
     elements.retryBatchFailures.disabled = running;
     elements.retryBatchFailures.textContent = `重新核验 ${failedCount} 个未完成项`;
-    elements.retryBatchFailures.title = (view.failures || []).length < failedCount
+    elements.retryBatchFailures.title = (view.failures || []).filter(item => !batchFailureAlert(item)?.suppressed).length < failedCount
       ? "旧批次未保存全部失败 ID，将自动重新核验全部已拉取帖子"
-      : "只重新核验上一轮失败的帖子";
+      : "只重新核验上一轮未忽略的告警与错误；已忽略告警的帖子仍参加正常同步";
   }
   if (elements.deleteUnreachable) {
-    const reviewCount = (view.failures || []).filter((item) => !item?.markedUnreachable).length;
-    elements.deleteUnreachable.disabled = running || unreachableDeleteRunning || (unreachableNotes.length === 0 && reviewCount === 0);
+    renderUnreachableNotes({ notes: unreachableNotes });
   }
 
   if (!notify || running || !view.done) return;
@@ -536,13 +807,18 @@ function renderBatchSync(state = {}, notify = false) {
   if (view.cancelled) {
     setStatus(`批量同步已停止；已处理 ${current}/${total} 篇`, "warning");
     showToast(`批量同步已停止 · 已处理 ${current}/${total}`);
-  } else if (!view.ok || view.error) {
+  } else if (view.ok === false || view.error) {
     setStatus(`批量同步失败：${view.error || "请重新启动"}`, "error");
     showToast(`批量同步失败：${view.error || "请重新启动"}`, "error");
+  } else if (onlyMutedBatchAlerts(view)) {
+    const message = mutedBatchSyncMessage(view);
+    setStatus(message, "idle");
+    showToast(message, "neutral");
   } else {
-    const message = `评论同步完成 · ${batchSyncSummary(view)}`;
-    setStatus(message, Number(view.failedPosts) ? "warning" : "success");
-    showToast(message, Number(view.failedPosts) ? "error" : "success");
+    const hasErrors = counts.active > 0 || Number(view.statusSyncFailures) > 0;
+    const message = `${hasErrors ? "帖子与评论状态同步已结束" : "帖子与评论状态同步完成"} · ${batchSyncSummary(view)}`;
+    setStatus(message, hasErrors ? "warning" : "success");
+    showToast(message, hasErrors ? "error" : "success");
   }
 }
 
@@ -571,7 +847,7 @@ async function startAllPulledSync() {
 
 async function retryFailedPulledSync() {
   if (batchSyncViewState.running) return;
-  const failedCount = Math.max(0, Number(batchSyncViewState.failedPosts) || 0);
+  const failedCount = batchFailureCounts(batchSyncViewState).active;
   if (!failedCount) return;
   renderBatchSync({
     ok: true, running: true, done: false, cancelled: false,
@@ -606,23 +882,23 @@ async function cancelAllPulledSync() {
 function renderUnreachableNotes(result = {}) {
   unreachableNotes = Array.isArray(result.notes) ? result.notes : [];
   const count = Number(result.count ?? unreachableNotes.length) || 0;
-  const reviewCount = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable).length;
+  const reviewCount = (batchSyncViewState.failures || []).filter(isManualDeleteCandidate).length;
   if (elements.unreachableCount) elements.unreachableCount.textContent = String(count || reviewCount);
   if (elements.deleteUnreachableLabel) {
-    elements.deleteUnreachableLabel.textContent = count
-      ? `清理已确认失效帖子（${count}）`
-      : reviewCount ? `人工确认并删除无效帖子（${reviewCount}）` : "暂无已确认失效帖子";
+    elements.deleteUnreachableLabel.textContent = reviewCount
+      ? `人工确认并标记已删除（${reviewCount}）`
+      : count ? `已保留删除帖子记录（${count}）` : "暂无已确认删除帖子";
   }
   if (elements.unreachableHint) {
-    elements.unreachableHint.textContent = count
-      ? "同步删除笔记/评论 CSV、SQLite、分析记录与素材，并执行一致性校验"
-      : reviewCount ? "自动证据不足时，可由你人工确认后彻底删除；操作前会再次提示" : "仅删除经双重证据确认已删除或下架的帖子";
+    elements.unreachableHint.textContent = reviewCount
+      ? "人工确认后只把帖子状态改为“已删除”，不会删除帖子、评论、分析记录或素材"
+      : count ? "帖子行、评论、SQLite、语义分析和素材均已保留" : "仅双重证据或人工确认后才标记帖子已删除";
   }
   if (elements.deleteUnreachable) {
-    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || (count === 0 && reviewCount === 0);
-    elements.deleteUnreachable.title = count
-      ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n")
-      : reviewCount ? "点击后确认删除这些无效帖子，并同步清理 CSV、数据库和素材" : "当前没有经双重证据确认的失效帖子";
+    elements.deleteUnreachable.disabled = batchSyncViewState.running || unreachableDeleteRunning || reviewCount === 0;
+    elements.deleteUnreachable.title = reviewCount
+      ? "点击后人工确认并标记为已删除；所有本地数据继续保留"
+      : count ? unreachableNotes.slice(0, 5).map((item) => item.title || item.note_id).join("\n") : "当前没有待确认帖子";
   }
 }
 
@@ -635,57 +911,36 @@ async function refreshUnreachableNotes() {
 
 async function deleteAllUnreachableNotes() {
   if (unreachableDeleteRunning || batchSyncViewState.running) return;
-  if (!unreachableNotes.length) {
-    const reviewFailures = (batchSyncViewState.failures || []).filter((item) => !item?.markedUnreachable && item?.noteId);
-    if (!reviewFailures.length) return;
-    const preview = reviewFailures.slice(0, 8).map((item) => `• ${item.title || item.noteId}（${item.diagnosis?.label || "待复核"}）`).join("\n");
-    const accepted = confirm(
-      `自动核验尚未达到“确认失效”标准。\n\n你是否人工确认以下 ${reviewFailures.length} 篇属于无效帖子并彻底删除？\n\n${preview}` +
-      `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
-      "将同步删除笔记/评论 CSV、SQLite 分析记录和素材目录。此操作不可撤销。"
-    );
-    if (!accepted) return;
-    unreachableDeleteRunning = true;
-    if (elements.deleteUnreachable) elements.deleteUnreachable.disabled = true;
-    if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在删除 ${reviewFailures.length} 篇…`;
-    setStatus(`正在按人工确认清理 ${reviewFailures.length} 篇无效帖子…`, "warning");
-    try {
-      const result = await sendRuntime({ type: "deleteReviewedFailures", noteIds: reviewFailures.map((item) => item.noteId) });
-      if (result?.state) renderBatchSync(result.state);
-      if (!result?.ok) throw new Error(result?.error || "部分帖子删除失败");
-      setStatus(`已彻底删除 ${result.deletedCount || reviewFailures.length} 篇人工确认的无效帖子`, "success");
-      showToast("无效帖子已从 CSV、数据库和素材目录清理");
-      await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
-      return result;
-    } finally {
-      unreachableDeleteRunning = false;
-      renderUnreachableNotes({ notes: unreachableNotes, count: unreachableNotes.length });
-    }
+  const reviewFailures = (batchSyncViewState.failures || [])
+    .filter(isManualDeleteCandidate);
+  if (!reviewFailures.length) {
+    if (unreachableNotes.length) showToast("已删除帖子均已保留在 CSV、SQLite 和素材目录中");
+    return;
   }
-  const count = unreachableNotes.length;
+  const preview = reviewFailures.slice(0, 8)
+    .map((item) => `• ${item.title || item.noteId}（${item.diagnosis?.label || "待复核"}）`).join("\n");
   const accepted = confirm(
-    `确定删除 ${count} 篇标记为“打不开”的帖子吗？\n\n` +
-    "将同时删除笔记 CSV 中的帖子行、评论 CSV 对应行、SQLite 记录和受管素材目录。"
+    `自动证据尚不充分。\n\n是否人工确认以下 ${reviewFailures.length} 篇帖子已删除或下架？\n\n${preview}` +
+    `${reviewFailures.length > 8 ? `\n• 另有 ${reviewFailures.length - 8} 篇` : ""}\n\n` +
+    "确认后只把“帖子状态”改为“已删除”；帖子行、评论、SQLite、分析结果和素材均完整保留。"
   );
   if (!accepted) return;
   unreachableDeleteRunning = true;
   if (elements.deleteUnreachable) elements.deleteUnreachable.disabled = true;
-  if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在删除 ${count} 篇…`;
-  setStatus(`正在删除 ${count} 篇打不开帖子及对应评论…`, "warning");
+  if (elements.deleteUnreachableLabel) elements.deleteUnreachableLabel.textContent = `正在标记 ${reviewFailures.length} 篇…`;
+  setStatus(`正在标记 ${reviewFailures.length} 篇帖子为已删除…`, "warning");
   try {
-    const result = await sendRuntime({ type: "deleteUnreachableNotes" });
-    const deleted = Number(result?.deletedCount) || 0;
-    const failed = Number(result?.failedCount) || 0;
-    if (!result?.ok && !deleted) throw new Error(result?.error || "批量删除失败");
-    const verified = Boolean(result?.excelVerified && result?.databaseVerified);
-    const linked = Number(result?.deletedLinkedDatabaseRecords) || 0;
-    const message = `已清理 ${deleted} 篇失效帖子、${Number(result?.deletedCommentRows) || 0} 条 CSV 评论及 ${linked} 条关联记录${verified ? "；CSV 与数据库校验通过" : ""}${failed ? `；${failed} 篇失败` : ""}`;
-    setStatus(message, failed ? "warning" : "success");
-    showToast(message, failed ? "error" : "success");
-    await Promise.all([refreshAll({ quiet: true }), refreshUnreachableNotes()]);
+    const result = await sendRuntime({ type: "deleteReviewedFailures", noteIds: reviewFailures.map((item) => item.noteId) });
+    if (result?.state) renderBatchSync(result.state);
+    if (!result?.ok) throw new Error(result?.error || "部分帖子标记失败");
+    const marked = Number(result.markedDeletedCount ?? result.deletedCount) || reviewFailures.length;
+    setStatus(`已标记 ${marked} 篇帖子为已删除；所有本地数据均已保留`, "success");
+    showToast("帖子状态已更新，CSV、数据库、评论和素材未删除");
+    await Promise.all([refreshStats(), refreshPending(), refreshUnreachableNotes(), loadPageInfo()]);
+    return result;
   } finally {
     unreachableDeleteRunning = false;
-    renderUnreachableNotes({ count: unreachableNotes.length, notes: unreachableNotes });
+    renderUnreachableNotes({ notes: unreachableNotes, count: unreachableNotes.length });
   }
 }
 
@@ -702,6 +957,7 @@ function renderCurrentDetail(note = null, loading = false) {
     Array.isArray(currentDetailNote.imageUrls) ? currentDetailNote.imageUrls[0] : "",
     currentDetailNote.inExcel, currentDetailNote.pullStatus,
     currentDetailNote.relevanceStatus, currentDetailNote.isRelevant,
+    currentDetailNote.postStatus, currentDetailNote.isDeleted,
     currentDetailNote.watched, currentDetailNote.watchPriority
   ]) : "empty";
   if (nextSignature === currentDetailRenderSignature) return;
@@ -711,8 +967,11 @@ function renderCurrentDetail(note = null, loading = false) {
 
   const contentLength = String(currentDetailNote.content || "").trim().length;
   const imageCount = Number(currentDetailNote.imageCount) || currentDetailNote.imageUrls?.length || 0;
+  const postDeleted = Boolean(currentDetailNote.isDeleted || currentDetailNote.postStatus === "已删除");
   const state = active
     ? { label: "处理中", value: "processing" }
+    : postDeleted
+      ? { label: "帖子已删除", value: "deleted" }
     : currentDetailNote.inExcel
       ? { label: "CSV 已有", value: "synced" }
       : loading || !contentLength
@@ -726,6 +985,8 @@ function renderCurrentDetail(note = null, loading = false) {
   ].filter(Boolean).join(" · ");
   const hint = active
     ? "Process 正在详情右侧运行：正文、素材图片、评论及 ID、CSV / SQLite。"
+    : postDeleted
+      ? "平台帖子已确认删除或下架；帖子行、评论、SQLite、语义分析和素材均完整保留。"
     : currentDetailNote.inExcel
       ? "本次已写入本地 CSV 与 SQLite；再次点击可补采正文、图片或评论。"
       : contentLength
@@ -756,8 +1017,10 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailState.dataset.state = state.value;
   elements.currentDetailMeta.textContent = meta || "当前详情已识别，等待操作";
   const pulled = currentDetailNote.inExcel || ["synced", "partial"].includes(currentDetailNote.pullStatus);
-  elements.currentDetailPullStatus.textContent = pulled ? (currentDetailNote.pullStatus === "partial" ? "拉取：部分拉取" : "拉取：已拉取") : "拉取：未拉取";
-  elements.currentDetailPullStatus.dataset.state = pulled ? "pulled" : "missing";
+  elements.currentDetailPullStatus.textContent = postDeleted
+    ? "帖子状态：已删除（数据保留）"
+    : pulled ? (currentDetailNote.pullStatus === "partial" ? "拉取：部分拉取" : "拉取：已拉取") : "拉取：未拉取";
+  elements.currentDetailPullStatus.dataset.state = postDeleted ? "deleted" : pulled ? "pulled" : "missing";
   const relevance = currentDetailNote.relevanceStatus || (currentDetailNote.isRelevant ? "relevant" : "unknown");
   elements.currentDetailRelevance.textContent = `相关性：${relevance === "relevant" ? "相关" : relevance === "irrelevant" ? "不相关" : "未知"}`;
   elements.currentDetailRelevance.dataset.state = relevance;
@@ -767,7 +1030,7 @@ function renderCurrentDetail(note = null, loading = false) {
   elements.currentDetailPull.disabled = active || !noteId;
   elements.currentDetailPull.textContent = active
     ? "处理中…"
-    : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 CSV";
+    : postDeleted ? "重新核验 / 恢复" : currentDetailNote.inExcel ? "再次拉取 / 补全" : "拉取到 CSV";
   elements.currentDetailRefresh.disabled = active;
   elements.currentDetailSummary.disabled = active || !contentLength;
   elements.currentDetailComments.disabled = active || !contentLength;
@@ -779,7 +1042,7 @@ function renderCurrentDetail(note = null, loading = false) {
       ? "点击移出重点帖子观察名单"
       : "同步变化会在运营工作台优先显示";
   }
-  elements.currentDetailDelete.hidden = !pulled;
+  elements.currentDetailDelete.hidden = !pulled || postDeleted;
   elements.currentDetailDelete.disabled = active;
 }
 
@@ -818,6 +1081,11 @@ function renderDataHealth(result) {
     return;
   }
   const summary = result.summary || {};
+  if (elements.dataOverviewSummary) {
+    elements.dataOverviewSummary.textContent = summary.relationshipsConsistent
+      ? `${summary.csvNotes || 0} 篇帖子 · ${summary.csvComments || 0} 条评论 · 一致性已通过`
+      : "数据一致性未通过，数据总览将保持只读锁定";
+  }
   elements.healthScore.textContent = String(result.score ?? "—");
   elements.healthScore.dataset.state = result.status || "healthy";
   const statusLabel = { healthy: "数据结构健康", warning: "发现可处理问题", critical: "发现关键一致性问题" }[result.status] || "体检完成";
@@ -861,12 +1129,12 @@ function renderChangeEvents(result) {
   const byType = result?.byType || {};
   renderOperationsMetrics(elements.changeMetrics, [
     ["新增评论", byType.comment_added || 0],
-    ["删除评论", byType.comment_removed || 0],
+    ["标记删除评论", byType.comment_removed || 0],
     ["帖子/状态变化", (byType.note_fields_changed || 0) + (byType.access_status_changed || 0)]
   ]);
   elements.changeList.replaceChildren();
   const labels = {
-    comment_added: "新增", comment_removed: "删除", comment_changed: "修改",
+    comment_added: "新增", comment_removed: "标记删除", comment_changed: "修改",
     note_fields_changed: "帖子", access_status_changed: "状态"
   };
   const events = Array.isArray(result?.events) ? result.events : [];
@@ -944,7 +1212,7 @@ function renderIgnoredOperations(result) {
         const restored = await sendRuntime({ type: "restoreNote", note: { noteId: item.noteId } });
         if (!restored?.ok) throw new Error(restored?.error || "恢复失败");
         await Promise.all([refreshIgnoredOperations(), refreshStats()]);
-        showToast("帖子已恢复，将重新参与批量同步");
+        showToast("帖子已恢复，忽略前仍存在的评论已恢复并将重新参与同步");
       } catch (error) {
         restore.disabled = false; restore.textContent = "重试";
         setStatus(error.message || "恢复失败", "error");
@@ -953,6 +1221,61 @@ function renderIgnoredOperations(result) {
     actions.append(open, restore); row.append(copy, actions); elements.ignoredOperationsList.appendChild(row);
   }
   if (!items.length) operationsEmpty(elements.ignoredOperationsList, "当前没有已忽略帖子");
+}
+
+function renderSyncAlertRules(rules) {
+  if (!Array.isArray(rules)) return;
+  syncAlertRules = rules.slice();
+  if (elements.syncAlertRulesCount) elements.syncAlertRulesCount.textContent = String(rules.length);
+  if (elements.syncAlertRulesHint) {
+    elements.syncAlertRulesHint.textContent = "仅忽略此帖的同类评论告警；不停止同步，不改变数据状态。";
+    elements.syncAlertRulesHint.dataset.state = "idle";
+  }
+  if (!elements.syncAlertRulesList) return;
+  const signature = JSON.stringify(rules);
+  if (signature === syncAlertRulesRenderSignature) return;
+  syncAlertRulesRenderSignature = signature;
+  const fragment = document.createDocumentFragment();
+  for (const rule of rules) {
+    const row = document.createElement("div");
+    row.className = "operations-row sync-alert-rule";
+    const copy = document.createElement("div");
+    copy.className = "operations-row__copy";
+    const title = document.createElement("strong");
+    title.textContent = rule.title || rule.noteId || "未命名帖子";
+    const detail = document.createElement("p");
+    detail.textContent = `${rule.label || rule.issueType} · 持续忽略，仅此帖同类告警 · 仍同步`;
+    const meta = document.createElement("small");
+    meta.textContent = [rule.noteId, rule.createdAt ? formatLocalTime(rule.createdAt) : ""].filter(Boolean).join(" · ");
+    copy.append(title, detail, meta);
+    const actions = document.createElement("div");
+    actions.className = "operations-row__actions";
+    // A saved rule can be restored even when this note is absent from the
+    // current batch. Never read/write business tables to manage these rules.
+    actions.append(createSyncAlertButton(rule, "restore", "恢复提醒"));
+    row.append(copy, actions);
+    fragment.append(row);
+  }
+  elements.syncAlertRulesList.replaceChildren(fragment);
+  if (!rules.length) operationsEmpty(elements.syncAlertRulesList, "当前没有持续忽略规则");
+}
+
+async function refreshSyncAlertSettings() {
+  const revision = ++syncAlertSettingsRevision;
+  try {
+    const result = await sendRuntime({ type: "getSyncAlertSettings" });
+    if (revision !== syncAlertSettingsRevision) return result;
+    if (!result?.ok) throw new Error(result?.error || "告警规则刷新失败");
+    if (result.state) renderBatchSync(result.state);
+    if (Array.isArray(result.rules)) renderSyncAlertRules(result.rules);
+    return result;
+  } catch (error) {
+    if (revision === syncAlertSettingsRevision && elements.syncAlertRulesHint) {
+      elements.syncAlertRulesHint.textContent = `告警规则刷新失败，已保留原规则：${error.message || "请重试"}`;
+      elements.syncAlertRulesHint.dataset.state = "warning";
+    }
+    return { ok: false, error: error.message || "告警规则刷新失败" };
+  }
 }
 
 function renderWeeklyReport(result) {
@@ -1004,7 +1327,7 @@ async function refreshOperations() {
   operationsLoading = true;
   elements.refreshOperations.disabled = true;
   try {
-    await Promise.all([refreshHealth(), refreshChanges(), refreshWatchlist(), refreshIgnoredOperations(), refreshWeeklyReport()]);
+    await Promise.all([refreshHealth(), refreshChanges(), refreshWatchlist(), refreshIgnoredOperations(), refreshWeeklyReport(), refreshSyncAlertSettings()]);
     return operationsState;
   } finally {
     operationsLoading = false;
@@ -1304,7 +1627,7 @@ async function pullCurrentDetail() {  const note = currentDetailNote;
   renderCurrentDetail(note, false);
   try {
     await pullNoteToExcel(note, elements.currentDetailPull);
-    currentDetailNote = { ...currentDetailNote, inExcel: true };
+    currentDetailNote = { ...currentDetailNote, inExcel: true, postStatus: "存在", isDeleted: false, deletedAt: "" };
     renderCurrentDetail(currentDetailNote, false);
   } finally {
     currentDetailPullingId = "";
@@ -1483,6 +1806,7 @@ function renderNoteList(notes, options = {}) {
     const meta = document.createElement("span");
     meta.textContent = [
       note.author,
+      note.isDeleted || note.postStatus === "已删除" ? "帖子已删除·数据保留" : "",
       sourceLabel(note.source, options.sourceFallback),
       formatTime(note.firstSeenAt)
     ].filter(Boolean).join(" · ") || "本次发现";
@@ -1517,10 +1841,11 @@ function renderNoteList(notes, options = {}) {
       pullActions.removeAttribute?.("aria-hidden");
       pullActions.append(actionButton("补采评论", async (button) => pullNoteToExcel(note, button)));
     }
-    if (options.status === "known" || note.inExcel || ["synced", "partial"].includes(note.pullStatus)) {
+    if (!(note.isDeleted || note.postStatus === "已删除")
+        && (options.status === "known" || note.inExcel || ["synced", "partial"].includes(note.pullStatus))) {
       pullActions.hidden = false;
       pullActions.removeAttribute?.("aria-hidden");
-      pullActions.append(actionButton("删除", async (button) => deleteLocalNote({ ...note, noteId }, button)));
+      pullActions.append(actionButton("彻底清除", async (button) => deleteLocalNote({ ...note, noteId }, button)));
     }
     if ((note.target_type || "note") === "note") {
       actions.append(
@@ -1534,10 +1859,11 @@ function renderNoteList(notes, options = {}) {
       );
       if ((note.status || options.status || "") === "new") actions.append(
         actionButton("拉取到 CSV", async (button) => pullNoteToExcel(note, button)),
-        actionButton("忽略", async () => {
+        actionButton("忽略整个帖子（停止同步）", async () => {
+          if (!confirmWholePostIgnore([{ ...note, noteId }])) return;
           const result = await sendRuntime({ type: "ignoreNote", note: { ...note, noteId, url: noteUrl(note) } });
           if (!result?.ok) throw new Error(result?.error || "忽略失败");
-          setStatus("已忽略；该帖子不再参与批量同步", "success");
+          setStatus("已忽略整个帖子并停止同步；帖子与关联评论已标记为删除态", "warning");
           await Promise.all([refreshStats(), refreshPending()]);
         })
       );
@@ -1590,6 +1916,36 @@ function actionButton(label, handler) {
   return button;
 }
 
+function pullNoteFeedback(result, knownView = false) {
+  const commentError = String(result.commentError || "").trim();
+  const pullError = String(result.pullError || "").trim();
+  const mediaIncomplete = Boolean(result.mediaStatus && result.mediaStatus !== "complete");
+  const commentIncomplete = Boolean(result.commentStatus && result.commentStatus !== "likely_complete")
+    || result.canPrune === false || Boolean(result.syncAlert?.issueType);
+  const otherErrors = [...new Set([result.error, result.mediaError, result.warning,
+    pullError && pullError !== commentError ? pullError : ""]
+    .map(value => String(value || "").trim()).filter(Boolean))];
+  const muted = result.syncAlert?.suppressed === true
+    && ["once", "issue"].includes(result.syncAlert.scope);
+  // Muting comment reminders never masks a media, write, or other error, and
+  // never upgrades pullStatus/commentStatus/canPrune in the business result.
+  if (muted && !mediaIncomplete && !otherErrors.length && result.pullStatus !== "failed") {
+    return { message: `已同步可见评论 ${result.commentCount || 0} 条，同类告警已忽略，帖子仍继续同步`, state: "idle" };
+  }
+  const partial = ["partial", "failed"].includes(result.pullStatus) || commentIncomplete
+    || mediaIncomplete || otherErrors.length > 0 || Boolean(commentError);
+  const partialReasons = [commentIncomplete && !muted ? "评论" : "", mediaIncomplete ? "素材" : ""]
+    .filter(Boolean).join("和") || "部分内容";
+  const detail = [...new Set([...otherErrors, !muted ? commentError : ""].filter(Boolean))].join("；");
+  return {
+    message: partial
+      ? `已写入 CSV：${detail || `${partialReasons}仍未完整采集，已保留本地数据`}`
+      : knownView ? "评论补采完成，已更新 CSV"
+        : `已写入 CSV：正文 + ${result.commentCount || 0} 条评论；该帖子现在归入“CSV 已有”`,
+    state: partial ? "warning" : "success"
+  };
+}
+
 async function pullNoteToExcel(note, button) {
   const noteId = note.noteId || note.note_id;
   if (!noteId) throw new Error("缺少帖子 ID，无法拉取");
@@ -1603,28 +1959,16 @@ async function pullNoteToExcel(note, button) {
       type: "pullNote",
       note: { ...note, noteId, url: noteUrl(note), showProcess: true, process: true }
     });
-    if (!result?.ok) throw new Error(result?.error || "拉取失败");
-    const partial = result.pullStatus === "partial"
-      || result.commentStatus === "partial"
-      || result.commentStatus === "failed"
-      || (result.mediaStatus && result.mediaStatus !== "complete");
-    const partialReasons = [
-      result.commentStatus === "partial" || result.commentStatus === "failed" ? "评论" : "",
-      result.mediaStatus && result.mediaStatus !== "complete" ? "图片" : ""
-    ].filter(Boolean).join("和") || "部分内容";
-    setStatus(
-      partial
-        ? `已写入 CSV：正文完成，${partialReasons}读取不完整，可稍后重试`
-        : `已写入 CSV：正文 + ${result.commentCount || 0} 条评论；该帖子现在归入“CSV 已有”`,
-      partial ? "warning" : "success"
-    );
+    if (!result?.ok || result.consistencyVerified !== true) {
+      throw new Error(result?.error || "拉取未通过全存储一致性校验");
+    }
+    const feedback = pullNoteFeedback(result);
+    setStatus(feedback.message, feedback.state);
     await Promise.all([refreshStats(), refreshPending(), loadPageInfo()]);
     if (queueView.type === "status" && queueView.status === "known") {
       await showStatusView("known");
-      setStatus(
-        partial ? `已写入 CSV，但${partialReasons}仍未完整采集` : "评论补采完成，已更新 CSV",
-        partial ? "warning" : "success"
-      );
+      const refreshedFeedback = pullNoteFeedback(result, true);
+      setStatus(refreshedFeedback.message, refreshedFeedback.state);
     }
   } finally {
     activePulls.delete(noteId);
@@ -1993,6 +2337,17 @@ elements.syncAllPulled?.addEventListener("click", () => {
   startAllPulledSync().catch((error) => setStatus(error.message || "批量同步启动失败", "error"));
 });
 
+elements.openDataOverview?.addEventListener("click", async () => {
+  elements.openDataOverview.disabled = true;
+  try {
+    const result = await sendRuntime({ type: "openDataOverview" });
+    if (!result?.ok) throw new Error(result?.error || "数据总览打开失败");
+  } catch (error) {
+    setStatus(error.message || "数据总览打开失败", "error");
+  } finally {
+    elements.openDataOverview.disabled = false;
+  }
+});
 elements.overviewTab?.addEventListener("click", () => setPanelView("overview"));
 elements.postsTab?.addEventListener("click", () => setPanelView("posts"));
 elements.toolsTab?.addEventListener("click", () => {
@@ -2005,9 +2360,17 @@ elements.cancelBatchSync?.addEventListener("click", () => {
 elements.retryBatchFailures?.addEventListener("click", () => {
   retryFailedPulledSync().catch((error) => setStatus(error.message || "失败项重试失败", "error"));
 });
-elements.ignoreAllBatchFailures?.addEventListener("click", () => {
-  const items = (batchSyncViewState.failures || []).filter((item) => item?.noteId);
-  ignoreBatchFailureItems(items, true).catch((error) => setStatus(error.message || "一键忽略失败", "error"));
+elements.ignoreAllBatchFailures?.addEventListener("click", async () => {
+  const items = (batchSyncViewState.failures || []).filter(item => item?.noteId && !batchFailureAlert(item)?.suppressed);
+  elements.ignoreAllBatchFailures.disabled = true;
+  try {
+    await ignoreBatchFailureItems(items);
+  } catch (error) {
+    setStatus(error.message || "整帖忽略失败", "error");
+  } finally {
+    elements.ignoreAllBatchFailures.disabled = batchSyncViewState.running
+      || !(batchSyncViewState.failures || []).some(item => item?.noteId && !batchFailureAlert(item)?.suppressed);
+  }
 });
 elements.deleteUnreachable?.addEventListener("click", () => {
   deleteAllUnreachableNotes().catch((error) => setStatus(error.message || "批量删除失败", "error"));
@@ -2196,15 +2559,39 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && !scanning && !deepScanning) refreshAll({ quiet: true }).catch(() => {});
 });
 
+let localDataRefreshTimer = null;
+let localDataRefreshTask = null;
+let localDataRefreshQueued = false;
+
+function scheduleLocalDataRefresh() {
+  if (ballMode) return;
+  if (localDataRefreshTask) { localDataRefreshQueued = true; return; }
+  if (localDataRefreshTimer !== null) return;
+  // Hundreds of per-note access notifications at the end of a batch share a
+  // single refresh. Changes during that request get one trailing refresh.
+  localDataRefreshTimer = setTimeout(() => {
+    localDataRefreshTimer = null;
+    localDataRefreshTask = Promise.allSettled([refreshStats(), refreshPending(), loadPageInfo()]);
+    localDataRefreshTask.finally(() => {
+      localDataRefreshTask = null;
+      if (localDataRefreshQueued) {
+        localDataRefreshQueued = false;
+        scheduleLocalDataRefresh();
+      }
+    });
+  }, 100);
+}
+
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "localNoteStateChanged") {
+    if (message.inExcel === true && message.consistencyVerified !== true) return false;
     if (message.noteId && currentDetailNote?.noteId === message.noteId) {
       currentDetailNote = message.deleted
-        ? { ...currentDetailNote, inExcel: false, pullStatus: "not_started", status: "new" }
-        : { ...currentDetailNote, inExcel: true, pullStatus: message.pullStatus || "synced", status: "known" };
+        ? { ...currentDetailNote, ...message, inExcel: false, pullStatus: "not_started", status: "new" }
+        : { ...currentDetailNote, ...message, inExcel: true, pullStatus: message.pullStatus || "synced", status: "known" };
       if (!ballMode) renderCurrentDetail(currentDetailNote, false);
     }
-    if (!ballMode) Promise.all([refreshStats(), refreshPending(), loadPageInfo()]).catch(() => {});
+    scheduleLocalDataRefresh();
     return false;
   }
   if (ballMode) {
@@ -2212,9 +2599,9 @@ chrome.runtime.onMessage.addListener((message) => {
     return false;
   }
   if (message.type === "batchCommentSyncProgress") {
-    renderBatchSync(message, Boolean(message.done));
-    if (message.phase === "failed-note") refreshUnreachableNotes().catch(() => {});
-    if (message.done) Promise.all([
+    renderBatchSync(message, message.notifyCompletion !== false);
+    if (message.notifyCompletion !== false && message.phase === "failed-note") refreshUnreachableNotes().catch(() => {});
+    if (message.notifyCompletion !== false && message.done) Promise.all([
       refreshStats(), refreshPending(), loadPageInfo(), refreshUnreachableNotes(),
       refreshChanges(), refreshWatchlist(), refreshWeeklyReport()
     ]).catch(() => {});
@@ -2246,7 +2633,8 @@ chrome.runtime.onMessage.addListener((message) => {
         if (message.ok && message.mode === "relevance") {
           currentDetailNote = { ...currentDetailNote, relevanceStatus: message.relevanceStatus || "unknown",
             isRelevant: message.relevanceStatus === "relevant" };
-        } else if (message.ok) currentDetailNote = { ...currentDetailNote, inExcel: true, pullStatus: "synced" };
+        } else if (message.ok && message.consistencyVerified === true) currentDetailNote = { ...currentDetailNote, inExcel: true, pullStatus: message.pullStatus || "partial",
+          postStatus: "存在", isDeleted: false, deletedAt: "" };
         renderCurrentDetail(currentDetailNote, false);
       }
     }
@@ -2313,17 +2701,20 @@ let compactFloatingElements = null;
 
 function updateCompactFloatingState(state = {}) {
   if (!compactFloatingElements) return;
+  state = mergeBatchSyncViewState(state);
   const running = Boolean(state.running);
-  const failed = Math.max(0, Number(state.failedPosts) || 0);
+  const failed = batchFailureCounts(state).active;
+  const hasErrors = failed > 0 || Number(state.statusSyncFailures) > 0 || state.error || state.ok === false;
   const current = Math.max(0, Number(state.current) || 0);
   const total = Math.max(0, Number(state.total) || 0);
-  compactFloatingElements.widget.dataset.state = running ? "running" : (failed ? "warning" : "idle");
+  compactFloatingElements.widget.dataset.state = running ? "running" : (hasErrors ? "warning" : "idle");
   compactFloatingElements.title.textContent = running
     ? `正在同步 ${current}/${total || "?"}`
-    : (state.done ? "同步已完成" : "舆情雷达");
+    : (state.done ? (onlyMutedBatchAlerts(state) ? "已同步可见内容" : hasErrors || state.cancelled ? "同步已结束" : "同步已完成") : "舆情雷达");
   compactFloatingElements.detail.textContent = running
     ? (state.currentTitle || "正在准备下一篇帖子")
-    : (failed ? `${failed} 篇失败 · 点击查看详情` : "点击展开完整面板");
+    : (hasErrors ? (state.error || `${failed} 项待处理${Number(state.statusSyncFailures) ? ` · ${state.statusSyncFailures} 项状态未写入` : ""} · 点击查看详情`)
+      : onlyMutedBatchAlerts(state) ? mutedBatchSyncMessage(state) : "点击展开完整面板");
   compactFloatingElements.badge.hidden = !failed;
   compactFloatingElements.badge.textContent = String(failed);
 }

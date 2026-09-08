@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>本地数据总览 · 舆情雷达</title>
+    <link rel="stylesheet" href="data-overview.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <button id="railPeek" class="rail-peek" type="button" aria-controls="databaseRail" aria-expanded="false" aria-label="展开导航" title="靠近左侧展开导航">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+      </button>
+      <aside id="databaseRail" class="database-rail" aria-label="数据表切换" inert>
+        <div class="rail-brand" aria-label="舆情雷达">
+          <span class="rail-brand__mark">X</span>
+          <span class="rail-brand__copy"><small>XHS MONITOR</small><strong>数据总览</strong></span>
+        </div>
+        <nav class="dataset-nav">
+          <button class="dataset-button is-active" type="button" data-dataset="notes">
+            <span class="dataset-button__icon">帖</span>
+            <span><strong>帖子数据库</strong><small>同步库与已忽略记录</small></span>
+            <i id="notesCount">—</i>
+          </button>
+          <button class="dataset-button" type="button" data-dataset="comments">
+            <span class="dataset-button__icon">评</span>
+            <span><strong>评论数据库</strong><small>一级与全部回复</small></span>
+            <i id="commentsCount">—</i>
+          </button>
+        </nav>
+
+        <section class="saved-views" aria-label="快捷视图">
+          <header><span>快捷视图</span><small>LOCAL</small></header>
+          <button type="button" data-quick-view="all"><i></i>全部记录</button>
+          <button type="button" data-quick-view="active"><i></i>当前存在</button>
+          <button type="button" data-quick-view="deleted"><i></i>已删除历史</button>
+          <button type="button" data-quick-view="ignored"><i></i>已忽略帖子</button>
+          <button type="button" data-quick-view="negative"><i></i>语义差评</button>
+          <button type="button" data-quick-view="unanalyzed" title="筛选语义结论为空的全部记录，包括未分析、失败或尚无结果的记录；不按次数判断"><i></i>尚无语义结论</button>
+        </section>
+
+        <div class="rail-footnote">
+          <span id="railHealthDot" data-state="checking"></span>
+          <p><strong id="railHealthText">正在校验数据</strong><small id="railHealthMeta">CSV · SQLite · 素材快照</small></p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header" hidden>
+          <h1 id="datasetTitle">帖子数据库</h1><p id="datasetSubtitle"></p>
+        </header>
+
+        <section id="lineageRibbon" hidden class="lineage-ribbon" data-state="checking" aria-live="polite">
+          <div class="lineage-node"><i></i><span><small>来源</small><strong>业务 CSV</strong></span></div>
+          <b></b>
+          <div class="lineage-node"><i></i><span><small>查询</small><strong>SQLite 快照</strong></span></div>
+          <b></b>
+          <div class="lineage-node"><i></i><span><small>核验</small><strong>素材 JSON</strong></span></div>
+          <p><strong id="consistencyTitle">正在建立一致性快照</strong><small id="consistencyMeta">查询将在校验通过后开放</small></p>
+          <code id="snapshotCode">CHECKING</code>
+        </section>
+
+        <section class="query-toolbar" aria-label="数据筛选工具">
+          <button id="returnToComments" class="toolbar-button return-comments-button" type="button" hidden title="返回定位原帖前的评论，恢复筛选、已加载记录和滚动位置">← 返回评论位置</button>
+          <div class="search-control">
+            <details id="searchOptions" class="search-options">
+              <summary title="搜索模式与快捷语义查询"><span id="searchModeLabel">关键词</span><span aria-hidden="true">⌄</span></summary>
+        <section class="semantic-toolbar" aria-label="搜索模式与语义快捷查询">
+          <label class="semantic-switch"><input id="semanticSearch" type="checkbox" aria-describedby="semanticStatus">语义检索</label>
+          <span class="semantic-shortcuts" aria-label="填入语义查询，按搜索执行">
+            <button type="button" data-semantic-query="差评">差评</button>
+            <button type="button" data-semantic-query="强硬销售">强硬销售</button>
+            <button type="button" data-semantic-query="价格差异">价格差异</button>
+            <button type="button" data-semantic-query="过敏">过敏</button>
+          </span>
+          <small id="semanticStatus" role="status" aria-live="polite">普通搜索 · 关键词匹配</small>
+        </section>
+            </details>
+            <input id="globalSearch" type="search" placeholder="搜索标题、正文、作者或 ID" autocomplete="off" aria-label="搜索标题、正文、作者或 ID">
+            <button id="searchSubmit" class="search-submit" type="button" aria-label="搜索" title="搜索（Enter）"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="m15 15 5 5"/></svg></button>
+          </div>
+          <button id="toggleFilters" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+            筛选 <i id="filterCount" hidden>0</i>
+          </button>
+          <button id="toggleFields" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9 5v14m6-14v14"/></svg>
+            字段 <i id="fieldCount">0</i>
+          </button>
+          <button id="toggleSort" class="toolbar-button" type="button" aria-expanded="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h8M8 18h4M4 5v14"/></svg>
+            排序 <i id="sortCount" hidden>0</i>
+          </button>
+          <button id="resetView" class="toolbar-button toolbar-button--reset" type="button"
+                  title="清除当前数据库的搜索、筛选和排序，并恢复默认显示字段、列顺序与列宽" aria-label="重置当前视图">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.8 9A8 8 0 1 1 5 15.4"/><path d="M4 4v5h5"/></svg>
+            重置
+          </button>
+          <div class="result-counter"><strong id="resultCount">—</strong><span id="resultLabel">条结果</span></div>
+          <div class="header-actions">
+            <button id="deleteSelected" class="danger-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"/></svg>
+              删除选中 <i id="selectedCount">0</i>
+            </button>
+            <select id="exportFormat" class="export-format" aria-label="导出格式" title="Excel 含成组评论与全部原始字段；CSV 导出当前可见字段。两种格式均导出全部筛选结果。">
+              <option value="xlsx">Excel（成组）</option><option value="csv">CSV（当前字段）</option>
+            </select>
+            <button id="exportCurrent" class="quiet-button" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg>
+              <span id="exportLabel">导出筛选结果</span>
+            </button>
+            <button id="refreshSchema" class="icon-button" type="button" title="重新校验并刷新" aria-label="重新校验并刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+            </button>
+          </div>
+        </section>
+
+
+
+        <section id="pageFind" class="page-find" hidden aria-label="在筛选结果中查找">
+          <label><span>查找</span><input id="pageFindInput" type="search" placeholder="在筛选结果中定位内容" autocomplete="off"></label>
+          <strong id="pageFindCount">0 / 0</strong>
+          <button id="pageFindPrevious" type="button" title="上一个匹配" aria-label="上一个匹配">↑</button>
+          <button id="pageFindNext" type="button" title="下一个匹配" aria-label="下一个匹配">↓</button>
+          <button id="closePageFind" type="button" title="关闭查找" aria-label="关闭查找">×</button>
+        </section>
+
+        <section id="columnFilterPopover" class="column-filter-popover" hidden aria-label="列筛选">
+          <header>
+            <div><small>FILTER FIELD</small><strong id="columnFilterTitle">字段筛选</strong></div>
+            <button id="closeColumnFilter" type="button" aria-label="关闭列筛选">×</button>
+          </header>
+          <label class="column-filter-control"><span>应用方式</span><select id="columnFilterMode"><option value="replace">替换本列条件</option><option value="append">追加条件</option></select></label>
+          <label class="column-filter-control"><span>条件</span><select id="columnFilterOperator"></select></label>
+          <div id="columnFilterValueWrap" class="column-filter-value"></div>
+          <p id="columnFilterExisting">该字段暂无筛选条件</p>
+          <footer>
+            <button id="clearColumnFilter" class="column-filter-clear" type="button">清除此列筛选</button>
+            <button id="applyColumnFilter" class="column-filter-apply" type="button">加入筛选</button>
+          </footer>
+        </section>
+
+        <p id="filterDraftNotice" class="snapshot-notice" role="status" hidden></p>
+        <section id="filterPanel" class="builder-panel" hidden>
+          <header>
+            <div><strong>条件筛选</strong><span>满足</span><select id="filterLogic"><option value="and">全部条件</option><option value="or">任一条件</option></select></div>
+            <button id="clearFilters" type="button">清空</button>
+          </header>
+          <p class="filter-value-hint">全部＝同时满足；任一＝满足其中一条。同字段多选请用“属于任一值”；搜索框与筛选条件同时生效。</p>
+          <div id="filterRows" class="builder-rows"></div>
+          <button id="addFilter" class="builder-add" type="button">＋ 添加筛选条件</button>
+        </section>
+
+        <section id="fieldPanel" class="popover-panel field-panel" hidden>
+          <label><span>查找字段</span><input id="fieldSearch" type="search" placeholder="输入字段名称"></label>
+          <div class="field-panel__actions"><button id="selectDefaultFields" type="button">默认字段</button><button id="selectAllFields" type="button">显示全部</button><button id="restoreColumnOrder" type="button" title="只恢复列顺序，保留筛选、显示字段和排序规则">恢复列顺序</button><button id="restoreColumnWidths" type="button" title="只恢复当前数据库的列宽，保留筛选、显示字段和列顺序">恢复列宽</button></div>
+          <div id="fieldOptions" class="field-options"></div>
+          <section class="column-pin-settings" aria-label="列固定设置">
+            <header><strong>列固定</strong><button id="clearColumnPins" type="button">取消全部固定</button></header>
+            <p>默认全部不固定。勾选后立即移入左侧冻结区，横向滚动时保持可见；取消后恢复原顺序。</p>
+            <div id="columnPinOptions" class="column-pin-options"></div>
+          </section>
+        <div class="row-status-legend" aria-label="行颜色说明"><span><i class="legend-deleted"></i>已删除</span><span><i class="legend-negative"></i>语义差评</span><small>同时命中：粉底＋绿边</small></div>
+        </section>
+
+        <section id="sortPanel" class="builder-panel sort-panel" hidden>
+          <header><strong>排序规则</strong><button id="clearSorts" type="button">恢复默认</button></header>
+          <p class="filter-value-hint">默认按发布时间从新到旧；未知时间置后。多条规则从上到下优先，语义搜索按相关度排序。</p>
+          <label id="threadGroupingRow" class="thread-grouping-option" hidden>
+            <input id="groupThreads" type="checkbox" checked>
+            <span>合并一级评论线程<small>可按一级评论时间排列整个线程，或按每条评论时间全局排列。</small></span>
+          </label>
+          <label id="threadSortModeRow" class="column-filter-control" hidden><span>合并后的时间排序</span>
+            <select id="threadSortMode"><option value="root">按一级评论发布时间（整组排序）</option><option value="comment">按各条评论发布时间（全局排序）</option></select>
+          </label>
+          <p id="threadSortModeHint" class="filter-value-hint" hidden></p>
+          <div id="sortRows" class="builder-rows"></div>
+          <button id="addSort" class="builder-add" type="button">＋ 添加排序</button>
+        </section>
+
+        <section id="queryBlocked" class="query-blocked" hidden>
+          <span>!</span>
+          <div><strong>数据一致性校验尚未通过</strong><p id="blockedReason">请先刷新校验，再进行筛选查询。</p></div>
+          <button id="retryHealth" type="button">重新校验</button>
+        </section>
+
+        <aside id="snapshotNotice" class="snapshot-notice" hidden role="status"><span id="snapshotNoticeText"></span><button id="refreshSnapshot" type="button">更新数据</button></aside>
+
+
+        <section id="dataSurface" class="data-surface" aria-busy="false">
+          <div id="tableViewport" class="table-viewport" tabindex="0" aria-label="数据表格，可上下和左右滚动">
+            <table id="dataTable">
+              <thead><tr id="tableHead"></tr></thead>
+              <tbody id="tableBody"></tbody>
+            </table>
+            <button id="infiniteSentinel" class="infinite-sentinel" data-state="idle" type="button" aria-live="polite">
+              <i aria-hidden="true"></i><span id="loadMoreText">向下滚动加载更多</span>
+            </button>
+            <div id="tableEmpty" class="table-empty" hidden>
+              <span>⌕</span><strong>没有符合当前条件的数据</strong><p>调整筛选条件或切换快捷视图。</p>
+            </div>
+            <div id="tableLoading" class="table-loading"><i></i><span>正在读取一致性快照…</span></div>
+          </div>
+          <footer class="infinite-status">
+            <span id="pageMeta">已加载 0 / 0 条</span>
+            <small id="columnOrderHint" role="status" aria-live="polite" title="拖动表头调整顺序，拖动右边缘调整宽度；双击边缘恢复默认；列宽与顺序自动保存">拖动表头调顺序 · 拖动列边缘调宽度 · 自动保存</small>
+          </footer>
+        </section>
+      </main>
+
+      <aside id="recordDrawer" class="record-drawer" hidden aria-label="图文记录详情" aria-busy="false">
+        <header><div><span id="drawerType">帖子记录</span><strong id="drawerTitle">记录详情</strong></div><button id="closeDrawer" type="button" aria-label="关闭详情">×</button></header>
+        <div id="drawerFields" class="drawer-fields"></div>
+        <footer><button id="deleteDrawerRecord" class="drawer-delete" type="button">彻底删除</button><span></span><button id="copyRecord" type="button">复制 JSON</button><button id="openRecordLink" type="button" hidden>打开原链接</button></footer>
+      </aside>
+
+      <dialog id="deleteDialog" class="delete-dialog" aria-labelledby="deleteDialogTitle">
+        <form method="dialog">
+          <header>
+            <span aria-hidden="true">!</span>
+            <div><small>PERMANENT DELETE</small><strong id="deleteDialogTitle">确认彻底删除</strong></div>
+          </header>
+          <p id="deleteDialogSummary"></p>
+          <ul id="deleteDialogDetails"></ul>
+          <label class="delete-acknowledgement"><input id="deleteAcknowledgement" type="checkbox"><span>我已确认这些本地数据不再需要，并理解该操作不可撤销。</span></label>
+          <footer>
+            <button id="cancelDelete" type="button">取消</button>
+            <button id="confirmDelete" type="button" disabled>永久删除</button>
+          </footer>
+        </form>
+      </dialog>
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+    <script src="column-order.js"></script>
+    <script src="column-widths.js"></script>
+    <script src="data-export.js"></script>
+    <script src="overview-media.js"></script>
+    <script src="record-details.js"></script>
+    <script src="data-overview.js"></script>
+    <script src="data-overview-layout.js"></script>
+  </body>
+</html>

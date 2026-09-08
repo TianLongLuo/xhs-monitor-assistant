@@ -24,3 +24,7 @@ node_modules/
 bridge/build-v*/
 bridge/dist-v*/
 bridge/native_host.log*
+
+# Offline semantic model and machine-local interpreter
+bridge/models/
+bridge/semantic_runtime.json

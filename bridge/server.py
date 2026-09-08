@@ -36,25 +36,59 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 try:
+    from .overview_read_sessions import OverviewReadSessions
+    from . import agent_analysis
     from .ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from .data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
+    from .data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, effective_thread_grouping, search_clause
+    from .time_fields import NOTE_TIME_HEADERS, COMMENT_TIME_HEADERS, enrich_time_payload, csv_time_fields, latest_observation_reference
+    from .snapshot_validation import validate_snapshot_identity
+    from .overview_media import read_overview_media, read_comment_target
+    from .overview_export_service import export_filtered_workbook
+    from .semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 except ImportError:  # Native Host runs this module as a top-level script.
+    from overview_read_sessions import OverviewReadSessions
+    import agent_analysis
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
     from data_relationships import comment_note_id as csv_comment_note_id, repair_relationship_rows
+    from data_overview import OPERATORS as DATA_OVERVIEW_OPERATORS, build_field_specs, compile_filter_group, compile_sort, effective_thread_grouping, search_clause
+    from time_fields import NOTE_TIME_HEADERS, COMMENT_TIME_HEADERS, enrich_time_payload, csv_time_fields, latest_observation_reference
+    from snapshot_validation import validate_snapshot_identity
+    from overview_media import read_overview_media, read_comment_target
+    from overview_export_service import export_filtered_workbook
+    from semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 
 
-VERSION = "0.25.1"
+VERSION = "0.34.18"
+DATA_OVERVIEW_NOTE_SCOPE = (
+    "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
+)
 NOTE_CSV_HEADERS = [
     "笔记url", "用户主页url", "用户昵称", "笔记标题", "笔记内容", "笔记话题",
     "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
     "图片数量", "发布日期", "来源词", "笔记ID", "博主ID", "对应帖子文件夹地址",
     "文件夹内清单", "AI情绪判断", "帖子好坏", "访问状态",
+    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "帖子状态", *NOTE_TIME_HEADERS,
 ]
 COMMENT_CSV_HEADERS = [
-    "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
+    "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论用户主页url", "评论内容",
     "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
     "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "映射状态", "映射备注",
+    "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "评论状态", *COMMENT_TIME_HEADERS,
 ]
+# A supplied blank is an observed blank, not an omitted observation. Keep this
+# map shared by the writer and verifier so CSV and payload use identical rules.
+NOTE_CSV_SOURCE_FIELDS = {
+    "用户主页url": "authorUrl", "博主ID": "authorId",
+    "点赞量": "likeCount", "收藏量": "collectCount",
+    "评论量": "commentCount", "分享量": "shareCount",
+    "发布时间": "publishedAt", "更新时间": "updatedAt",
+    "IP地址": "ipLocation", "图片数量": "imageCount",
+}
+COMMENT_STATUS_PRESENT = "存在"
+COMMENT_STATUS_DELETED = "已删除"
+POST_STATUS_PRESENT = "存在"
+POST_STATUS_DELETED = "已删除"
 CSV_ENCODING = "utf-8-sig"
 NOTE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\uFEFF]")
@@ -166,7 +200,8 @@ Write-Output $result
     return completed.returncode == 0 and "CLOSED" in output
 
 
-def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_delay: float = 0.15) -> int:
+def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_delay: float = 0.15,
+                       *, office_recovery: bool = True) -> int:
     """Atomically replace a file, tolerating WPS, cloud sync and antivirus sharing locks."""
     total_attempts = max(1, int(attempts))
     office_recovery_attempted = False
@@ -175,7 +210,7 @@ def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_d
             os.replace(source, target)
             return attempt + 1
         except PermissionError:
-            if not office_recovery_attempted:
+            if office_recovery and not office_recovery_attempted:
                 office_recovery_attempted = True
                 if _reopen_saved_office_workbook_read_only(target):
                     continue
@@ -183,6 +218,15 @@ def replace_with_retry(source: Path, target: Path, attempts: int = 20, initial_d
                 raise
             time.sleep(min(initial_delay * (2 ** attempt), 1.5))
     return total_attempts
+
+
+def replace_material_with_retry(source: Path, target: Path) -> int:
+    """Retry only transient file-handle contention, not a whole DB transaction.
+
+    No Office/GUI probing for JSON/TXT/journals. First success has no added wait;
+    six failed attempts wait at most 0.775 seconds before normal rollback.
+    """
+    return replace_with_retry(source, target, attempts=6, initial_delay=0.025, office_recovery=False)
 
 
 def _relevance_keywords_path() -> Path:
@@ -346,11 +390,110 @@ def bool_value(value: Any) -> bool:
     return text(value, 20).casefold() in {"1", "true", "yes", "y", "是"}
 
 
+def collection_evidence_verified(payload: Any) -> bool:
+    source = payload if isinstance(payload, dict) else {}
+    evidence = source.get("collectionEvidence")
+    if not isinstance(evidence, dict):
+        return False
+    # Older collectors omit these fields. When present, only an explicit zero
+    # (or false for pendingLoads) proves that no unfinished work remains.
+    for field in ("pendingLoads", "unreadableCount"):
+        if field not in evidence:
+            continue
+        value = evidence[field]
+        if field == "pendingLoads" and isinstance(value, str) and value.strip().casefold() == "false":
+            value = 0
+        try:
+            if float(value) != 0:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    return bool_value(evidence.get("allCommentsRequested")) \
+        and bool_value(evidence.get("expandersExhausted")) \
+        and bool_value(evidence.get("scrollExhausted")) \
+        and nonnegative_int(evidence.get("stableRounds")) >= 2
+
+
+def comment_snapshot_status(payload: Any, current_count: int, status: Any = None) -> str:
+    """Resolve completeness from this canonical snapshot, never accumulated history."""
+    source = payload if isinstance(payload, dict) else {}
+    requested = text(source.get("status") if status is None else status, 30) or "partial"
+    if requested != "likely_complete":
+        return requested if requested in {"collecting", "failed"} else "partial"
+    expected_value = source.get("expectedCount") or 0
+    try:
+        expected_count = int(expected_value)
+        if float(expected_value) != expected_count:
+            return "partial"
+    except (TypeError, ValueError, OverflowError):
+        return "partial"
+    count_verified = (expected_count > 0 and current_count >= expected_count) or (
+        expected_count == 0 and current_count == 0 and bool_value(source.get("explicitEmptyVerified"))
+    )
+    return "likely_complete" if count_verified and collection_evidence_verified(source) else "partial"
+
+
+def nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(float(text(value, 40) or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _presence_status_label(value: Any, is_deleted: Any, present_label: str, deleted_label: str) -> str:
+    raw = text(value, 40).strip().casefold()
+    deleted_values = {"已删除", "被删", "删除", "不存在", "否", "deleted", "missing", "removed", "0", "false"}
+    present_values = {"存在", "仍存在", "是", "present", "exists", "active", "1", "true"}
+    if raw in deleted_values or (not raw and bool_value(is_deleted)):
+        return deleted_label
+    if raw in present_values:
+        return present_label
+    return present_label
+
+
+def comment_status_label(value: Any, is_deleted: Any = None) -> str:
+    return _presence_status_label(value, is_deleted, COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED)
+
+
+def post_status_label(value: Any, is_deleted: Any = None) -> str:
+    return _presence_status_label(value, is_deleted, POST_STATUS_PRESENT, POST_STATUS_DELETED)
+
+
+def imported_access_state(
+    row_label: Any,
+    existing: sqlite3.Row | dict[str, Any] | None = None,
+    source_name: str = "CSV",
+) -> tuple[str, str, str]:
+    """Import a projected label without downgrading a live database verdict."""
+    existing_status = text(existing["access_status"], 40) if existing else ""
+    existing_error = text(existing["access_error"], 1000) if existing else ""
+    existing_result = text(existing["access_check_result"], 80) if existing else ""
+    if existing_status in {"ok", "check_failed", "unreachable"}:
+        return existing_status, existing_error, existing_result
+
+    label = text(row_label, 100).strip()
+    if label == "可打开":
+        return "ok", "", "opened"
+    if label in {"打不开", "待复核", "检查失败"}:
+        return "check_failed", f"{source_name} 中的旧状态等待重新同步核验", "legacy_excel_unverified"
+    return "", "", ""
+
+
 def sentiment_label(value: Any) -> str:
     raw = text(value, 40)
     if raw in set(SENTIMENT_LABELS.values()):
         return raw
     return SENTIMENT_LABELS.get(raw.lower(), "待复核")
+
+
+def persisted_sentiment_label(value: Any) -> str:
+    """Keep historical workflow labels while normalizing real sentiment codes."""
+    raw = text(value, 40)
+    if not raw:
+        return ""
+    if raw in set(SENTIMENT_LABELS.values()) or raw.lower() in SENTIMENTS:
+        return sentiment_label(raw)
+    return raw
 
 
 def sentiment_code(value: Any) -> str:
@@ -449,10 +592,103 @@ def match_key(value: Any, limit: int = 12000) -> str:
     return normalized
 
 
+HASHTAG_RE = re.compile(r"#[^\s#]+")
+
+
+def canonical_tag_items(value: Any) -> list[str]:
+    """Normalize DOM/legacy tags without dropping mixed plain/hashtag values."""
+    values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    cleaned = [text(item, 6000) for item in values if text(item, 6000)]
+    if len(cleaned) >= 3 and sum(len(item) == 1 for item in cleaned) / len(cleaned) >= 0.6:
+        return []
+    output: list[str] = []
+    for item in cleaned:
+        hashtags = HASHTAG_RE.findall(item)
+        output.extend(hashtags)
+        remainder = HASHTAG_RE.sub(" ", item).strip()
+        tokens = remainder.split()
+        # Legacy browser code spread a tag string into individual characters,
+        # producing values such as "# O r i g a n ...". If valid hashtags are
+        # present beside that corruption, keep only the complete hashtag evidence.
+        if len(tokens) >= 5 and sum(len(token) == 1 for token in tokens) / len(tokens) >= 0.6:
+            if hashtags:
+                continue
+            reconstructed = WHITESPACE_RE.sub("", remainder)
+            if reconstructed.endswith("作者"):
+                reconstructed = reconstructed[:-2]
+            if reconstructed.startswith("#") and len(reconstructed) > 1:
+                output.append(reconstructed)
+            continue
+        for plain in tokens:
+            collapsed = WHITESPACE_RE.sub("", plain)
+            if collapsed in {"", "#", "无话题", "无话题作者", "作者"}:
+                continue
+            output.append(plain if plain.startswith("#") else f"#{plain}")
+    return list(dict.fromkeys(output))
+
+
 def tag_text(value: Any) -> str:
-    if isinstance(value, (list, tuple, set)):
-        return " ".join(text(item, 300) for item in value if text(item, 300))
-    return text(value, 6000)
+    items = canonical_tag_items(value)
+    if items:
+        return " ".join(items)
+    values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    return "无话题" if any(WHITESPACE_RE.sub("", text(item, 6000)) == "无话题" for item in values) else ""
+
+
+def comment_level_value(value: Any) -> int:
+    raw = text(value, 30)
+    matched = re.search(r"([123一二三])", raw)
+    if not matched:
+        return 1
+    token = matched.group(1)
+    level = {"一": 1, "二": 2, "三": 3}[token] if token in {"一", "二", "三"} else int(token)
+    return max(1, min(level, 3))
+
+
+BROWSER_NOTE_FIELDS = {
+    "noteId", "url", "title", "author", "authorUrl", "authorId", "publishedAt", "updatedAt",
+    "content", "detailRead", "tags", "mediaText", "imageUrls", "imageCount", "videoUrls",
+    "videoCount", "mediaType", "likeCount", "collectCount", "commentCount", "shareCount",
+    "ipLocation", "ipRegion", "ipRegionSource", "ipRegionVersion", "keyword", "pageUrl", "timeObservedAt", "timeReferenceSource", "publishedTime", "updatedTime",
+}
+
+
+def browser_note_payload(value: Any) -> dict[str, Any]:
+    """Keep only browser/source fields; discard nested local API/status objects."""
+    source = value if isinstance(value, dict) else {}
+    output = {key: source[key] for key in BROWSER_NOTE_FIELDS if key in source}
+    note_id = valid_note_id(output.get("noteId"))
+    if note_id:
+        output["noteId"] = note_id
+    if "tags" in output:
+        raw_tags = output.get("tags")
+        normalized_tags = canonical_tag_items(raw_tags)
+        if normalized_tags:
+            output["tags"] = normalized_tags
+        elif tag_text(raw_tags) == "无话题":
+            output["tags"] = ["无话题"]
+        else:
+            output.pop("tags", None)
+    for field in ("imageUrls", "videoUrls"):
+        if field not in output:
+            continue
+        values = output.get(field)
+        normalized = list(dict.fromkeys(text(item, 4000) for item in values if text(item, 4000))) \
+            if isinstance(values, list) else []
+        if normalized:
+            output[field] = normalized
+        else:
+            output.pop(field, None)
+    if output.get("detailRead") is not True:
+        output.pop("detailRead", None)
+    for field in ("imageCount", "videoCount"):
+        # Preserve a supplied empty/zero counter through the subsequent merge;
+        # otherwise an older nonzero count silently wins over a fresh snapshot.
+        if (field in output and output[field] not in (None, "")
+                and nonnegative_int(output[field]) <= 0
+                and not re.fullmatch(r"0+(?:\.0+)?", text(output[field], 80))):
+            output.pop(field, None)
+    return output
 
 
 def _contains_term(corpus: str, term: str) -> bool:
@@ -550,7 +786,7 @@ class MonitorStore:
         # Serialize a complete pull transaction. Without this lock, two clicks
         # can both inspect the same workbook before either atomic replace and
         # append duplicate rows despite row-level dedupe.
-        self.pull_lock = threading.Lock()
+        self.pull_lock = threading.RLock()
         # The search page can ask for dozens of note statuses at once. Loading
         # the same workbook once per card creates a thundering herd, leaves the
         # Process panel in its skeleton state, and can exhaust the HTTP worker
@@ -562,6 +798,14 @@ class MonitorStore:
         # Since v0.24 it always points to the UTF-8 notes CSV after startup.
         self.seed_xlsx_path: Path | None = None
         self.comments_csv_path: Path | None = None
+        self._csv_managed_hashes: dict[str, str] = {}
+        self._active_csv_checkpoint: dict[str, Any] | None = None
+        self._persistent_checkpoints_recovered = False
+        # Tokens are issued only after a full CSV/SQLite/material health pass.
+        # Complex overview queries must present one of these short-lived tokens.
+        self._overview_read_sessions = OverviewReadSessions()
+        self._data_overview_approved_tokens: dict[str, float] = {}
+        self._data_overview_read_renewals: dict[str, float] = {}
         self.ai_settings = AISettingsStore(self.db_path.parent / "ai_settings.json")
         self.ai_client = ai_client or DeepSeekClient()
         self.ai_wakeup = threading.Event()
@@ -587,6 +831,9 @@ class MonitorStore:
         notes_path, comments_path = self._derived_csv_paths(Path(master_path))
         self.seed_xlsx_path = notes_path
         self.comments_csv_path = comments_path
+        if not self._persistent_checkpoints_recovered:
+            self._recover_persistent_sync_checkpoints()
+            self._persistent_checkpoints_recovered = True
         return notes_path, comments_path
 
     def _csv_paths(self) -> tuple[Path, Path]:
@@ -656,13 +903,66 @@ class MonitorStore:
             os.fsync(stream.fileno())
         return temporary
 
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).is_file() else ""
+
+    def _remember_managed_csv(self, path: Path) -> None:
+        resolved = str(Path(path).resolve()).casefold()
+        self._csv_managed_hashes[resolved] = self._file_sha256(path)
+
+    def _update_active_checkpoint_csv_hashes(self) -> None:
+        checkpoint = self._active_csv_checkpoint
+        if not checkpoint or not checkpoint.get("captureCsv"):
+            return
+        actual_hashes = {
+            str(Path(checkpoint["notesPath"]).resolve()).casefold(): self._file_sha256(
+                Path(checkpoint["notesPath"])
+            ),
+            str(Path(checkpoint["commentsPath"]).resolve()).casefold(): self._file_sha256(
+                Path(checkpoint["commentsPath"])
+            ),
+        }
+        allowed = checkpoint.get("managedCsvAllowedHashes") or {}
+        if any(
+            allowed.get(key) and value not in set(allowed[key])
+            for key, value in actual_hashes.items()
+        ):
+            return
+        checkpoint["managedCsvHashes"] = actual_hashes
+        checkpoint.pop("managedCsvAllowedHashes", None)
+        self._persist_sync_checkpoint(checkpoint)
+
+    def _prepare_active_checkpoint_csv_replacement(self, replacements: dict[Path, Path]) -> None:
+        """Persist both pre/post hashes before replacement so a crash is not mistaken for an external edit."""
+        checkpoint = self._active_csv_checkpoint
+        if not checkpoint or not checkpoint.get("captureCsv"):
+            return
+        allowed: dict[str, list[str]] = {}
+        for key in ("notesPath", "commentsPath"):
+            target = Path(checkpoint[key])
+            resolved = str(target.resolve()).casefold()
+            hashes = {self._file_sha256(target)}
+            replacement = replacements.get(target)
+            if replacement is not None:
+                hashes.add(self._file_sha256(replacement))
+            allowed[resolved] = sorted(hashes)
+        checkpoint["managedCsvAllowedHashes"] = allowed
+        self._persist_sync_checkpoint(checkpoint)
+
     def _replace_csv_table(self, path: Path, headers: list[str], rows: list[dict[str, Any]], purpose: str) -> None:
         temporary = self._write_csv_temporary(path, headers, rows, purpose)
+        expected_hash = self._file_sha256(temporary)
         try:
+            self._prepare_active_checkpoint_csv_replacement({Path(path): temporary})
             replace_with_retry(temporary, path)
+            if self._file_sha256(path) != expected_hash:
+                raise ValueError(f"CSV 原子替换后检测到外部修改：{path.name}")
+            self._csv_managed_hashes[str(Path(path).resolve()).casefold()] = expected_hash
         except PermissionError as exc:
             raise ValueError(f"WPS/Excel 持续占用 CSV：{path.name}，请关闭该文件后重试") from exc
         finally:
+            self._update_active_checkpoint_csv_hashes()
             temporary.unlink(missing_ok=True)
 
     def _replace_csv_pair(
@@ -676,9 +976,16 @@ class MonitorStore:
         notes_path, comments_path = self._csv_paths()
         note_temp = self._write_csv_temporary(notes_path, note_headers, note_rows, purpose)
         comment_temp = self._write_csv_temporary(comments_path, comment_headers, comment_rows, purpose)
+        expected_hashes = {
+            notes_path: self._file_sha256(note_temp),
+            comments_path: self._file_sha256(comment_temp),
+        }
         backups: list[tuple[Path, Path]] = []
         replaced: list[Path] = []
         try:
+            self._prepare_active_checkpoint_csv_replacement({
+                notes_path: note_temp, comments_path: comment_temp,
+            })
             for target in (notes_path, comments_path):
                 if target.exists():
                     backup = target.with_name(f".{target.stem}.{purpose}-backup-{os.getpid()}-{time.time_ns()}.csv")
@@ -686,8 +993,14 @@ class MonitorStore:
                     backups.append((target, backup))
             replace_with_retry(note_temp, notes_path)
             replaced.append(notes_path)
+            if self._file_sha256(notes_path) != expected_hashes[notes_path]:
+                raise ValueError(f"CSV 原子替换后检测到外部修改：{notes_path.name}")
             replace_with_retry(comment_temp, comments_path)
             replaced.append(comments_path)
+            if self._file_sha256(comments_path) != expected_hashes[comments_path]:
+                raise ValueError(f"CSV 原子替换后检测到外部修改：{comments_path.name}")
+            for target, expected_hash in expected_hashes.items():
+                self._csv_managed_hashes[str(target.resolve()).casefold()] = expected_hash
         except PermissionError as exc:
             backed_up = {target for target, _backup in backups}
             for target, backup in backups:
@@ -707,10 +1020,410 @@ class MonitorStore:
                     target.unlink(missing_ok=True)
             raise
         finally:
+            self._update_active_checkpoint_csv_hashes()
             note_temp.unlink(missing_ok=True)
             comment_temp.unlink(missing_ok=True)
             for _target, backup in backups:
                 backup.unlink(missing_ok=True)
+
+    @staticmethod
+    def _restore_file_bytes(path: Path, payload: bytes | None) -> None:
+        path = Path(path)
+        if payload is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.rollback-{os.getpid()}-{time.time_ns()}.tmp")
+        try:
+            temporary.write_bytes(payload)
+            replace_with_retry(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _managed_binary_material(path: Path) -> bool:
+        return bool(re.match(r"^(?:image|video)-\d+\..+", path.name, re.IGNORECASE)) \
+            or path.name.endswith(".part")
+
+    @classmethod
+    def _checkpoint_json_value(cls, value: Any, *, decode: bool = False) -> Any:
+        if decode:
+            if isinstance(value, dict) and set(value) == {"__bytes__"}:
+                return base64.b64decode(value["__bytes__"])
+            if isinstance(value, dict):
+                return {key: cls._checkpoint_json_value(item, decode=True) for key, item in value.items()}
+            if isinstance(value, list):
+                return [cls._checkpoint_json_value(item, decode=True) for item in value]
+            return value
+        if isinstance(value, bytes):
+            return {"__bytes__": base64.b64encode(value).decode("ascii")}
+        if isinstance(value, dict):
+            return {str(key): cls._checkpoint_json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._checkpoint_json_value(item) for item in value]
+        return value
+
+    def _persist_sync_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        root = self.export_dir / ".sync_checkpoints"
+        root.mkdir(parents=True, exist_ok=True)
+        existing = text(
+            checkpoint.get("checkpointDir") or checkpoint.get("binaryBackupDir"), 4000
+        )
+        folder = Path(existing) if existing else root / (
+            f"{checkpoint['noteId']}-{os.getpid()}-{time.time_ns()}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        checkpoint["checkpointDir"] = str(folder)
+        checkpoint["dbPath"] = str(self.db_path.resolve())
+        checkpoint["capturedAt"] = now_iso()
+        manifest = folder / "checkpoint.json"
+        temporary = folder / f".checkpoint-{time.time_ns()}.tmp"
+        try:
+            temporary.write_text(
+                json.dumps(self._checkpoint_json_value(checkpoint), ensure_ascii=False), encoding="utf-8"
+            )
+            replace_material_with_retry(temporary, manifest)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return checkpoint
+
+    def _recover_persistent_sync_checkpoints(self) -> None:
+        root = self.export_dir / ".sync_checkpoints"
+        if not root.is_dir():
+            return
+        manifests = sorted(
+            root.glob("*/checkpoint.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True
+        )
+        failures: list[str] = []
+        loaded: list[tuple[Path, dict[str, Any]]] = []
+        for manifest in manifests:
+            try:
+                raw = json.loads(manifest.read_text(encoding="utf-8"))
+                checkpoint = self._checkpoint_json_value(raw, decode=True)
+                if Path(checkpoint.get("dbPath", "")).resolve() != self.db_path.resolve():
+                    raise ValueError("检查点数据库路径与当前配置不同")
+                reload_batch = checkpoint.get("reloadBatchId")
+                if reload_batch:
+                    if not re.fullmatch(r"[0-9]+-[0-9]+", str(reload_batch)):
+                        raise ValueError("总表重载检查点批次无效")
+                    marker = self.export_dir / ".reload_commits" / f"{reload_batch}.json"
+                    if marker.is_file():
+                        committed = json.loads(marker.read_text(encoding="utf-8"))
+                        if committed != {"batchId": reload_batch, "dbPath": str(self.db_path.resolve())}:
+                            raise ValueError("总表重载提交标记无效")
+                        self._discard_sync_checkpoint(checkpoint)
+                        continue
+                if checkpoint.get("externalAnalysisBatch") and agent_analysis.committed(self, checkpoint["externalAnalysisBatch"]):
+                    self._discard_sync_checkpoint(checkpoint)
+                    continue
+                if checkpoint.get("captureCsv"):
+                    expected_hashes = checkpoint.get("managedCsvHashes") or {}
+                    allowed_hashes = checkpoint.get("managedCsvAllowedHashes") or {}
+                    for key in ("notesPath", "commentsPath"):
+                        path = Path(checkpoint[key])
+                        resolved = str(path.resolve()).casefold()
+                        expected = expected_hashes.get(resolved)
+                        allowed = set(allowed_hashes.get(resolved) or [])
+                        actual = self._file_sha256(path)
+                        if expected is not None and actual != expected and actual not in allowed:
+                            conflict = manifest.parent / f"external-conflict-{path.name}"
+                            if path.is_file() and not conflict.exists():
+                                shutil.copy2(path, conflict)
+                            raise ValueError(f"崩溃后检测到外部 CSV 修改，已保留冲突副本：{path.name}")
+                loaded.append((manifest, checkpoint))
+            except Exception as exc:
+                failures.append(f"{manifest.parent.name}: {text(exc, 500)}")
+        if failures:
+            raise RuntimeError(f"检测到未完成同步且自动恢复冲突：{'；'.join(failures)}")
+        for manifest, checkpoint in loaded:
+            try:
+                self._restore_sync_checkpoint(checkpoint, recovering=True)
+                self._discard_sync_checkpoint(checkpoint)
+            except Exception as exc:
+                failures.append(f"{manifest.parent.name}: {text(exc, 500)}")
+        if failures:
+            raise RuntimeError(f"检测到未完成同步且自动恢复失败：{'；'.join(failures)}")
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+
+    def _capture_sync_checkpoint(
+        self, note_id: str, *, capture_csv: bool = True, capture_media_binaries: bool = False,
+        capture_global_database: bool = False,
+    ) -> dict[str, Any]:
+        """Capture one note's mutable local state for all-or-nothing synchronization."""
+        notes_path, comments_path = self._csv_paths()
+        notes_bytes = notes_path.read_bytes() if capture_csv and notes_path.is_file() else None
+        comments_bytes = comments_path.read_bytes() if capture_csv and comments_path.is_file() else None
+        with self.lock, self._session() as db:
+            note_row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            comments = [dict(row) for row in db.execute(
+                "SELECT * FROM comments WHERE note_id=? ORDER BY comment_id", (note_id,)
+            ).fetchall()]
+            jobs = [dict(row) for row in db.execute(
+                "SELECT * FROM comment_collection_jobs WHERE note_id=? ORDER BY id", (note_id,)
+            ).fetchall()]
+            watchlist_snapshot = [dict(row) for row in db.execute(
+                "SELECT * FROM watchlist ORDER BY note_id"
+            ).fetchall()] if capture_csv else None
+            max_event_id = int(db.execute("SELECT COALESCE(MAX(id),0) FROM change_events").fetchone()[0])
+        note = dict(note_row) if note_row else None
+        media_dir = text((note or {}).get("media_dir"), 4000)
+        tracked_files: dict[str, bytes | None] = {}
+        binary_backup_dir = ""
+        preexisting_media_backups: dict[str, str] = {}
+        try:
+            media_exists = bool(media_dir and Path(media_dir).is_dir())
+        except OSError:
+            media_exists = False
+        preexisting_unlinked: list[Path] = []
+        if not media_exists:
+            root = self._media_root()
+            suffix = f"__{note_id}"
+            try:
+                if root.is_dir():
+                    preexisting_unlinked = [
+                        path.resolve() for path in root.iterdir()
+                        if path.is_dir() and path.name.endswith(suffix)
+                    ]
+            except OSError:
+                preexisting_unlinked = []
+        if media_exists:
+            folder = Path(media_dir)
+            for name in ("note.json", "comments.json", "帖子正文.txt"):
+                path = folder / name
+                tracked_files[str(path)] = path.read_bytes() if path.is_file() else None
+        if capture_media_binaries and (media_exists or preexisting_unlinked):
+            backup = self.export_dir / ".sync_checkpoints" / f"{note_id}-{os.getpid()}-{time.time_ns()}"
+            backup.mkdir(parents=True, exist_ok=False)
+            try:
+                if media_exists:
+                    for path in Path(media_dir).iterdir():
+                        if not path.is_file() or not self._managed_binary_material(path):
+                            continue
+                        shutil.copy2(path, backup / path.name)
+                for index, folder in enumerate(preexisting_unlinked):
+                    relative = f"preexisting-{index}"
+                    shutil.copytree(folder, backup / relative)
+                    preexisting_media_backups[str(folder)] = relative
+                binary_backup_dir = str(backup)
+            except Exception:
+                shutil.rmtree(backup, ignore_errors=True)
+                raise
+        checkpoint = {
+            "noteId": note_id, "captureCsv": bool(capture_csv),
+            "notesPath": str(notes_path), "commentsPath": str(comments_path),
+            "notesBytes": notes_bytes, "commentsBytes": comments_bytes,
+            "note": note, "comments": comments, "jobs": jobs,
+            "watchlistSnapshot": watchlist_snapshot,
+            "maxEventId": max_event_id, "mediaDir": media_dir, "materialFiles": tracked_files,
+            "binaryBackupDir": binary_backup_dir,
+            "preexistingMediaBackups": preexisting_media_backups,
+        }
+        if capture_csv:
+            self._remember_managed_csv(notes_path)
+            self._remember_managed_csv(comments_path)
+            checkpoint["managedCsvHashes"] = {
+                str(notes_path.resolve()).casefold(): self._file_sha256(notes_path),
+                str(comments_path.resolve()).casefold(): self._file_sha256(comments_path),
+            }
+        try:
+            persisted = self._persist_sync_checkpoint(checkpoint)
+            if capture_global_database:
+                backup_path = Path(persisted["checkpointDir"]) / "database-before.sqlite"
+                with self.lock:
+                    source = self._connect()
+                    target = sqlite3.connect(backup_path)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                        source.close()
+                persisted["globalDatabaseBackup"] = str(backup_path)
+                persisted = self._persist_sync_checkpoint(persisted)
+            if capture_csv:
+                self._active_csv_checkpoint = persisted
+            return persisted
+        except Exception:
+            cleanup = text(checkpoint.get("checkpointDir") or binary_backup_dir, 4000)
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _insert_snapshot_rows(db: sqlite3.Connection, table: str, rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            columns = list(row)
+            placeholders = ",".join("?" for _ in columns)
+            quoted = ",".join(f'"{column}"' for column in columns)
+            db.execute(
+                f'INSERT INTO "{table}" ({quoted}) VALUES ({placeholders})',
+                tuple(row[column] for column in columns),
+            )
+
+    def _discard_sync_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        backup_value = text(
+            checkpoint.get("checkpointDir") or checkpoint.get("binaryBackupDir"), 4000
+        )
+        if backup_value:
+            shutil.rmtree(backup_value, ignore_errors=True)
+        if self._active_csv_checkpoint is checkpoint or (
+            self._active_csv_checkpoint
+            and self._active_csv_checkpoint.get("checkpointDir") == checkpoint.get("checkpointDir")
+        ):
+            self._active_csv_checkpoint = None
+        root = self.export_dir / ".sync_checkpoints"
+        try:
+            root.rmdir()
+        except OSError:
+            pass
+
+    def _rollback_sync_checkpoints(self, checkpoints: list[dict[str, Any]]) -> list[str]:
+        errors: list[str] = []
+        restored: list[dict[str, Any]] = []
+        for checkpoint in reversed(checkpoints):
+            try:
+                self._restore_sync_checkpoint(checkpoint)
+                restored.append(checkpoint)
+            except Exception as exc:
+                errors.append(f"{checkpoint.get('noteId')}: {text(exc, 500)}")
+        for checkpoint in restored:
+            self._discard_sync_checkpoint(checkpoint)
+        return errors
+
+    def _restore_sync_checkpoint(
+        self, checkpoint: dict[str, Any], *, recovering: bool = False
+    ) -> None:
+        """Restore a failed note sync without touching unrelated notes or analysis jobs."""
+        note_id = valid_note_id(checkpoint.get("noteId"))
+        if not note_id:
+            raise ValueError("同步回滚缺少帖子 ID")
+        current_media_dir = ""
+        with self.lock, self._session() as db:
+            current = db.execute("SELECT media_dir FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            current_media_dir = text(current[0], 4000) if current else ""
+        global_database_backup = text(checkpoint.get("globalDatabaseBackup"), 4000)
+        # Automatic startup recovery must remain note-scoped. A whole-database
+        # backup can predate a later successful delete, ignore, review or AI
+        # write and would silently roll those unrelated operations back.
+        # Synchronous in-process rollback still uses the global image because
+        # it runs inside the operation that created the checkpoint.
+        if global_database_backup and not recovering:
+            backup_path = Path(global_database_backup)
+            if not backup_path.is_file():
+                raise FileNotFoundError(f"全库检查点不存在：{backup_path}")
+            with self.lock:
+                source = sqlite3.connect(backup_path)
+                target = self._connect()
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+        if checkpoint.get("captureCsv"):
+            csv_paths = (Path(checkpoint["notesPath"]), Path(checkpoint["commentsPath"]))
+            if not recovering:
+                for path in csv_paths:
+                    key = str(path.resolve()).casefold()
+                    expected_hash = self._csv_managed_hashes.get(key)
+                    if expected_hash is not None and self._file_sha256(path) != expected_hash:
+                        raise ValueError(f"回滚前检测到外部修改，拒绝覆盖：{path.name}")
+            self._restore_file_bytes(csv_paths[0], checkpoint.get("notesBytes"))
+            self._restore_file_bytes(csv_paths[1], checkpoint.get("commentsBytes"))
+            self._remember_managed_csv(csv_paths[0])
+            self._remember_managed_csv(csv_paths[1])
+        with self.lock, self._session() as db:
+            db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
+            db.execute("DELETE FROM comment_collection_jobs WHERE note_id=?", (note_id,))
+            previous_note = checkpoint.get("note")
+            if previous_note:
+                existing = db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone()
+                columns = [column for column in previous_note if column != "note_id"]
+                if existing:
+                    assignments = ",".join(f'"{column}"=?' for column in columns)
+                    db.execute(
+                        f'UPDATE notes SET {assignments} WHERE note_id=?',
+                        tuple(previous_note[column] for column in columns) + (note_id,),
+                    )
+                else:
+                    self._insert_snapshot_rows(db, "notes", [previous_note])
+                self._insert_snapshot_rows(db, "comments", checkpoint.get("comments") or [])
+                self._insert_snapshot_rows(db, "comment_collection_jobs", checkpoint.get("jobs") or [])
+            else:
+                db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
+                db.execute("DELETE FROM notes WHERE note_id=?", (note_id,))
+            db.execute(
+                "DELETE FROM change_events WHERE note_id=? AND id>?",
+                (note_id, int(checkpoint.get("maxEventId") or 0)),
+            )
+            if checkpoint.get("watchlistSnapshot") is not None:
+                watchlist_snapshot = checkpoint.get("watchlistSnapshot") or []
+                if recovering:
+                    db.execute("DELETE FROM watchlist WHERE note_id=?", (note_id,))
+                    self._insert_snapshot_rows(
+                        db, "watchlist",
+                        [row for row in watchlist_snapshot if text(row.get("note_id"), 256) == note_id],
+                    )
+                else:
+                    db.execute("DELETE FROM watchlist")
+                    self._insert_snapshot_rows(db, "watchlist", watchlist_snapshot)
+        previous_media_dir = text(checkpoint.get("mediaDir"), 4000)
+        if previous_media_dir:
+            folder = Path(previous_media_dir)
+            folder.mkdir(parents=True, exist_ok=True)
+            backup_value = text(checkpoint.get("binaryBackupDir"), 4000)
+            if backup_value and Path(backup_value).is_dir():
+                for path in folder.iterdir():
+                    if path.is_file() and self._managed_binary_material(path):
+                        path.unlink(missing_ok=True)
+                for source in Path(backup_value).iterdir():
+                    if not source.is_file() or not self._managed_binary_material(source):
+                        continue
+                    target = folder / source.name
+                    shutil.copy2(source, target)
+        for path_value, payload in (checkpoint.get("materialFiles") or {}).items():
+            self._restore_file_bytes(Path(path_value), payload)
+        preexisting_backups = checkpoint.get("preexistingMediaBackups") or {}
+        backup_root = Path(text(checkpoint.get("binaryBackupDir"), 4000)) \
+            if text(checkpoint.get("binaryBackupDir"), 4000) else None
+        for folder_value, relative in preexisting_backups.items():
+            folder = Path(folder_value)
+            source = backup_root / relative if backup_root else None
+            if not source or not source.is_dir():
+                continue
+            original_files = {
+                str(path.relative_to(source)).casefold() for path in source.rglob("*") if path.is_file()
+            }
+            if folder.is_dir():
+                for path in folder.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    relative_name = str(path.relative_to(folder)).casefold()
+                    if relative_name not in original_files and (
+                        self._managed_binary_material(path)
+                        or path.name in {"note.json", "comments.json", "帖子正文.txt"}
+                    ):
+                        path.unlink(missing_ok=True)
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, folder, dirs_exist_ok=True)
+        if current_media_dir:
+            try:
+                current_folder = Path(current_media_dir).resolve()
+                previous_folder = Path(previous_media_dir).resolve() if previous_media_dir else None
+                preexisting_folders = {Path(value).resolve() for value in preexisting_backups}
+                root = self._media_root().resolve()
+                if current_folder != previous_folder and current_folder not in preexisting_folders \
+                        and current_folder.parent == root and current_folder.name.endswith(f"__{note_id}"):
+                    shutil.rmtree(current_folder, ignore_errors=True)
+            except OSError:
+                pass
+        self._invalidate_excel_artifact_cache()
+
+    def _invalidate_excel_artifact_cache(self) -> None:
+        with self._excel_artifact_cache_lock:
+            self._excel_artifact_cache_key = None
+            self._excel_artifact_cache = {}
 
     def _ensure_seed_workbook(self, _path: Path | None = None) -> None:
         """Create both CSVs and normalize WPS/Excel legacy encodings to UTF-8 BOM."""
@@ -720,15 +1433,73 @@ class MonitorStore:
                 self._replace_csv_table(path, defaults, [], "initialize")
                 continue
             encoding = self._csv_source_encoding(path)
-            if encoding == CSV_ENCODING:
+            with path.open("r", encoding=encoding, newline="") as stream:
+                actual_headers = [str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()]
+            missing_headers = [name for name in defaults if name not in actual_headers]
+            if encoding == CSV_ENCODING and not missing_headers:
                 continue
             headers, rows = self._read_csv_table(path, defaults)
+            if path == notes_path:
+                with self.lock, self._session() as db:
+                    stored_presence = {
+                        str(item["note_id"]): post_status_label(item["post_status"], item["is_deleted"])
+                        for item in db.execute("SELECT note_id,post_status,is_deleted FROM notes").fetchall()
+                    }
+                for row in rows:
+                    note_id = valid_note_id(row.get("笔记ID"))
+                    raw_status = text(row.get("帖子状态"), 40)
+                    row["帖子状态"] = raw_status if raw_status in {
+                        POST_STATUS_PRESENT, POST_STATUS_DELETED
+                    } else stored_presence.get(note_id, POST_STATUS_PRESENT)
+            elif path == comments_path:
+                comment_author_url_missing = "评论用户主页url" not in actual_headers
+                presence_missing = "评论状态" not in actual_headers
+                with self.lock, self._session() as db:
+                    stored_comments = {
+                        str(item["comment_id"]): {
+                            "authorUrl": text(item["author_url"], 2000),
+                            "status": comment_status_label(item["comment_status"], item["is_deleted"]),
+                        }
+                        for item in db.execute(
+                            "SELECT comment_id,author_url,comment_status,is_deleted FROM comments"
+                        ).fetchall()
+                    }
+                    stored_note_author_urls = {}
+                    for item in db.execute("SELECT note_id,payload_json FROM notes").fetchall():
+                        try:
+                            payload = json.loads(item["payload_json"] or "{}")
+                            if not isinstance(payload, dict):
+                                payload = {}
+                        except (TypeError, ValueError):
+                            payload = {}
+                        stored_note_author_urls[str(item["note_id"])] = text(payload.get("authorUrl"), 2000)
+                try:
+                    _, current_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                    for note_row in current_note_rows:
+                        note_id = valid_note_id(note_row.get("笔记ID"))
+                        if note_id and text(note_row.get("用户主页url"), 2000):
+                            stored_note_author_urls[note_id] = text(note_row.get("用户主页url"), 2000)
+                except Exception:
+                    pass
+                for row in rows:
+                    comment_id = text(row.get("笔记评论ID"), 256)
+                    stored = stored_comments.get(comment_id) or {}
+                    if comment_author_url_missing:
+                        legacy_comment_author_url = text(row.get("帖子用户主页url"), 2000)
+                        row["评论用户主页url"] = legacy_comment_author_url or stored.get("authorUrl", "")
+                        row["帖子用户主页url"] = stored_note_author_urls.get(csv_comment_note_id(row), "")
+                    elif not text(row.get("评论用户主页url"), 2000) and stored.get("authorUrl"):
+                        row["评论用户主页url"] = stored["authorUrl"]
+                    raw_status = text(row.get("评论状态"), 40)
+                    if presence_missing or raw_status not in {COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED}:
+                        row["评论状态"] = stored.get("status", COMMENT_STATUS_PRESENT)
+            purpose = "normalize-schema" if missing_headers else "normalize-encoding"
             try:
-                self._replace_csv_table(path, headers, rows, "normalize-encoding")
+                self._replace_csv_table(path, headers, rows, purpose)
             except ValueError as exc:
                 # Keep the Bridge usable when WPS is still editing the file;
-                # reads continue with the detected encoding and the next write/restart retries.
-                print(f"[bridge] CSV 编码等待规范化：{path} ({exc})", flush=True)
+                # reads continue and the next write/restart retries the schema/encoding normalization.
+                print(f"[bridge] CSV 结构或编码等待规范化：{path} ({exc})", flush=True)
 
     def migrate_legacy_workbook(self, xlsx_path: Path) -> dict[str, Any]:
         """Losslessly split the legacy workbook into notes/comments UTF-8 CSV files."""
@@ -850,6 +1621,7 @@ class MonitorStore:
 
     def _init_db(self) -> None:
         with self._session() as db:
+            agent_analysis.init_schema(db)
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS notes (
@@ -915,6 +1687,14 @@ class MonitorStore:
                 "access_error": "TEXT NOT NULL DEFAULT ''",
                 "last_access_checked_at": "TEXT NOT NULL DEFAULT ''",
                 "access_check_result": "TEXT NOT NULL DEFAULT ''",
+                "semantic_analysis_count": "INTEGER NOT NULL DEFAULT 0",
+                "analysis_is_negative": "TEXT NOT NULL DEFAULT ''",
+                "negative_type": "TEXT NOT NULL DEFAULT ''",
+                "negative_subtype": "TEXT NOT NULL DEFAULT ''",
+                "post_status": "TEXT NOT NULL DEFAULT '存在'",
+                "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+                "deleted_at": "TEXT NOT NULL DEFAULT ''",
+                "last_presence_checked_at": "TEXT NOT NULL DEFAULT ''",
             }
             columns = {str(row[1]) for row in db.execute("PRAGMA table_info(notes)").fetchall()}
             for column, definition in note_migrations.items():
@@ -928,6 +1708,15 @@ class MonitorStore:
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_review ON notes(review_status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_relevance ON notes(relevance_status, source)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_notes_access_status ON notes(access_status)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_presence ON notes(is_deleted, pull_status)")
+            db.execute("""UPDATE notes SET is_deleted=1,post_status=?,
+                       deleted_at=CASE WHEN deleted_at='' THEN last_access_checked_at ELSE deleted_at END,
+                       last_presence_checked_at=CASE WHEN last_presence_checked_at='' THEN last_access_checked_at ELSE last_presence_checked_at END
+                       WHERE access_status='unreachable' AND access_check_result='confirmed_v2'""", (POST_STATUS_DELETED,))
+            db.execute("""UPDATE notes SET is_deleted=1
+                       WHERE post_status IN ('已删除','被删','删除','不存在','deleted','missing','removed')""")
+            db.execute("UPDATE notes SET post_status=CASE WHEN is_deleted=1 THEN ? ELSE ? END",
+                       (POST_STATUS_DELETED, POST_STATUS_PRESENT))
             db.execute("""UPDATE notes SET access_status='check_failed',
                        access_error='旧版打不开判定已降级，等待重新同步核验',
                        access_check_result='legacy_untrusted'
@@ -969,6 +1758,14 @@ class MonitorStore:
                     review_note TEXT NOT NULL DEFAULT '',
                     manual_negative INTEGER NOT NULL DEFAULT 0,
                     last_ai_analyzed_at TEXT NOT NULL DEFAULT '',
+                    semantic_analysis_count INTEGER NOT NULL DEFAULT 0,
+                    analysis_is_negative TEXT NOT NULL DEFAULT '',
+                    negative_type TEXT NOT NULL DEFAULT '',
+                    negative_subtype TEXT NOT NULL DEFAULT '',
+                    comment_status TEXT NOT NULL DEFAULT '存在',
+                    is_deleted INTEGER NOT NULL DEFAULT 0,
+                    deleted_at TEXT NOT NULL DEFAULT '',
+                    last_presence_checked_at TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(note_id) REFERENCES notes(note_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_comments_identity_full
@@ -1136,6 +1933,27 @@ class MonitorStore:
             # distinct comments that happened to share author/text/time.
             db.execute("DROP INDEX IF EXISTS idx_comments_identity_full")
             db.execute("CREATE INDEX idx_comments_identity_full ON comments(note_id,author,content,published_at,parent_comment_id)")
+            comment_migrations = {
+                "semantic_analysis_count": "INTEGER NOT NULL DEFAULT 0",
+                "analysis_is_negative": "TEXT NOT NULL DEFAULT ''",
+                "negative_type": "TEXT NOT NULL DEFAULT ''",
+                "negative_subtype": "TEXT NOT NULL DEFAULT ''",
+                "comment_status": "TEXT NOT NULL DEFAULT '存在'",
+                "is_deleted": "INTEGER NOT NULL DEFAULT 0",
+                "deleted_at": "TEXT NOT NULL DEFAULT ''",
+                "last_presence_checked_at": "TEXT NOT NULL DEFAULT ''",
+            }
+            comment_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(comments)").fetchall()}
+            for column, definition in comment_migrations.items():
+                if column not in comment_columns:
+                    db.execute(f"ALTER TABLE comments ADD COLUMN {column} {definition}")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_comments_semantic_negative ON comments(analysis_is_negative, negative_type)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_comments_presence ON comments(is_deleted, note_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_notes_semantic_negative ON notes(analysis_is_negative, negative_type)")
+            db.execute("""UPDATE comments SET is_deleted=1
+                WHERE comment_status IN ('已删除','删除','不存在','deleted','missing','removed')""")
+            db.execute("UPDATE comments SET comment_status=CASE WHEN is_deleted=1 THEN ? ELSE ? END",
+                       (COMMENT_STATUS_DELETED, COMMENT_STATUS_PRESENT))
 
             # Backfill identity keys for databases created before content-based
             # matching was introduced.
@@ -1290,20 +2108,12 @@ class MonitorStore:
                 )
                 row_media_count = len([line for line in value(row, "文件夹内清单").splitlines() if line.strip()])
                 existing = db.execute(
-                    "SELECT note_id,url,page_url,access_status,access_check_result FROM notes WHERE note_id = ?",
+                    "SELECT note_id,url,page_url,access_status,access_error,access_check_result FROM notes WHERE note_id = ?",
                     (note_id,),
                 ).fetchone()
-                confirmed_unreachable = bool(existing and existing["access_check_result"] == "confirmed_v2")
-                if row_access_label == "可打开":
-                    row_access_status, row_access_error, row_access_result = "ok", "", "opened"
-                elif row_access_label == "打不开" and confirmed_unreachable:
-                    row_access_status, row_access_error, row_access_result = "unreachable", "", "confirmed_v2"
-                elif row_access_label in {"打不开", "待复核", "检查失败"}:
-                    row_access_status, row_access_error, row_access_result = (
-                        "check_failed", "Excel 中的旧状态等待重新同步核验", "legacy_excel_unverified"
-                    )
-                else:
-                    row_access_status, row_access_error, row_access_result = "", "", ""
+                row_access_status, row_access_error, row_access_result = imported_access_state(
+                    row_access_label, existing, "Excel"
+                )
                 if existing:
                     # A note may have been discovered by the browser before it
                     # was manually added to Excel. Promote it on every reload
@@ -1434,7 +2244,15 @@ class MonitorStore:
         headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
         if "笔记ID" not in headers:
             raise ValueError("笔记 CSV 缺少笔记ID列")
+        source_encoding = self._csv_source_encoding(notes_path)
+        with notes_path.open("r", encoding=source_encoding, newline="") as stream:
+            actual_headers = {str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()}
+        semantic_headers_present = all(name in actual_headers for name in (
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型"
+        ))
+        presence_header_present = "帖子状态" in actual_headers
         inserted = 0
+        repaired_access_labels = 0
         timestamp = now_iso()
         with self.lock, self._session() as db:
             for row in rows:
@@ -1443,23 +2261,30 @@ class MonitorStore:
                     continue
                 row_title = text(row.get("笔记标题"), 1000)
                 row_content = text(row.get("笔记内容"), 20000)
-                row_tags = text(row.get("笔记话题"), 6000)
+                row_tags = tag_text(row.get("笔记话题"))
                 row_access_label = text(row.get("访问状态"), 100).strip()
+                row_post_status = post_status_label(row.get("帖子状态"))
+                row_is_deleted = int(row_post_status == POST_STATUS_DELETED)
                 row_title_key, row_content_key, row_combined_key = identity_keys(row_title, row_content)
                 row_files = [line.strip() for line in text(row.get("文件夹内清单"), 50000).splitlines() if line.strip()]
                 row_media_dir = self._resolve_legacy_media_dir(row.get("对应帖子文件夹地址"), row_files, note_id)
                 existing = db.execute(
-                    "SELECT note_id,url,page_url,access_status,access_check_result FROM notes WHERE note_id=?", (note_id,)
+                    """SELECT note_id,url,page_url,payload_json,tags,access_status,access_error,access_check_result,
+                               post_status,is_deleted,deleted_at,last_presence_checked_at
+                       FROM notes WHERE note_id=?""", (note_id,)
                 ).fetchone()
-                confirmed_unreachable = bool(existing and existing["access_check_result"] == "confirmed_v2")
-                if row_access_label == "可打开":
-                    access_status, access_error, access_result = "ok", "", "opened"
-                elif row_access_label == "打不开" and confirmed_unreachable:
-                    access_status, access_error, access_result = "unreachable", "", "confirmed_v2"
-                elif row_access_label in {"打不开", "待复核", "检查失败"}:
-                    access_status, access_error, access_result = "check_failed", "CSV 中的旧状态等待重新同步核验", "legacy_excel_unverified"
-                else:
-                    access_status, access_error, access_result = "", "", ""
+                if existing and not presence_header_present:
+                    row_post_status = post_status_label(existing["post_status"], existing["is_deleted"])
+                    row_is_deleted = int(row_post_status == POST_STATUS_DELETED)
+                access_status, access_error, access_result = imported_access_state(
+                    row_access_label, existing, "CSV"
+                )
+                canonical_access_label = {
+                    "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""
+                }[access_status]
+                if row_access_label != canonical_access_label:
+                    row["访问状态"] = canonical_access_label
+                    repaired_access_labels += 1
                 row_url = text(row.get("笔记url"), 4000)
                 if existing:
                     preferred = preferred_url(existing["url"], row_url)
@@ -1479,32 +2304,231 @@ class MonitorStore:
                            content_key=CASE WHEN ?<>'' THEN ? ELSE content_key END,
                            title_content_key=CASE WHEN ?<>'' THEN ? ELSE title_content_key END,
                            last_seen_at=?,access_status=?,access_error=?,access_check_result=?,
-                           pull_status='synced',pull_error='',excel_synced_at=?,excel_sync_path=? WHERE note_id=?""",
+                           post_status=CASE WHEN ? THEN ? ELSE post_status END,
+                           is_deleted=CASE WHEN ? THEN ? ELSE is_deleted END,
+                           deleted_at=CASE WHEN ? AND ?=1 AND deleted_at='' THEN ?
+                                           WHEN ? AND ?=0 THEN '' ELSE deleted_at END,
+                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END,
+                           pull_status=CASE WHEN pull_status IN ('partial','failed') THEN pull_status ELSE 'synced' END,
+                           pull_error=CASE WHEN pull_status IN ('partial','failed') THEN pull_error ELSE '' END,
+                           excel_synced_at=?,excel_sync_path=? WHERE note_id=?""",
                         (preferred, preferred, row_title, row_title, text(row.get("用户昵称"), 500), text(row.get("用户昵称"), 500),
                          row_content, row_content, row_tags, row_tags, text(row.get("来源词"), 200), text(row.get("来源词"), 200),
                          preferred_page, preferred_page, text(row.get("帖子好坏"), 80), text(row.get("帖子好坏"), 80),
                          row_title_key, row_title_key, row_content_key, row_content_key, row_combined_key, row_combined_key,
-                         timestamp, access_status, access_error, access_result, timestamp, str(notes_path), note_id),
+                         timestamp, access_status, access_error, access_result,
+                         int(presence_header_present), row_post_status,
+                         int(presence_header_present), row_is_deleted,
+                         int(presence_header_present), row_is_deleted, timestamp,
+                         int(presence_header_present), row_is_deleted,
+                         int(presence_header_present), timestamp,
+                         timestamp, str(notes_path), note_id),
                     )
                 else:
                     db.execute(
                         """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
                            status,is_relevant,source,post_sentiment,title_key,content_key,title_content_key,payload_json,
-                           access_status,access_error,access_check_result,pull_status,excel_synced_at,excel_sync_path,relevance_status,relevance_source)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,'known',1,'existing_xlsx',?,?,?,?,?, ?,?,?,'synced',?,?, 'relevant','csv')""",
+                           access_status,access_error,access_check_result,post_status,is_deleted,deleted_at,
+                           last_presence_checked_at,pull_status,excel_synced_at,excel_sync_path,relevance_status,relevance_source)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,'known',1,'existing_xlsx',?,?,?,?,?, ?,?,?,?,?,?,?,'synced',?,?, 'relevant','csv')""",
                         (note_id, row_url, row_title, text(row.get("用户昵称"), 500), row_content, row_tags,
                          text(row.get("来源词"), 200), row_url, timestamp, timestamp, text(row.get("帖子好坏"), 80),
                          row_title_key, row_content_key, row_combined_key,
                          json.dumps({"seed": "csv", "tags": row_tags}, ensure_ascii=False), access_status, access_error,
-                         access_result, timestamp, str(notes_path)),
+                         access_result, row_post_status, row_is_deleted, timestamp if row_is_deleted else "",
+                         timestamp if presence_header_present else "", timestamp, str(notes_path)),
                     )
                     inserted += 1
+                if semantic_headers_present:
+                    db.execute(
+                        """UPDATE notes SET semantic_analysis_count=?,analysis_is_negative=?,
+                           negative_type=?,negative_subtype=? WHERE note_id=?""",
+                        (nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                         text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000), note_id),
+                    )
+                try:
+                    previous_payload = json.loads(existing["payload_json"] or "{}") if existing else {}
+                    if not isinstance(previous_payload, dict):
+                        previous_payload = {}
+                except (TypeError, ValueError):
+                    previous_payload = {}
+                row_payload = browser_note_payload(previous_payload)
+                csv_payload = {
+                    "noteId": note_id, "url": preferred if existing else row_url,
+                    "authorUrl": text(row.get("用户主页url"), 2000),
+                    "author": text(row.get("用户昵称"), 500), "title": row_title, "content": row_content,
+                    "likeCount": row.get("点赞量", ""), "collectCount": row.get("收藏量", ""),
+                    "commentCount": row.get("评论量", ""), "shareCount": row.get("分享量", ""),
+                    "publishedAt": text(row.get("发布时间"), 100), "updatedAt": text(row.get("更新时间"), 100),
+                    "ipLocation": text(row.get("IP地址"), 100),
+                    "keyword": text(row.get("来源词"), 200), "authorId": text(row.get("博主ID"), 256),
+                    "postSentiment": text(row.get("帖子好坏"), 80),
+                }
+                if text(row.get("时间采集基准"), 80):
+                    csv_payload["timeObservedAt"] = text(row.get("时间采集基准"), 80)
+                if row_tags:
+                    csv_payload["tags"] = canonical_tag_items(row_tags) or ["无话题"]
+                if text(row.get("图片数量"), 30):
+                    csv_payload["imageCount"] = nonnegative_int(row.get("图片数量"))
+                if row_content:
+                    csv_payload["detailRead"] = True
+                if semantic_headers_present:
+                    csv_payload.update({
+                        "semanticAnalysisCount": nonnegative_int(row.get("语义分析次数")),
+                        "analysisIsNegative": text(row.get("分析结论是否差评"), 40),
+                        "negativeType": text(row.get("差评类型"), 1000),
+                        "negativeSubtype": text(row.get("差评子类型"), 2000),
+                    })
+                for key, value in csv_payload.items():
+                    if value not in (None, "") or key in {"noteId", "semanticAnalysisCount"}:
+                        row_payload[key] = value
+                effective_tags = (row_tags or text(existing["tags"], 6000)) if existing else row_tags
+                db.execute(
+                    "UPDATE notes SET payload_json=?,tags=? WHERE note_id=?",
+                    (json.dumps(row_payload, ensure_ascii=False), effective_tags, note_id),
+                )
                 if row_media_dir:
                     db.execute(
                         "UPDATE notes SET media_dir=?,media_status='complete',media_file_count=? WHERE note_id=?",
                         (row_media_dir, len(row_files), note_id),
                     )
+        if repaired_access_labels:
+            try:
+                self._replace_csv_table(notes_path, headers, rows, "access-seed-reconcile")
+            except OSError as exc:
+                # Keep the native host available while Excel/WPS owns the CSV.
+                # SQLite remains authoritative and the next successful status
+                # mutation will heal the user-facing projection.
+                print(f"[bridge] 访问状态已按数据库保留；CSV 标签暂时无法修复：{exc}", flush=True)
         return inserted
+
+    def _seed_comments_from_csv(self, comments_path: Path) -> dict[str, int]:
+        """Import user-maintained comment metadata without deleting SQLite-only rows."""
+        headers, rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        source_encoding = self._csv_source_encoding(comments_path)
+        with comments_path.open("r", encoding=source_encoding, newline="") as stream:
+            actual_headers = {str(item).strip() for item in next(csv.reader(stream), []) if str(item).strip()}
+        semantic_headers_present = all(name in actual_headers for name in (
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型"
+        ))
+        presence_header_present = "评论状态" in actual_headers
+        comment_author_header_present = "评论用户主页url" in actual_headers
+        timestamp = now_iso()
+        inserted = 0
+        updated = 0
+        with self.lock, self._session() as db:
+            note_ids = {str(row[0]) for row in db.execute("SELECT note_id FROM notes").fetchall()}
+            for row in rows:
+                note_id = csv_comment_note_id(row)
+                comment_id = text(row.get("笔记评论ID"), 256)
+                content_value = text(row.get("评论内容"), 8000)
+                substantive = bool(
+                    content_value or text(row.get("用户昵称"), 500) or text(row.get("评论时间"), 100)
+                )
+                if not note_id or note_id not in note_ids or not comment_id or not substantive:
+                    continue
+                api = self._csv_comment_to_api(row)
+                if not comment_author_header_present:
+                    api["authorUrl"] = text(row.get("帖子用户主页url"), 2000)
+                raw_presence = text(row.get("评论状态"), 40)
+                status_supplied = presence_header_present and raw_presence in {
+                    COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED
+                }
+                existing = db.execute(
+                    """SELECT payload_json,content,author_url,parent_comment_id,published_at,comment_level,
+                              comment_status,is_deleted
+                       FROM comments WHERE comment_id=?""", (comment_id,)
+                ).fetchone()
+                status_label = raw_presence if status_supplied else (
+                    comment_status_label(existing["comment_status"], existing["is_deleted"])
+                    if existing else COMMENT_STATUS_PRESENT
+                )
+                is_deleted = int(status_label == COMMENT_STATUS_DELETED)
+                if existing:
+                    content_value = content_value or text(existing["content"], 8000)
+                    api["content"] = content_value
+                    api["authorUrl"] = api["authorUrl"] or text(existing["author_url"], 2000)
+                    api["parentCommentId"] = api["parentCommentId"] or text(existing["parent_comment_id"], 256)
+                    api["publishedAt"] = api["publishedAt"] or text(existing["published_at"], 100)
+                    if api["parentCommentId"]:
+                        api["commentLevel"] = max(2, comment_level_value(api["commentLevel"]))
+                    elif not text(row.get("评论层级"), 30):
+                        api["commentLevel"] = int(existing["comment_level"] or 1)
+                try:
+                    payload = json.loads(existing["payload_json"] or "{}") if existing else {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except (TypeError, ValueError):
+                    payload = {}
+                if existing:
+                    # The CSV has no reply-count column. Its API default zero
+                    # must not overwrite the last actual DOM observation.
+                    api.pop("replyCount", None)
+                payload.update(api)
+                if text(row.get("时间采集基准"), 80):
+                    payload["timeObservedAt"] = text(row.get("时间采集基准"), 80)
+                payload.update({"commentStatus": status_label, "isDeleted": bool(is_deleted)})
+                if semantic_headers_present:
+                    payload.update({
+                        "semanticAnalysisCount": nonnegative_int(row.get("语义分析次数")),
+                        "analysisIsNegative": text(row.get("分析结论是否差评"), 40),
+                        "negativeType": text(row.get("差评类型"), 1000),
+                        "negativeSubtype": text(row.get("差评子类型"), 2000),
+                    })
+                if existing:
+                    db.execute(
+                        """UPDATE comments SET note_id=?,parent_comment_id=?,content=?,author=?,author_url=?,
+                           published_at=?,like_count=?,comment_level=?,payload_json=?,content_hash=?,
+                           sentiment=CASE WHEN ?<>'' THEN ? ELSE sentiment END,
+                           semantic_analysis_count=CASE WHEN ? THEN ? ELSE semantic_analysis_count END,
+                           analysis_is_negative=CASE WHEN ? THEN ? ELSE analysis_is_negative END,
+                           negative_type=CASE WHEN ? THEN ? ELSE negative_type END,
+                           negative_subtype=CASE WHEN ? THEN ? ELSE negative_subtype END,
+                           comment_status=CASE WHEN ? THEN ? ELSE comment_status END,
+                           is_deleted=CASE WHEN ? THEN ? ELSE is_deleted END,
+                           deleted_at=CASE WHEN ? AND ?=1 AND deleted_at='' THEN ?
+                                           WHEN ? AND ?=0 THEN '' ELSE deleted_at END,
+                           last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
+                           WHERE comment_id=?""",
+                        (note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                         api["publishedAt"], api["likeCount"], api["commentLevel"],
+                         json.dumps(payload, ensure_ascii=False), self._content_hash(content_value),
+                         sentiment_code(row.get("AI情绪判断")), sentiment_code(row.get("AI情绪判断")),
+                         int(semantic_headers_present), nonnegative_int(row.get("语义分析次数")),
+                         int(semantic_headers_present), text(row.get("分析结论是否差评"), 40),
+                         int(semantic_headers_present), text(row.get("差评类型"), 1000),
+                         int(semantic_headers_present), text(row.get("差评子类型"), 2000),
+                         int(status_supplied), status_label,
+                         int(status_supplied), is_deleted,
+                         int(status_supplied), is_deleted, timestamp,
+                         int(status_supplied), is_deleted,
+                         int(status_supplied), timestamp, comment_id),
+                    )
+                    updated += 1
+                else:
+                    db.execute(
+                        """INSERT INTO comments(comment_id,note_id,parent_comment_id,content,author,author_url,
+                           published_at,like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
+                           payload_json,content_hash,sentiment,semantic_analysis_count,analysis_is_negative,
+                           negative_type,negative_subtype,comment_status,is_deleted,deleted_at,last_presence_checked_at)
+                           VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (comment_id, note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
+                         api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, timestamp,
+                         json.dumps(payload, ensure_ascii=False), self._content_hash(content_value),
+                         sentiment_code(row.get("AI情绪判断")),
+                         nonnegative_int(row.get("语义分析次数")) if semantic_headers_present else 0,
+                         text(row.get("分析结论是否差评"), 40) if semantic_headers_present else "",
+                         text(row.get("差评类型"), 1000) if semantic_headers_present else "",
+                         text(row.get("差评子类型"), 2000) if semantic_headers_present else "",
+                         status_label, is_deleted, timestamp if is_deleted else "",
+                         timestamp if status_supplied else ""),
+                    )
+                    inserted += 1
+            db.execute(
+                """UPDATE notes SET comment_count_collected=(
+                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
+            )
+        return {"inserted": inserted, "updated": updated}
 
     def seed_from_xlsx(self, master_path: Path) -> int:
         """Compatibility entry point: migrate XLSX once, then use two CSV files."""
@@ -1530,11 +2554,103 @@ class MonitorStore:
                 print(f"[bridge] CSV 迁移已完成；旧 XLSX 尚有未保存内容或仍被占用，暂不强制删除：{source}", flush=True)
             self._seed_from_csv(notes_path)
             self.repair_csv_relationships({"source": "legacy_xlsx_migration"})
+            self._seed_comments_from_csv(self.comments_csv_path)
             return inserted
         notes_path, comments_path = self.configure_data_files(source)
         self._ensure_seed_workbook(notes_path)
         self.comments_csv_path = comments_path
-        return self._seed_from_csv(notes_path)
+        inserted = self._seed_from_csv(notes_path)
+        self._seed_comments_from_csv(comments_path)
+        return inserted
+
+    def reload_data_files(self) -> dict[str, Any]:
+        """Publish an explicit CSV reload to DB and material snapshots together.
+
+        The low-level seed method is also used during startup and repair; keep
+        this user-facing publication boundary separate from those imports.
+        External CSV/SQLite writers must finish before starting a reload.
+        """
+        seed_path = self.seed_xlsx_path
+        if not seed_path or Path(seed_path).suffix.lower() != ".csv":
+            raise ValueError("请先配置并迁移为 CSV 总表，再重新载入")
+        with self.pull_lock, self.lock:
+            if list((self.export_dir / ".sync_checkpoints").glob("*/checkpoint.json")):
+                raise ValueError("存在未恢复的同步检查点，请先重启服务完成恢复")
+            notes_path, comments_path = self._csv_paths()
+            _, csv_notes = self._read_csv_table(notes_path, [])
+            _, csv_comments = self._read_csv_table(comments_path, [])
+            with self._session() as db:
+                existing = {row["note_id"]: dict(row) for row in db.execute("SELECT * FROM notes")}
+                note_ids = set(existing) | {row[0] for row in db.execute("SELECT DISTINCT note_id FROM comments")}
+            for row in existing.values():
+                if row.get("media_dir") and not Path(row["media_dir"]).is_dir():
+                    raise ValueError(f"素材目录缺失，重载已取消：{row['note_id']}")
+            for row in csv_notes:
+                note_id = valid_note_id(row.get("笔记ID"))
+                if not note_id:
+                    raise ValueError("笔记总表存在缺失的笔记 ID")
+                note_ids.add(note_id)
+                # Reload is not a material-folder migration. A changed folder
+                # would sit outside the captured rollback files.
+                incoming = text(row.get("对应帖子文件夹地址"), 4000)
+                previous = text(existing.get(note_id, {}).get("media_dir"), 4000)
+                if incoming != previous:
+                    raise ValueError("总表素材目录已变化，请使用采集/素材迁移流程，不要直接重载")
+            note_ids.update(csv_comment_note_id(row) for row in csv_comments)
+            note_ids.discard("")
+            checkpoints: list[dict[str, Any]] = []
+            reload_batch = f"{os.getpid()}-{time.time_ns()}"
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(note_ids) or ["checkpoint-empty"]):
+                    checkpoints.append(self._capture_sync_checkpoint(
+                        note_id, capture_csv=index == 0, capture_global_database=index == 0,
+                    ))
+                    checkpoints[-1]["reloadBatchId"] = reload_batch
+                    self._persist_sync_checkpoint(checkpoints[-1])
+                mutation_started = True
+                inserted = self.seed_from_xlsx(Path(seed_path))
+                migration = self.reconcile_legacy_access_statuses()
+                with self._session() as db:
+                    material_rows = [dict(row) for row in db.execute(
+                        "SELECT note_id,media_dir FROM notes WHERE media_dir<>'' ORDER BY note_id"
+                    )]
+                for row in material_rows:
+                    folder = self._refresh_material_snapshot_for_note(row["note_id"])
+                    if not folder:
+                        raise ValueError(f"素材目录缺失，重载已取消：{row['note_id']}")
+                    self._verify_note_store_consistency(row["note_id"], folder, verify_fields=True)
+                health = self.data_health()
+                if health.get("status") == "critical" or not health.get("summary", {}).get("relationshipsConsistent"):
+                    raise ValueError("重载后的全局字段/关联校验未通过")
+                # One durable batch marker precedes every checkpoint deletion.
+                # A crash during cleanup must never partially undo a success.
+                commit_root = self.export_dir / ".reload_commits"
+                commit_root.mkdir(parents=True, exist_ok=True)
+                marker = commit_root / f"{reload_batch}.json"
+                temporary = commit_root / f"{reload_batch}.tmp"
+                try:
+                    with temporary.open("x", encoding="utf-8") as stream:
+                        json.dump({"batchId": reload_batch, "dbPath": str(self.db_path.resolve())}, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, marker)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                errors = self._rollback_sync_checkpoints(checkpoints)
+                if errors:
+                    raise RuntimeError("总表重载失败且回滚未完全成功：" + "；".join(errors)) from exc
+                raise ValueError(f"总表重载未通过，已恢复重载前状态：{text(exc, 1000)}") from exc
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return {"ok": True, "inserted": inserted, "path": str(seed_path),
+                    "accessMigration": migration.get("updated", 0), "accessMigrationError": "",
+                    "materialSnapshotsRefreshed": len(material_rows), "consistencyVerified": True}
 
     def _find_match(
         self,
@@ -1672,9 +2788,13 @@ class MonitorStore:
                 "mediaDir": str(existing["media_dir"]) if existing is not None and "media_dir" in existing.keys() else "",
                 "mediaFileCount": int(existing["media_file_count"] or 0) if existing is not None and "media_file_count" in existing.keys() else 0,
                 "mediaError": str(existing["media_error"]) if existing is not None and "media_error" in existing.keys() else "",
+                "postStatus": post_status_label(existing["post_status"], existing["is_deleted"])
+                    if existing is not None and "post_status" in existing.keys() else POST_STATUS_PRESENT,
+                "isDeleted": bool(existing["is_deleted"])
+                    if existing is not None and "is_deleted" in existing.keys() else False,
             }
 
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             stored_by_id: dict[str, sqlite3.Row] = {}
             if title_only:
                 stored_by_id = {
@@ -1778,7 +2898,13 @@ class MonitorStore:
                     # Keep Excel as the canonical comparison source. Search
                     # cards often contain truncated titles/captions and must
                     # not replace the fields imported from the workbook.
-                    preserve_excel = str(existing["source"]) == "existing_xlsx"
+                    # Every successfully/partially pulled note already has a
+                    # canonical row in the business CSV, even when it was first
+                    # discovered from DOM and therefore keeps source='dom'.
+                    # Search-card text is often truncated and must never drift
+                    # SQLite away from that CSV/material snapshot.
+                    preserve_excel = in_excel
+                    update_note_url = "" if preserve_excel else note_url
                     update_title = "" if preserve_excel else title
                     update_author = "" if preserve_excel else author
                     update_content = "" if preserve_excel else content
@@ -1813,8 +2939,8 @@ class MonitorStore:
                         WHERE note_id = ?
                         """,
                         (
-                            note_url,
-                            note_url,
+                            update_note_url,
+                            update_note_url,
                             update_title,
                             update_title,
                             update_author,
@@ -1896,7 +3022,7 @@ class MonitorStore:
         keyword = text(payload.get("keyword"), 200)
         title_value, content_value, combined_value = identity_keys(title, content)
         payload_json = json.dumps(payload, ensure_ascii=False)
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             existing = db.execute("SELECT first_seen_at,url,source FROM notes WHERE note_id = ?", (note_id,)).fetchone()
             first_seen_at = str(existing["first_seen_at"]) if existing else timestamp
             if existing:
@@ -1926,6 +3052,10 @@ class MonitorStore:
                     content_hash = CASE WHEN excluded.content_hash <> '' THEN excluded.content_hash ELSE notes.content_hash END,
                     pull_status = CASE WHEN notes.source='existing_xlsx' THEN 'synced' ELSE 'queued' END,
                     pull_error = '',
+                    post_status = '存在',
+                    is_deleted = 0,
+                    deleted_at = '',
+                    last_presence_checked_at = excluded.last_seen_at,
                     payload_json = excluded.payload_json
                 """,
                 (
@@ -1949,29 +3079,73 @@ class MonitorStore:
         return {"ok": True, "noteId": note_id, "status": "known" if existing and existing["source"] == "existing_xlsx" else "confirmed"}
 
     def ignore(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Ignore a note and soft-delete its retained post/comment presence as one transaction."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
-        with self.lock, self._session() as db:
-            updated = db.execute("UPDATE notes SET status = 'ignored', last_seen_at = ? WHERE note_id = ?", (now_iso(), note_id)).rowcount
-        if not updated:
+        with self.pull_lock, self.lock, self._session() as db:
+            stored = db.execute(
+                "SELECT source,pull_status,status FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        if not stored:
             raise ValueError("帖子尚未写入本地数据库，请先重新扫描")
-        return {"ok": True, "noteId": note_id, "status": "ignored", "updated": True}
+        pulled = stored["source"] == "existing_xlsx" or stored["pull_status"] in {"synced", "partial"}
+        if pulled:
+            reconciled = self.set_note_access_statuses({"items": [{
+                "noteId": note_id,
+                "preserveAccess": True,
+                "forcePostStatus": POST_STATUS_DELETED,
+                "workflowStatus": "ignored",
+                "cascadeComments": True,
+                "commentDeletionReason": "parent_ignored",
+            }]})
+            item = reconciled["items"][0]
+            return {
+                "ok": True, "noteId": note_id, "status": "ignored", "updated": True,
+                "pulled": True, "postStatus": item["postStatus"],
+                "commentsMarkedDeleted": int(item.get("commentsMarkedDeleted") or 0),
+                "consistencyVerified": reconciled.get("consistencyVerified") is True,
+                "verified": reconciled.get("verified", []),
+            }
+        with self.pull_lock, self.lock, self._session() as db:
+            db.execute("UPDATE notes SET status='ignored',last_seen_at=? WHERE note_id=?", (now_iso(), note_id))
+        return {"ok": True, "noteId": note_id, "status": "ignored", "updated": True,
+                "pulled": False, "consistencyVerified": True}
 
     def restore(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Restore workflow participation without reviving comments deleted before the ignore."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
-        with self.lock, self._session() as db:
-            updated = db.execute(
-                """UPDATE notes SET status=CASE
-                   WHEN source='existing_xlsx' OR pull_status IN ('synced','partial') THEN 'known'
-                   ELSE 'new' END, last_seen_at=? WHERE note_id=? AND status='ignored'""",
-                (now_iso(), note_id),
-            ).rowcount
-        if not updated:
+        with self.pull_lock, self.lock, self._session() as db:
+            stored = db.execute(
+                "SELECT source,pull_status,status FROM notes WHERE note_id=?", (note_id,)
+            ).fetchone()
+        if not stored or stored["status"] != "ignored":
             raise ValueError("帖子不存在或当前不是已忽略状态")
-        return {"ok": True, "noteId": note_id, "status": "new"}
+        pulled = stored["source"] == "existing_xlsx" or stored["pull_status"] in {"synced", "partial"}
+        workflow_status = "known" if pulled else "new"
+        if pulled:
+            reconciled = self.set_note_access_statuses({"items": [{
+                "noteId": note_id,
+                "preserveAccess": True,
+                "forcePostStatus": POST_STATUS_PRESENT,
+                "workflowStatus": workflow_status,
+                "restoreIgnoredComments": True,
+            }]})
+            item = reconciled["items"][0]
+            return {
+                "ok": True, "noteId": note_id, "status": workflow_status, "pulled": True,
+                "postStatus": item["postStatus"],
+                "commentsRestored": int(item.get("commentsRestored") or 0),
+                "consistencyVerified": reconciled.get("consistencyVerified") is True,
+                "verified": reconciled.get("verified", []),
+            }
+        with self.pull_lock, self.lock, self._session() as db:
+            db.execute("UPDATE notes SET status=?,last_seen_at=? WHERE note_id=?",
+                       (workflow_status, now_iso(), note_id))
+        return {"ok": True, "noteId": note_id, "status": workflow_status,
+                "pulled": False, "consistencyVerified": True}
 
     def ai_settings_public(self) -> dict[str, Any]:
         return {"ok": True, **self.ai_settings.get(False)}
@@ -1995,6 +3169,7 @@ class MonitorStore:
         return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else ""
 
     def upsert_comments(self, payload: dict[str, Any]) -> dict[str, Any]:
+        validate_snapshot_identity(payload)
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
@@ -2007,9 +3182,10 @@ class MonitorStore:
         timestamp = text(payload.get("collectedAt"), 80) or now_iso()
         inserted_ids: list[str] = []
         changed_ids: list[str] = []
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             if not db.execute("SELECT 1 FROM notes WHERE note_id = ?", (note_id,)).fetchone():
                 raise ValueError("帖子尚未写入本地数据库")
+            raw_comments = self._normalize_snapshot_comments(note_id, raw_comments)
             ordered_comments = sorted(
                 enumerate(raw_comments),
                 key=lambda pair: (max(1, min(int((pair[1] or {}).get("commentLevel") or 1), 3))
@@ -2027,71 +3203,124 @@ class MonitorStore:
                 supplied_id = text(item.get("commentId"), 256)
                 supplied_parent_id = text(item.get("parentCommentId"), 256)
                 parent_comment_id = comment_id_aliases.get(supplied_parent_id, supplied_parent_id)
-                identity = f"{note_id}\x1f{author}\x1f{content}\x1f{published_at}"
-                comment_id = supplied_id or f"dom-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}"
+                comment_id = self._excel_comment_id(note_id, {**item, "parentCommentId": parent_comment_id})
                 content_hash = self._content_hash(content)
                 existing = db.execute(
-                    "SELECT comment_id, content_hash FROM comments WHERE comment_id = ?",
+                    """SELECT comment_id,note_id,parent_comment_id,published_at,author_url,comment_level,
+                              content_hash,payload_json,semantic_analysis_count,
+                              analysis_is_negative,negative_type,negative_subtype,is_deleted
+                       FROM comments WHERE comment_id=?""",
                     (comment_id,),
                 ).fetchone()
                 if existing is None and not supplied_id:
                     existing = db.execute(
-                        """SELECT comment_id,content_hash FROM comments
-                           WHERE note_id=? AND author=? AND content=? AND published_at=? AND parent_comment_id=? LIMIT 1""",
+                        """SELECT comment_id,note_id,parent_comment_id,published_at,author_url,comment_level,
+                                  content_hash,payload_json,semantic_analysis_count,
+                                  analysis_is_negative,negative_type,negative_subtype,is_deleted
+                           FROM comments WHERE note_id=? AND author=? AND content=? AND published_at=?
+                             AND parent_comment_id=? LIMIT 1""",
                         (note_id, author, content, published_at, parent_comment_id),
                     ).fetchone()
                 if existing is None and not supplied_id and not published_at:
                     existing = db.execute(
-                        """SELECT comment_id,content_hash FROM comments
-                           WHERE note_id=? AND author=? AND content=? AND parent_comment_id=? LIMIT 1""",
+                        """SELECT comment_id,note_id,parent_comment_id,published_at,author_url,comment_level,
+                                  content_hash,payload_json,semantic_analysis_count,
+                                  analysis_is_negative,negative_type,negative_subtype,is_deleted
+                           FROM comments WHERE note_id=? AND author=? AND content=? AND parent_comment_id=? LIMIT 1""",
                         (note_id, author, content, parent_comment_id),
                     ).fetchone()
                 if existing:
                     stored_id = str(existing["comment_id"])
+                    if text(existing["note_id"], 128) != note_id:
+                        raise ValueError(f"评论 ID 已属于其他帖子，已停止串帖写入：{stored_id}")
                     if supplied_id:
                         comment_id_aliases[supplied_id] = stored_id
+                    parent_comment_id = parent_comment_id or text(existing["parent_comment_id"], 256)
+                    published_at = published_at or text(existing["published_at"], 100)
+                    author_url = text(item.get("authorUrl"), 2000) or text(existing["author_url"], 2000)
+                    incoming_level = max(1, min(int(item.get("commentLevel") or 1), 3))
+                    comment_level = max(2, incoming_level) if parent_comment_id else (
+                        int(existing["comment_level"] or 1) if not item.get("commentLevel") else incoming_level
+                    )
                     changed = str(existing["content_hash"]) != content_hash
+                    try:
+                        stored_payload = json.loads(existing["payload_json"] or "{}")
+                        if not isinstance(stored_payload, dict):
+                            stored_payload = {}
+                    except (TypeError, ValueError):
+                        stored_payload = {}
+                    current_payload = {
+                        **stored_payload, **item, "commentId": stored_id, "noteId": note_id,
+                        "parentCommentId": parent_comment_id, "publishedAt": published_at,
+                        "authorUrl": author_url, "commentLevel": comment_level,
+                        "commentType": "子评论" if comment_level >= 2 else "主评论",
+                        "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                        "semanticAnalysisCount": int(existing["semantic_analysis_count"] or 0),
+                        "analysisIsNegative": text(existing["analysis_is_negative"], 40),
+                        "negativeType": text(existing["negative_type"], 1000),
+                        "negativeSubtype": text(existing["negative_subtype"], 2000),
+                    }
+                    current_payload = enrich_time_payload(current_payload, timestamp, kind="comment", previous=stored_payload)
+                    current_payload.pop("presenceReason", None)
+                    current_payload.pop("presenceReasonAt", None)
+                    current_payload.pop("presenceReason", None)
+                    current_payload.pop("presenceReasonAt", None)
                     db.execute(
                         """
                         UPDATE comments SET last_seen_at=?, like_count=?, reply_count=?,
                             parent_comment_id=?, content=?, author=?, author_url=?, published_at=?,
                             comment_url=?, comment_level=?, content_hash=?, payload_json=?,
-                            ai_analysis_status=CASE WHEN ? THEN 'not_analyzed' ELSE ai_analysis_status END
+                            ai_analysis_status=CASE WHEN ? THEN 'not_analyzed' ELSE ai_analysis_status END,
+                            comment_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?
                         WHERE comment_id=?
                         """,
                         (timestamp, int(item.get("likeCount") or 0), int(item.get("replyCount") or 0),
                          parent_comment_id, content, author,
-                         text(item.get("authorUrl"), 2000), published_at,
+                         author_url, published_at,
                          text(item.get("commentUrl"), 2000),
-                         max(1, min(int(item.get("commentLevel") or 1), 3)),
-                         content_hash, json.dumps(item, ensure_ascii=False), int(changed), stored_id),
+                         comment_level,
+                         content_hash, json.dumps(current_payload, ensure_ascii=False), int(changed),
+                         COMMENT_STATUS_PRESENT, timestamp, stored_id),
                     )
                     if changed:
                         changed_ids.append(stored_id)
                     continue
+                comment_level = max(1, min(int(item.get("commentLevel") or 1), 3))
+                if parent_comment_id:
+                    comment_level = max(2, comment_level)
+                current_payload = {
+                    **item, "commentId": comment_id, "noteId": note_id,
+                    "parentCommentId": parent_comment_id, "publishedAt": published_at,
+                    "authorUrl": text(item.get("authorUrl"), 2000),
+                    "commentLevel": comment_level,
+                    "commentType": "子评论" if comment_level >= 2 else "主评论",
+                    "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                }
+                current_payload = enrich_time_payload(current_payload, timestamp, kind="comment")
                 db.execute(
                     """
                     INSERT INTO comments (
                         comment_id,note_id,parent_comment_id,content,author,author_url,published_at,
                         like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
-                        payload_json,content_hash
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        payload_json,content_hash,comment_status,is_deleted,deleted_at,last_presence_checked_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',?)
                     """,
                     (comment_id, note_id, parent_comment_id, content, author,
                      text(item.get("authorUrl"), 2000), published_at, int(item.get("likeCount") or 0),
                      int(item.get("replyCount") or 0), text(item.get("commentUrl"), 2000),
-                     max(1, min(int(item.get("commentLevel") or 1), 3)), timestamp, timestamp,
-                     json.dumps(item, ensure_ascii=False), content_hash),
+                     comment_level, timestamp, timestamp,
+                     json.dumps(current_payload, ensure_ascii=False), content_hash, COMMENT_STATUS_PRESENT, timestamp),
                 )
                 if supplied_id:
                     comment_id_aliases[supplied_id] = comment_id
                 inserted_ids.append(comment_id)
-            count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
+            count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+            ).fetchone()[0])
             expected_count = int(payload.get("expectedCount") or 0)
-            if collection_status == "likely_complete" and (expected_count <= 0 or count < expected_count):
-                collection_status = "partial"
+            collection_status = comment_snapshot_status(payload, len(raw_comments), collection_status)
             negative = int(db.execute(
-                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_negative=1 AND ai_confidence>=0.85",
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0 AND is_negative=1 AND ai_confidence>=0.85",
                 (note_id,),
             ).fetchone()[0])
             db.execute(
@@ -2119,7 +3348,7 @@ class MonitorStore:
                      text(payload.get("error"), 1000), timestamp, timestamp),
                 )
         return {"ok": True, "noteId": note_id, "newCount": len(inserted_ids), "changedCount": len(changed_ids),
-                "collectedCount": count, "status": collection_status}
+                "collectedCount": count, "currentCount": len(raw_comments), "status": collection_status}
 
     @staticmethod
     def _comment_api_row(item: dict[str, Any]) -> dict[str, Any]:
@@ -2132,6 +3361,10 @@ class MonitorStore:
             "commentLevel": max(1, min(int(item.get("commentLevel") or item.get("comment_level") or 1), 3)),
             "likeCount": int(item.get("likeCount") or item.get("like_count") or 0),
             "replyCount": int(item.get("replyCount") or item.get("reply_count") or 0),
+            "commentStatus": comment_status_label(
+                item.get("commentStatus") or item.get("comment_status"), item.get("isDeleted") or item.get("is_deleted")
+            ),
+            "isDeleted": bool_value(item.get("isDeleted") or item.get("is_deleted")),
         }
 
     def compare_comments(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2140,15 +3373,38 @@ class MonitorStore:
         Missing rows are only confirmed as removed when collection is likely
         complete, so a collapsed or slow reply thread is never deleted.
         """
+        validate_snapshot_identity(payload)
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
         raw_comments = payload.get("comments") or []
         if not isinstance(raw_comments, list):
             raise ValueError("comments must be an array")
-        current = [self._comment_api_row(item) for item in raw_comments
-                   if isinstance(item, dict) and text(item.get("content"), 8000)]
-        local = [self._comment_api_row(item) for item in self.list_comments(note_id, 2000)]
+        raw_comments = self._normalize_snapshot_comments(note_id, raw_comments)
+        return self._compare_normalized_comments(payload, note_id, raw_comments)
+
+    def _compare_normalized_comments(
+        self, payload: dict[str, Any], note_id: str, raw_comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compare freshly normalized rows, never a cached browser preview.
+
+        Only validated in-process callers supply these rows. The public preview
+        still validates and normalizes; sync reuses its write-stage normalization
+        while holding pull_lock, before any snapshot writes. No payload flag can
+        opt a client out of validation or normalization.
+        """
+        current_by_identity: dict[tuple[str, ...], dict[str, Any]] = {}
+        for item in raw_comments:
+            if not isinstance(item, dict) or not text(item.get("content"), 8000):
+                continue
+            row = self._comment_api_row(item)
+            identity = ("id", row["commentId"]) if row["commentId"] else (
+                "legacy", row["parentCommentId"], row["author"], row["content"], row["publishedAt"]
+            )
+            current_by_identity[identity] = row
+        current = list(current_by_identity.values())
+        all_local = [self._comment_api_row(item) for item in self.list_comments(note_id, 10000)]
+        local = [item for item in all_local if not item["isDeleted"] and item["commentStatus"] != COMMENT_STATUS_DELETED]
         incoming_note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
         with self.lock, self._session() as db:
             stored_note_row = db.execute(
@@ -2179,18 +3435,22 @@ class MonitorStore:
             if str(before if before is not None else "") != str(after if after is not None else ""):
                 note_changes.append({"field": field, "label": label, "before": before, "after": after})
         by_id = {row["commentId"]: index for index, row in enumerate(local) if row["commentId"]}
-        by_exact = {(row["author"], row["content"], row["publishedAt"]): index
+        by_exact = {(row["parentCommentId"], row["author"], row["content"], row["publishedAt"]): index
                     for index, row in enumerate(local)}
-        by_loose = {(row["author"], row["content"]): index for index, row in enumerate(local)}
+        by_loose = {(row["parentCommentId"], row["author"], row["content"]): index for index, row in enumerate(local)}
         matched: set[int] = set()
         new_comments: list[dict[str, Any]] = []
         changed_comments: list[dict[str, Any]] = []
         for row in current:
-            index = by_id.get(row["commentId"]) if row["commentId"] else None
-            if index is None:
-                index = by_exact.get((row["author"], row["content"], row["publishedAt"]))
-            if index is None:
-                index = by_loose.get((row["author"], row["content"]))
+            supplied_id = row["commentId"]
+            index = by_id.get(supplied_id) if supplied_id else None
+            # A supplied comment ID is an opaque stable primary key. Never
+            # merge two different IDs merely because author/text/time match.
+            # Text fallbacks are reserved for legacy snapshots with no ID.
+            if index is None and not supplied_id:
+                index = by_exact.get((row["parentCommentId"], row["author"], row["content"], row["publishedAt"]))
+            if index is None and not supplied_id:
+                index = by_loose.get((row["parentCommentId"], row["author"], row["content"]))
             if index is None:
                 new_comments.append(row)
                 continue
@@ -2201,14 +3461,19 @@ class MonitorStore:
                     previous["commentLevel"] != row["commentLevel"]):
                 changed_comments.append({"before": previous, "after": row})
         missing = [row for index, row in enumerate(local) if index not in matched]
-        status = text(payload.get("status"), 30) or "partial"
+        status = comment_snapshot_status(payload, len(current))
         expected_count = max(0, int(payload.get("expectedCount") or 0))
-        can_prune = status == "likely_complete" and (expected_count <= 0 or len(current) >= expected_count)
+        explicit_empty_verified = bool_value(payload.get("explicitEmptyVerified"))
+        collection_verified = collection_evidence_verified(payload)
+        can_prune = status == "likely_complete"
         removed = missing if can_prune else []
         pending_removed = [] if can_prune else missing
         return {
             "ok": True, "noteId": note_id, "status": status,
-            "expectedCount": expected_count, "currentCount": len(current), "localCount": len(local),
+            "expectedCount": expected_count, "currentCount": len(current),
+            "explicitEmptyVerified": explicit_empty_verified,
+            "collectionEvidenceVerified": collection_verified, "localCount": len(local),
+            "historicalCount": len(all_local), "deletedLocalCount": len(all_local) - len(local),
             "canPrune": can_prune, "newCount": len(new_comments), "removedCount": len(removed),
             "changedCount": len(changed_comments), "pendingRemovedCount": len(pending_removed),
             "hasChanges": bool(new_comments or removed or changed_comments or note_changes),
@@ -2279,30 +3544,99 @@ class MonitorStore:
                 temporary_path.unlink(missing_ok=True)
 
     def _delete_comment_rows_from_xlsx(self, note_id: str, removed: list[dict[str, Any]]) -> int:
+        """Compatibility helper: mark missing CSV comments deleted; never remove rows."""
         if not removed:
             return 0
         _notes_path, comments_path = self._csv_paths()
         headers, rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        if "评论状态" not in headers:
+            headers.append("评论状态")
         removed_ids = {text(item.get("commentId"), 256) for item in removed if text(item.get("commentId"), 256)}
         removed_exact = {(text(item.get("author"), 500), text(item.get("content"), 8000),
                           text(item.get("publishedAt"), 100)) for item in removed}
-        kept: list[dict[str, Any]] = []
-        deleted = 0
+        marked = 0
         for row in rows:
             belongs = csv_comment_note_id(row) == note_id
             row_id = text(row.get("笔记评论ID"), 256)
             row_key = (text(row.get("用户昵称"), 500), text(row.get("评论内容"), 8000),
                        text(row.get("评论时间"), 100))
             if belongs and (row_id in removed_ids or row_key in removed_exact):
-                deleted += 1
+                if comment_status_label(row.get("评论状态")) != COMMENT_STATUS_DELETED:
+                    marked += 1
+                row["评论状态"] = COMMENT_STATUS_DELETED
+        if marked:
+            self._replace_csv_table(comments_path, headers, rows, "comment-mark-deleted")
+        return marked
+
+    def _mark_missing_comments_deleted(
+        self, note_id: str, current_ids: list[str], checked_at: str
+    ) -> int:
+        """Soft-delete IDs absent from one trusted complete snapshot and update their payloads."""
+        with self.lock, self._session() as db:
+            if current_ids:
+                placeholders = ",".join("?" for _ in current_ids)
+                marked = db.execute(
+                    f"""UPDATE comments SET comment_status=?,is_deleted=1,
+                        deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                        last_presence_checked_at=?
+                        WHERE note_id=? AND is_deleted=0 AND comment_id NOT IN ({placeholders})""",
+                    (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id, *current_ids),
+                ).rowcount
             else:
-                kept.append(row)
-        if deleted:
-            self._replace_csv_table(comments_path, headers, kept, "comment-prune")
-        return deleted
+                marked = db.execute(
+                    """UPDATE comments SET comment_status=?,is_deleted=1,
+                       deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                       last_presence_checked_at=? WHERE note_id=? AND is_deleted=0""",
+                    (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id),
+                ).rowcount
+            if marked:
+                rows = db.execute(
+                    """SELECT comment_id,payload_json,deleted_at,last_presence_checked_at FROM comments
+                       WHERE note_id=? AND is_deleted=1 AND last_presence_checked_at=?""",
+                    (note_id, checked_at),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        deleted_payload = json.loads(row["payload_json"] or "{}")
+                        if not isinstance(deleted_payload, dict):
+                            deleted_payload = {}
+                    except (TypeError, ValueError):
+                        deleted_payload = {}
+                    deleted_payload.update({
+                        "commentId": str(row["comment_id"]), "noteId": note_id,
+                        "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
+                        "deletedAt": str(row["deleted_at"] or checked_at),
+                        "lastPresenceCheckedAt": str(row["last_presence_checked_at"] or checked_at),
+                        "presenceReason": "snapshot_missing", "presenceReasonAt": checked_at,
+                    })
+                    db.execute(
+                        "UPDATE comments SET payload_json=? WHERE comment_id=?",
+                        (json.dumps(deleted_payload, ensure_ascii=False), row["comment_id"]),
+                    )
+        return int(marked)
 
     def sync_comment_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Apply a reviewed comment delta to SQLite, Excel and comments.json."""
+        """Apply one all-or-nothing note/comment snapshot across every local store."""
+        validate_snapshot_identity(payload)
+        note_id = valid_note_id(payload.get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
+        with self.pull_lock:
+            checkpoint = self._capture_sync_checkpoint(note_id)
+            try:
+                result = self._sync_comment_snapshot_unchecked(payload)
+            except Exception as exc:
+                rollback_errors = self._rollback_sync_checkpoints([checkpoint])
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"同步失败且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    ) from exc
+                raise
+            self._discard_sync_checkpoint(checkpoint)
+            return result
+
+    def _sync_comment_snapshot_unchecked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Unchecked implementation; public callers use the rollback wrapper above."""
         note_id = valid_note_id(payload.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
@@ -2310,69 +3644,127 @@ class MonitorStore:
         if not isinstance(comments, list):
             raise ValueError("comments must be an array")
         with self.pull_lock:
-            comparison = self.compare_comments(payload)
+            self._normalize_csv_cross_store_fields()
             comments = self._normalize_snapshot_comments(note_id, comments)
+            comparison = self._compare_normalized_comments({**payload, "comments": comments}, note_id, comments)
             with self.lock, self._session() as db:
                 stored = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
             if stored is None:
                 raise ValueError("帖子尚未写入本地数据库")
             stored_row = dict(stored)
+            pull_status = text(stored_row.get("pull_status"), 30) or "not_started"
+            if pull_status in {"synced", "partial", "failed"}:
+                pull_status = "synced" if comparison["canPrune"] and stored_row.get("media_status") == "complete" else "partial"
             try:
                 stored_payload = json.loads(stored_row.get("payload_json") or "{}")
                 if not isinstance(stored_payload, dict):
                     stored_payload = {}
             except (TypeError, ValueError):
                 stored_payload = {}
-            incoming_note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
-            note = {**stored_payload, **incoming_note, "noteId": note_id}
+            incoming_note = browser_note_payload(payload.get("note"))
+            note = {**browser_note_payload(stored_payload), **incoming_note, "noteId": note_id}
+            if text(incoming_note.get("publishedAt"), 100):
+                # A live sync is a new observation even when the rounded label
+                # is still "7 days ago". Older clients may omit the clock.
+                note["timeObservedAt"] = text(incoming_note.get("timeObservedAt"), 80) or text(payload.get("collectedAt"), 80) or now_iso()
+                note["timeReferenceSource"] = "capture"
+            note = enrich_time_payload(note, now_iso(), previous=stored_payload)
+            if "tags" in incoming_note:
+                note["tags"] = canonical_tag_items(incoming_note.get("tags")) or (
+                    ["无话题"] if tag_text(incoming_note.get("tags")) == "无话题" else note.get("tags", [])
+                )
             for field, column in (("url", "url"), ("title", "title"), ("content", "content"), ("author", "author")):
                 if not note.get(field):
                     note[field] = stored_row.get(column) or ""
+            note["title"] = canonical_note_title(note.get("title"), note.get("content"), 80)
             media_dir = text(stored_row.get("media_dir"), 4000)
             media_files = sorted(item.name for item in Path(media_dir).iterdir() if item.is_file()) if media_dir and Path(media_dir).is_dir() else []
             media_result = {"folder": media_dir, "files": media_files}
             upserted = self.upsert_comments({
                 "noteId": note_id, "comments": comments,
                 "expectedCount": comparison["expectedCount"],
-                "status": text(payload.get("status"), 30) or "partial",
+                "status": comparison["status"],
+                "collectionEvidence": payload.get("collectionEvidence"),
+                "explicitEmptyVerified": payload.get("explicitEmptyVerified"),
                 "collectedAt": now_iso(),
             })
             xlsx_result = self._sync_pull_to_xlsx(
                 note, comments, media_result, replace_comments=bool(comparison["canPrune"])
             )
             removed = comparison["removedComments"] if comparison["canPrune"] else []
-            excel_removed = int(xlsx_result.get("commentRemoved", 0) or 0)
+            excel_removed = int(xlsx_result.get("commentMarkedDeleted", 0) or 0)
             current_ids = [text(item.get("commentId"), 256) for item in comments if text(item.get("commentId"), 256)]
+            checked_at = now_iso()
+            deleted_marked = 0
             with self.lock, self._session() as db:
                 if comparison["canPrune"]:
                     if current_ids:
                         placeholders = ",".join("?" for _ in current_ids)
-                        db.execute(f"DELETE FROM comments WHERE note_id=? AND comment_id NOT IN ({placeholders})",
-                                   (note_id, *current_ids))
+                        deleted_marked = db.execute(
+                            f"""UPDATE comments SET comment_status=?,is_deleted=1,
+                                deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                                last_presence_checked_at=?
+                                WHERE note_id=? AND is_deleted=0 AND comment_id NOT IN ({placeholders})""",
+                            (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id, *current_ids),
+                        ).rowcount
                     else:
-                        db.execute("DELETE FROM comments WHERE note_id=?", (note_id,))
-                count = int(db.execute("SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)).fetchone()[0])
-                checked_at = now_iso()
+                        deleted_marked = db.execute(
+                            """UPDATE comments SET comment_status=?,is_deleted=1,
+                               deleted_at=CASE WHEN deleted_at='' THEN ? ELSE deleted_at END,
+                               last_presence_checked_at=? WHERE note_id=? AND is_deleted=0""",
+                            (COMMENT_STATUS_DELETED, checked_at, checked_at, note_id),
+                        ).rowcount
+                if comparison["canPrune"] and deleted_marked:
+                    newly_deleted_rows = db.execute(
+                        """SELECT comment_id,payload_json,deleted_at,last_presence_checked_at FROM comments
+                           WHERE note_id=? AND is_deleted=1 AND last_presence_checked_at=?""",
+                        (note_id, checked_at),
+                    ).fetchall()
+                    for deleted_row in newly_deleted_rows:
+                        try:
+                            deleted_payload = json.loads(deleted_row["payload_json"] or "{}")
+                            if not isinstance(deleted_payload, dict):
+                                deleted_payload = {}
+                        except (TypeError, ValueError):
+                            deleted_payload = {}
+                        deleted_payload.update({
+                            "commentId": str(deleted_row["comment_id"]), "noteId": note_id,
+                            "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
+                            "deletedAt": str(deleted_row["deleted_at"] or checked_at),
+                            "lastPresenceCheckedAt": str(deleted_row["last_presence_checked_at"] or checked_at),
+                            "presenceReason": "snapshot_missing", "presenceReasonAt": checked_at,
+                        })
+                        db.execute("UPDATE comments SET payload_json=? WHERE comment_id=?",
+                                   (json.dumps(deleted_payload, ensure_ascii=False), deleted_row["comment_id"]))
+                count = int(db.execute(
+                    "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+                ).fetchone()[0])
                 db.execute(
-                    """UPDATE notes SET comment_count_collected=?,comment_collection_status=?,last_comment_collected_at=?,
+                    """UPDATE notes SET comment_count_collected=?,comment_collection_status=?,pull_status=?,last_comment_collected_at=?,
                        access_status='ok',access_error='',last_access_checked_at=?,access_check_result='opened',
+                       post_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?,
                        title=CASE WHEN ?<>'' THEN ? ELSE title END,
                        content=CASE WHEN ?<>'' THEN ? ELSE content END,
                        author=CASE WHEN ?<>'' THEN ? ELSE author END,
                        url=CASE WHEN ?<>'' THEN ? ELSE url END,
+                       keyword=CASE WHEN ?<>'' THEN ? ELSE keyword END,
+                       tags=CASE WHEN ?<>'' THEN ? ELSE tags END,
+                       post_sentiment=CASE WHEN ?<>'' THEN ? ELSE post_sentiment END,
                        payload_json=?,last_seen_at=?
                        WHERE note_id=?""",
-                    (count, "likely_complete" if comparison["canPrune"] else text(payload.get("status"), 30) or "partial",
-                     checked_at, checked_at,
+                    (count, comparison["status"], pull_status,
+                     checked_at, checked_at, POST_STATUS_PRESENT, checked_at,
                      text(note.get("title"), 1000), text(note.get("title"), 1000),
                      text(note.get("content"), 20000), text(note.get("content"), 20000),
                      text(note.get("author"), 500), text(note.get("author"), 500),
                      text(note.get("url"), 4000), text(note.get("url"), 4000),
+                     text(note.get("keyword"), 200), text(note.get("keyword"), 200),
+                     tag_text(note.get("tags")), tag_text(note.get("tags")),
+                     text(note.get("postSentiment"), 80), text(note.get("postSentiment"), 80),
                      json.dumps(note, ensure_ascii=False), checked_at, note_id),
                 )
-            all_local_comments = self._comments_as_api(note_id)
             if media_dir:
-                self._write_media_snapshot(media_result, note, all_local_comments)
+                self._refresh_material_snapshot_for_note(note_id)
             consistency = self._verify_note_store_consistency(note_id, media_dir)
             change_result = self._record_comment_change_events(
                 note_id,
@@ -2388,10 +3780,14 @@ class MonitorStore:
             )
             return {
                 "ok": True, "noteId": note_id, "status": "latest",
+                "pullStatus": pull_status, "commentStatus": comparison["status"],
+                "postStatus": POST_STATUS_PRESENT, "isDeleted": False,
                 "newCount": comparison["newCount"], "removedCount": len(removed),
                 "changedCount": comparison["changedCount"], "collectedCount": count,
                 "excelAdded": int(xlsx_result.get("commentAdded", 0) or 0),
-                "excelRemoved": excel_removed, "canPrune": comparison["canPrune"],
+                "excelRemoved": excel_removed, "commentsMarkedDeleted": deleted_marked,
+                "canPrune": comparison["canPrune"],
+                "currentCount": comparison["currentCount"], "pendingRemovedCount": comparison["pendingRemovedCount"],
                 "storesSynced": ["notes_csv", "comments_csv", "sqlite"] + (["materials"] if media_dir else []),
                 "consistencyVerified": True, "consistency": consistency,
                 "runId": note_change_result.get("runId") or change_result.get("runId", 0),
@@ -2405,7 +3801,7 @@ class MonitorStore:
         if not note_id:
             raise ValueError("noteId is required")
         timestamp = now_iso()
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             if not db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone():
                 raise ValueError("帖子尚未写入本地数据库")
             db.execute("UPDATE notes SET comment_collection_status='collecting' WHERE note_id=?", (note_id,))
@@ -2415,13 +3811,14 @@ class MonitorStore:
             )
         return {"ok": True, "jobId": cursor.lastrowid, "noteId": note_id, "status": "collecting"}
 
-    def list_comments(self, note_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    def list_comments(self, note_id: str, limit: int = 500, include_deleted: bool = True) -> list[dict[str, Any]]:
         note_id = valid_note_id(note_id)
         if not note_id:
             return []
+        where = "note_id=?" if include_deleted else "note_id=? AND is_deleted=0"
         with self.lock, self._session() as db:
             rows = db.execute(
-                "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT ?",
+                f"SELECT * FROM comments WHERE {where} ORDER BY first_seen_at LIMIT ?",
                 (note_id, max(1, min(int(limit), 10000))),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -2545,10 +3942,13 @@ class MonitorStore:
                 "SELECT priority,reason,created_at,updated_at FROM watchlist WHERE note_id=?", (note_id,)
             ).fetchone() if row is not None else None
             comment_rows = db.execute(
-                "SELECT * FROM comments WHERE note_id=? ORDER BY first_seen_at LIMIT 12", (note_id,)
+                "SELECT * FROM comments WHERE note_id=? AND is_deleted=0 ORDER BY first_seen_at LIMIT 12", (note_id,)
             ).fetchall() if row is not None else []
             comment_count = int(db.execute(
-                "SELECT COUNT(*) FROM comments WHERE note_id=?", (note_id,)
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+            ).fetchone()[0]) if row is not None else 0
+            deleted_comment_count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=1", (note_id,)
             ).fetchone()[0]) if row is not None else 0
         if row is None:
             return {"ok": True, "noteId": note_id, "found": False, "inExcel": False,
@@ -2603,6 +4003,14 @@ class MonitorStore:
             "postSentiment": sentiment_label(item.get("post_sentiment")) if item.get("post_sentiment") else "",
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
+            "postStatus": post_status_label(item.get("post_status"), item.get("is_deleted")),
+            "isDeleted": bool(item.get("is_deleted")),
+            "deletedAt": item.get("deleted_at") or "",
+            "lastPresenceCheckedAt": item.get("last_presence_checked_at") or "",
+            "semanticAnalysisCount": int(item.get("semantic_analysis_count") or 0),
+            "analysisIsNegative": item.get("analysis_is_negative") or "",
+            "negativeType": item.get("negative_type") or "",
+            "negativeSubtype": item.get("negative_subtype") or "",
         }
         comments: list[dict[str, Any]] = []
         for comment_row in comment_rows:
@@ -2619,6 +4027,8 @@ class MonitorStore:
                 "author": stored.get("author") or payload.get("author") or "",
                 "content": stored.get("content") or payload.get("content") or "",
                 "publishedAt": stored.get("published_at") or payload.get("publishedAt") or "",
+                "commentStatus": comment_status_label(stored.get("comment_status"), stored.get("is_deleted")),
+                "isDeleted": bool(stored.get("is_deleted")),
             })
         return {
             "ok": True, "noteId": note_id, "found": True, "status": item.get("status", "new"),
@@ -2629,11 +4039,18 @@ class MonitorStore:
             "relevanceConfidence": float(item.get("relevance_confidence") or 0),
             "note": stored_note, "mediaDir": media_dir, "mediaFiles": media_files,
             "excelPath": item.get("excel_sync_path") or (str(self.seed_xlsx_path) if self.seed_xlsx_path else ""),
-            "excelRow": excel_row, "commentCount": comment_count, "commentRows": comments,
+            "excelRow": excel_row, "commentCount": comment_count,
+            "deletedCommentCount": deleted_comment_count,
+            "totalHistoricalCommentCount": comment_count + deleted_comment_count,
+            "commentRows": comments,
             "aiStatus": item.get("ai_analysis_status") or "",
             "accessStatus": item.get("access_status") or "",
             "accessError": item.get("access_error") or "",
             "lastAccessCheckedAt": item.get("last_access_checked_at") or "",
+            "postStatus": post_status_label(item.get("post_status"), item.get("is_deleted")),
+            "isDeleted": bool(item.get("is_deleted")),
+            "deletedAt": item.get("deleted_at") or "",
+            "lastPresenceCheckedAt": item.get("last_presence_checked_at") or "",
             "watched": bool(watch_row),
             "watchPriority": watch_row["priority"] if watch_row else "",
             "watchReason": watch_row["reason"] if watch_row else "",
@@ -2705,7 +4122,7 @@ class MonitorStore:
         content = text(note.get("content"), 12000)
         tags = tag_text(note.get("tags"))
         title_key, content_key, combined_key = identity_keys(title, content)
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             db.execute(
                 """INSERT INTO notes (note_id,url,title,author,content,tags,keyword,page_url,first_seen_at,last_seen_at,
                    status,is_relevant,source,title_key,content_key,title_content_key,payload_json,relevance_status)
@@ -2743,7 +4160,7 @@ class MonitorStore:
         reason = text(raw.get("reason"), 2000)
         decision = {"status": relevance_status, "confidence": confidence, "reason": reason, "analyzedAt": timestamp,
                     "matchedTopics": raw.get("matched_topics") if isinstance(raw.get("matched_topics"), list) else []}
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             db.execute("""UPDATE notes SET relevance_status=?,relevance_source='ai',relevance_reason=?,
                        relevance_confidence=?,relevance_analyzed_at=?,is_relevant=?,status=? WHERE note_id=?""",
                        (relevance_status, reason, confidence, timestamp, int(relevance_status == "relevant"),
@@ -2769,7 +4186,7 @@ class MonitorStore:
         target_id = text(target_id, 256)
         table, key = ("notes", "note_id") if target_type == "note" else ("comments", "comment_id")
         timestamp = now_iso()
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             if not db.execute(f"SELECT 1 FROM {table} WHERE {key}=?", (target_id,)).fetchone():
                 raise ValueError("分析对象不存在")
             if force:
@@ -3192,70 +4609,179 @@ class MonitorStore:
                 "ai_confidence": confidence, "needs_attention": int(bool(value.get("needs_attention"))),
                 "suggested_action": text(value.get("suggested_action"), 1000)}
 
+    def _publish_ai_results(self, entries: list[dict[str, Any]], model: str, request: Any) -> None:
+        """Publish one model response under the existing cross-store rollback contract."""
+        with self.pull_lock, self.lock:
+            prepared: list[dict[str, Any]] = []
+            media_by_note: dict[str, str] = {}
+            comment_note_ids: set[str] = set()
+            with self._session() as db:
+                for entry in entries:
+                    job, before = entry["job"], entry["row"]
+                    target_type, target_id = str(job["target_type"]), str(job["target_id"])
+                    table, key, sentiment_column = ("notes", "note_id", "post_sentiment") \
+                        if target_type == "note" else ("comments", "comment_id", "sentiment")
+                    current = db.execute(f"SELECT * FROM {table} WHERE {key}=?", (target_id,)).fetchone()
+                    note = current if target_type == "note" else db.execute(
+                        "SELECT * FROM notes WHERE note_id=?", (before["note_id"],)
+                    ).fetchone()
+                    if current is None or note is None or current["is_deleted"] or note["is_deleted"] or post_status_label(
+                        note["post_status"], note["is_deleted"]
+                    ) == POST_STATUS_DELETED or (target_type == "comment" and comment_status_label(
+                        current["comment_status"], current["is_deleted"]
+                    ) == COMMENT_STATUS_DELETED):
+                        raise AIServiceError("分析对象已不存在或已删除", "missing_target", False)
+                    fields = ("note_id", "first_seen_at", "content_hash", "content", "author", "deleted_at") + (
+                        ("title", "tags") if target_type == "note" else ("parent_comment_id",)
+                    )
+                    if any(current[field] != before[field] for field in fields) or (
+                        target_type == "comment" and any(
+                            note[field] != entry["context"][field]
+                            for field in ("first_seen_at", "title", "ai_summary", "deleted_at")
+                        )
+                    ):
+                        raise AIServiceError("分析期间对象或帖子上下文已变化，请重新分析", "stale_target", True)
+                    active_job = db.execute("SELECT * FROM ai_jobs WHERE id=?", (job["id"],)).fetchone()
+                    if active_job is None or active_job["target_type"] != target_type \
+                            or active_job["target_id"] != target_id \
+                            or active_job["status"] not in {"queued", "analyzing"}:
+                        raise AIServiceError("分析任务已取消或被替换", "stale_job", False)
+                    # Imported labels without AI provenance, reviewed labels and
+                    # edits made during the request remain authoritative. Review,
+                    # manual-negative, semantic and presence fields are not written.
+                    preserve_sentiment = bool(current["manual_negative"]) \
+                        or current["review_status"] != "pending_review" \
+                        or current[sentiment_column] != before[sentiment_column] \
+                        or bool(current[sentiment_column] and not current["last_ai_analyzed_at"])
+                    prepared.append({
+                        **entry, "table": table, "key": key, "sentiment_column": sentiment_column,
+                        "sentiment": current[sentiment_column] if preserve_sentiment else entry["result"]["sentiment"],
+                    })
+                    media_by_note[str(note["note_id"])] = text(note["media_dir"], 4000)
+                    if target_type == "comment":
+                        comment_note_ids.add(str(note["note_id"]))
+
+            checkpoints: list[dict[str, Any]] = []
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(media_by_note)):
+                    checkpoints.append(self._capture_sync_checkpoint(note_id, capture_csv=index == 0))
+                mutation_started = True
+                timestamp = now_iso()
+                with self._session() as db:
+                    for entry in prepared:
+                        result, job = entry["result"], entry["job"]
+                        db.execute(
+                            f"""UPDATE {entry['table']} SET {entry['sentiment_column']}=?,is_negative=?,risk_level=?,
+                               issue_categories=?,ai_summary=?,ai_reason=?,ai_confidence=?,needs_attention=?,suggested_action=?,
+                               last_ai_analyzed_at=? WHERE {entry['key']}=?""",
+                            (entry["sentiment"], result["is_negative"], result["risk_level"], result["issue_categories"],
+                             result["ai_summary"], result["ai_reason"], result["ai_confidence"], result["needs_attention"],
+                             result["suggested_action"], timestamp, job["target_id"]),
+                        )
+                    for note_id in comment_note_ids:
+                        db.execute(
+                            """UPDATE notes SET negative_comment_count=(SELECT COUNT(*) FROM comments
+                               WHERE note_id=? AND is_deleted=0 AND is_negative=1 AND ai_confidence>=0.85)
+                               WHERE note_id=?""", (note_id, note_id),
+                        )
+                notes_path, comments_path = self._csv_paths()
+                note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+                labels = {(str(entry["job"]["target_type"]), str(entry["job"]["target_id"])):
+                          persisted_sentiment_label(entry["sentiment"]) for entry in prepared}
+                for target_type, rows, id_header in (
+                    ("note", note_rows, "笔记ID"), ("comment", comment_rows, "笔记评论ID")
+                ):
+                    for row in rows:
+                        identity = (target_type, text(row.get(id_header), 256))
+                        if identity in labels:
+                            row["AI情绪判断"] = labels[identity]
+                            if target_type == "note":
+                                row["帖子好坏"] = labels[identity]
+                # Do not use the legacy best-effort AI CSV writer: it swallows
+                # replacement failures. These existing primitives propagate them.
+                self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "ai-publication")
+                for note_id in sorted(media_by_note):
+                    self._refresh_material_snapshot_for_note(note_id)
+                for note_id, media_dir in sorted(media_by_note.items()):
+                    self._verify_note_store_consistency(note_id, media_dir, verify_fields=True)
+                # Checkpoints cover note/comment data, not AI history/jobs. Keep
+                # every terminal write in this final transaction after verification.
+                with self._session() as db:
+                    for entry in prepared:
+                        job = entry["job"]
+                        db.execute(
+                            f"UPDATE {entry['table']} SET ai_analysis_status='completed' WHERE {entry['key']}=?",
+                            (job["target_id"],),
+                        )
+                        db.execute(
+                            """INSERT INTO ai_analysis_records(target_type,target_id,model,request_json,response_json,status,created_at)
+                               VALUES(?,?,?,?,?,'completed',?)""",
+                            (job["target_type"], job["target_id"], model, json.dumps(request, ensure_ascii=False),
+                             json.dumps(entry["result"], ensure_ascii=False), timestamp),
+                        )
+                        db.execute("UPDATE ai_jobs SET status='completed',last_error='',updated_at=? WHERE id=?",
+                                   (timestamp, job["id"]))
+            except Exception as exc:
+                if mutation_started:
+                    failures = self._rollback_sync_checkpoints(checkpoints)
+                    if failures:
+                        raise AIServiceError("AI 结果发布回滚未完成：" + "；".join(failures),
+                                             "publication_rollback_failed", False) from exc
+                else:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                raise AIServiceError("AI 结果发布失败，已保留原数据，请重试：" + text(exc, 1000),
+                                     "publication_failed", True) from exc
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+
     def _run_ai_job(self, job: sqlite3.Row) -> None:
         target_type, target_id = str(job["target_type"]), str(job["target_id"])
         table, key = ("notes", "note_id") if target_type == "note" else ("comments", "comment_id")
         settings = self.ai_settings.get(True)
         if not settings.get("configured"):
             raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             row = db.execute(f"SELECT * FROM {table} WHERE {key}=?", (target_id,)).fetchone()
-            if row is None:
-                raise AIServiceError("分析对象已不存在", "missing_target", False)
+            if row is None or row["is_deleted"] or (target_type == "note" and post_status_label(
+                row["post_status"], row["is_deleted"]
+            ) == POST_STATUS_DELETED) or (target_type == "comment" and comment_status_label(
+                row["comment_status"], row["is_deleted"]
+            ) == COMMENT_STATUS_DELETED):
+                raise AIServiceError("分析对象已不存在或已删除", "missing_target", False)
             context: dict[str, Any] = {}
             if target_type == "comment":
-                note = db.execute("SELECT title,ai_summary FROM notes WHERE note_id=?", (row["note_id"],)).fetchone()
-                context = dict(note) if note else {}
+                note = db.execute("SELECT * FROM notes WHERE note_id=?", (row["note_id"],)).fetchone()
+                if note is None or note["is_deleted"] or post_status_label(note["post_status"], note["is_deleted"]) == POST_STATUS_DELETED:
+                    raise AIServiceError("评论所属帖子已不存在或已删除", "missing_target", False)
+                context = dict(note)
             db.execute(f"UPDATE {table} SET ai_analysis_status='analyzing' WHERE {key}=?", (target_id,))
         messages = self._analysis_prompt(target_type, row, context)
         result = self._normalized_analysis(self.ai_client.complete_json(settings, messages))
-        timestamp = now_iso()
-        with self.lock, self._session() as db:
-            db.execute(
-                f"""UPDATE {table} SET ai_analysis_status='completed', sentiment=sentiment WHERE 0"""
-                if target_type == "comment" else "SELECT 1"
-            )
-            sentiment_column = "sentiment" if target_type == "comment" else "post_sentiment"
-            db.execute(
-                f"""UPDATE {table} SET ai_analysis_status='completed',{sentiment_column}=?,is_negative=?,risk_level=?,
-                    issue_categories=?,ai_summary=?,ai_reason=?,ai_confidence=?,needs_attention=?,suggested_action=?,
-                    last_ai_analyzed_at=? WHERE {key}=?""",
-                (result["sentiment"], result["is_negative"], result["risk_level"], result["issue_categories"],
-                 result["ai_summary"], result["ai_reason"], result["ai_confidence"], result["needs_attention"],
-                 result["suggested_action"], timestamp, target_id),
-            )
-            db.execute(
-                """INSERT INTO ai_analysis_records(target_type,target_id,model,request_json,response_json,status,created_at)
-                   VALUES(?,?,?,?,?,'completed',?)""",
-                (target_type, target_id, settings["model"], json.dumps(messages, ensure_ascii=False),
-                 json.dumps(result, ensure_ascii=False), timestamp),
-            )
-            db.execute("UPDATE ai_jobs SET status='completed',updated_at=? WHERE id=?", (timestamp, job["id"]))
-            if target_type == "comment":
-                db.execute(
-                    """UPDATE notes SET negative_comment_count=(SELECT COUNT(*) FROM comments
-                       WHERE note_id=? AND is_negative=1 AND ai_confidence>=0.85) WHERE note_id=?""",
-                    (row["note_id"], row["note_id"]),
-                )
-        try:
-            self._sync_ai_result_to_xlsx(target_type, target_id, result)
-        except Exception:
-            # SQLite remains the source of truth. A later pull/open can reconcile
-            # Excel when the workbook was temporarily locked by desktop Excel.
-            pass
+        self._publish_ai_results([
+            {"job": job, "row": row, "context": context, "result": result}
+        ], settings["model"], messages)
 
     def _run_comment_batch(self, jobs: list[sqlite3.Row]) -> None:
         settings = self.ai_settings.get(True)
+        if not settings.get("configured"):
+            raise AIServiceError("DeepSeek API Key 未配置", "not_configured", False)
         rows: dict[str, sqlite3.Row] = {}
+        contexts: dict[str, dict[str, Any]] = {}
         inputs: list[dict[str, Any]] = []
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             for job in jobs:
                 target_id = str(job["target_id"])
                 row = db.execute("SELECT * FROM comments WHERE comment_id=?", (target_id,)).fetchone()
-                if row is None:
-                    continue
-                note = db.execute("SELECT title,ai_summary FROM notes WHERE note_id=?", (row["note_id"],)).fetchone()
+                if row is None or row["is_deleted"] or comment_status_label(row["comment_status"], row["is_deleted"]) == COMMENT_STATUS_DELETED:
+                    raise AIServiceError("评论分析对象已不存在或已删除", "missing_target", False)
+                note = db.execute("SELECT * FROM notes WHERE note_id=?", (row["note_id"],)).fetchone()
+                if note is None or note["is_deleted"] or post_status_label(note["post_status"], note["is_deleted"]) == POST_STATUS_DELETED:
+                    raise AIServiceError("评论所属帖子已不存在或已删除", "missing_target", False)
                 rows[target_id] = row
+                contexts[target_id] = dict(note)
                 inputs.append({"target_id": target_id, "content": row["content"], "author": row["author"],
                                "parent_comment_id": row["parent_comment_id"], "post_title": note["title"] if note else "",
                                "post_summary": note["ai_summary"] if note else ""})
@@ -3280,34 +4806,15 @@ class MonitorStore:
         if not isinstance(result_list, list):
             raise AIServiceError("批量评论分析缺少 results 数组", "invalid_response", True)
         by_id = {text(item.get("target_id"), 256): item for item in result_list if isinstance(item, dict)}
-        timestamp = now_iso()
-        with self.lock, self._session() as db:
-            for job in jobs:
-                target_id = str(job["target_id"])
-                row = rows.get(target_id)
-                item = by_id.get(target_id)
-                if row is None or item is None:
-                    raise AIServiceError(f"批量结果缺少 {target_id}", "invalid_response", True)
-                result = self._normalized_analysis(item)
-                db.execute(
-                    """UPDATE comments SET ai_analysis_status='completed',sentiment=?,is_negative=?,risk_level=?,
-                       issue_categories=?,ai_summary=?,ai_reason=?,ai_confidence=?,needs_attention=?,suggested_action=?,
-                       last_ai_analyzed_at=? WHERE comment_id=?""",
-                    (result["sentiment"], result["is_negative"], result["risk_level"], result["issue_categories"],
-                     result["ai_summary"], result["ai_reason"], result["ai_confidence"], result["needs_attention"],
-                     result["suggested_action"], timestamp, target_id),
-                )
-                db.execute(
-                    """INSERT INTO ai_analysis_records(target_type,target_id,model,request_json,response_json,status,created_at)
-                       VALUES('comment',?,?,?,?,'completed',?)""",
-                    (target_id, settings["model"], json.dumps(inputs, ensure_ascii=False), json.dumps(result, ensure_ascii=False), timestamp),
-                )
-                db.execute("UPDATE ai_jobs SET status='completed',updated_at=? WHERE id=?", (timestamp, job["id"]))
-                db.execute(
-                    """UPDATE notes SET negative_comment_count=(SELECT COUNT(*) FROM comments
-                       WHERE note_id=? AND is_negative=1 AND ai_confidence>=0.85) WHERE note_id=?""",
-                    (row["note_id"], row["note_id"]),
-                )
+        entries: list[dict[str, Any]] = []
+        for job in jobs:
+            target_id = str(job["target_id"])
+            item = by_id.get(target_id)
+            if item is None:
+                raise AIServiceError(f"批量结果缺少 {target_id}", "invalid_response", True)
+            entries.append({"job": job, "row": rows[target_id], "context": contexts[target_id],
+                            "result": self._normalized_analysis(item)})
+        self._publish_ai_results(entries, settings["model"], inputs)
 
     def _ai_worker_loop(self) -> None:
         cooldowns = (5, 30, 120)
@@ -3407,7 +4914,7 @@ class MonitorStore:
         if target_type not in {"note", "comment"} or status not in allowed:
             raise ValueError("无效的复核操作")
         table, key = ("notes", "note_id") if target_type == "note" else ("comments", "comment_id")
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             manual_negative = int(bool(payload.get("manualNegative")))
             updated = db.execute(
                 f"UPDATE {table} SET review_status=?,review_note=?,manual_negative=CASE WHEN ? THEN 1 ELSE manual_negative END WHERE {key}=?",
@@ -3436,6 +4943,7 @@ class MonitorStore:
             pull_rows = db.execute(
                 "SELECT pull_status, COUNT(*) AS count FROM notes WHERE source<>'existing_xlsx' GROUP BY pull_status"
             ).fetchall()
+            deleted_posts = int(db.execute("SELECT COUNT(*) FROM notes WHERE is_deleted=1").fetchone()[0])
         by_status = {str(row["status"]): int(row["count"]) for row in rows}
         inbox = by_status.get("new", 0)
         archive = by_status.get("known", 0)
@@ -3459,6 +4967,8 @@ class MonitorStore:
                 "libraryTotal": archive + monitored,
                 "discoveryTotal": inbox + ignored,
                 "recordTotal": total,
+                "activePosts": total - deleted_posts,
+                "deletedPosts": deleted_posts,
                 "excelExisting": excel_existing,
                 "excelMissing": excel_missing,
                 "pullByStatus": pull_by_status,
@@ -3467,14 +4977,903 @@ class MonitorStore:
             "db": str(self.db_path),
         }
 
-    def list_notes(self, status: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def list_notes(self, status: str = "", limit: int = 100, include_deleted: bool = True) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit or 100), 1000))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if not include_deleted:
+            clauses.append("is_deleted=0")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.lock, self._session() as db:
-            if status:
-                rows = db.execute("SELECT * FROM notes WHERE status = ? ORDER BY first_seen_at DESC LIMIT ?", (status, limit)).fetchall()
-            else:
-                rows = db.execute("SELECT * FROM notes ORDER BY first_seen_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = db.execute(
+                f"SELECT * FROM notes{where} ORDER BY first_seen_at DESC LIMIT ?", (*params, limit)
+            ).fetchall()
         return [dict(row) for row in rows]
+
+    def _data_overview_snapshot_token(self, snapshot_db=None) -> str:
+        """Fingerprint query data, not SQLite/WAL bookkeeping or file mtimes.
+
+        All notes/comments columns are included: the dynamic field catalogue can
+        expose fields that are not currently visible. Other tables (jobs, logs,
+        receipts and caches) cannot change these SELECT results. CSV/material
+        bytes remain in the fingerprint so external edits still invalidate it.
+        """
+        with self.lock:
+            notes_path, comments_path = self._csv_paths()
+            paths = [notes_path, comments_path]
+            fingerprint = hashlib.sha256()
+
+            def add(value: Any) -> None:
+                fingerprint.update(json.dumps(
+                    self._checkpoint_json_value(value), ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8"))
+                fingerprint.update(b"\n")
+
+            add({"snapshotFormat": 2, "dbPath": str(self.db_path.resolve()).casefold()})
+            db = snapshot_db if snapshot_db is not None else self._connect()
+            try:
+                if snapshot_db is None:
+                    db.execute("PRAGMA query_only=ON")
+                    db.execute("BEGIN")
+                for table, key in (("notes", "note_id"), ("comments", "comment_id")):
+                    add({"table": table, "schema": [tuple(row) for row in db.execute(
+                        f"PRAGMA table_info({table})"
+                    )]})
+                    for row in db.execute(f"SELECT * FROM {table} ORDER BY {key}"):
+                        add(dict(row))
+                material_dirs = [
+                    text(row[0], 4000) for row in db.execute(
+                        "SELECT DISTINCT media_dir FROM notes WHERE TRIM(COALESCE(media_dir,''))<>'' ORDER BY media_dir"
+                    ).fetchall() if text(row[0], 4000)
+                ]
+            finally:
+                if snapshot_db is None:
+                    db.close()
+            for folder in material_dirs:
+                material_root = Path(folder)
+                add({"materialDir": str(material_root.resolve()).casefold(),
+                     "files": sorted(item.name for item in material_root.iterdir() if item.is_file())
+                     if material_root.is_dir() else None})
+                paths.extend(material_root / name for name in ("note.json", "comments.json", "帖子正文.txt"))
+            for path in paths:
+                # Deliberately no stat/mtime cache: same-size edits with a restored
+                # timestamp must still be detected. Missing files have a distinct hash.
+                add({"path": str(path.resolve()).casefold(), "sha256": self._file_sha256(path)})
+            return fingerprint.hexdigest()
+
+    def _validate_data_overview_read_snapshot(self, supplied_token: str, action: str, snapshot_db=None) -> str:
+        """Renew only an already-approved read snapshot after full verification.
+
+        An independent read lease never extends the 30-minute deletion/purge
+        lease. Unknown/revoked tokens still require an explicit schema refresh.
+        """
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at:
+                raise ValueError("一致性快照已过期，请重新校验数据总览")
+            current_token = (self._data_overview_snapshot_token(snapshot_db) if snapshot_db is not None else self._data_overview_snapshot_token())
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                self._data_overview_read_renewals.pop(supplied_token, None)
+                raise ValueError(f"本地数据已变化，请重新校验后再{action}")
+            read_issued_at = self._data_overview_read_renewals.get(supplied_token, issued_at)
+            if time.time() - read_issued_at >= 1800:
+                health = self.data_health()
+                if health.get("summary", {}).get("relationshipsConsistent") is not True or any(
+                    item.get("severity") == "critical" for item in health.get("issues", [])
+                ):
+                    self._data_overview_approved_tokens.pop(supplied_token, None)
+                    self._data_overview_read_renewals.pop(supplied_token, None)
+                    raise ValueError("一致性快照自动复核未通过，请更新数据并检查数据体检")
+                if (self._data_overview_snapshot_token(snapshot_db) if snapshot_db is not None else self._data_overview_snapshot_token()) != supplied_token:
+                    self._data_overview_approved_tokens.pop(supplied_token, None)
+                    self._data_overview_read_renewals.pop(supplied_token, None)
+                    raise ValueError(f"本地数据已变化，请重新校验后再{action}")
+                self._data_overview_read_renewals[supplied_token] = time.time()
+            return current_token
+
+    def normalize_publication_storage(self) -> dict[str, Any]:
+        """Backfill time projections without modifying raw dates, identities or presence.
+
+        Only real collection timestamps are used for historical relative labels.
+        Repeated schema refreshes reuse the persisted observation instant. The
+        existing per-note journal protects CSV, SQLite and material JSON together.
+        """
+        with self.pull_lock, self.lock:
+            notes_path, comments_path = self._csv_paths()
+            note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            csv_ids = {valid_note_id(row.get("笔记ID")) for row in note_rows}
+            with self._session() as db:
+                notes = [dict(row) for row in db.execute("SELECT * FROM notes")]
+                comments = [dict(row) for row in db.execute("SELECT * FROM comments")]
+
+            def payload_of(row: dict[str, Any]) -> dict[str, Any]:
+                try:
+                    value = json.loads(row.get("payload_json") or "{}")
+                    return value if isinstance(value, dict) else {}
+                except (TypeError, ValueError):
+                    return {}
+
+            normalized_notes: dict[str, dict[str, Any]] = {}
+            normalized_comments: dict[str, tuple[str, dict[str, Any]]] = {}
+            changed_ids: set[str] = set()
+            note_updates: dict[str, dict[str, Any]] = {}
+            comment_updates: dict[str, dict[str, Any]] = {}
+            for row in notes:
+                note_id = str(row["note_id"])
+                if note_id not in csv_ids:
+                    continue
+                old = payload_of(row)
+                reference = latest_observation_reference(
+                    row.get("last_comment_collected_at"), row.get("last_pull_at")
+                ) or text(row.get("first_seen_at"), 80)
+                normalized = enrich_time_payload(old, reference, reference_source="historical_collection")
+                normalized_notes[note_id] = normalized
+                if old != normalized:
+                    note_updates[note_id] = normalized
+                    changed_ids.add(note_id)
+            for row in comments:
+                note_id, comment_id = str(row["note_id"]), str(row["comment_id"])
+                if note_id not in normalized_notes:
+                    continue
+                old = payload_of(row)
+                source = {**old, "publishedAt": text(row.get("published_at"), 100)}
+                normalized = enrich_time_payload(
+                    source, row.get("last_seen_at") or row.get("first_seen_at"),
+                    kind="comment", reference_source="historical_collection",
+                )
+                normalized_comments[comment_id] = (note_id, normalized)
+                if old != normalized:
+                    comment_updates[comment_id] = normalized
+                    changed_ids.add(note_id)
+            for row in note_rows:
+                note_id = valid_note_id(row.get("笔记ID"))
+                if note_id not in normalized_notes:
+                    continue
+                for key, value in csv_time_fields(normalized_notes[note_id]).items():
+                    if text(row.get(key), 1000) != value:
+                        changed_ids.add(note_id)
+                    row[key] = value
+            for row in comment_rows:
+                comment_id = text(row.get("笔记评论ID"), 256)
+                linked = normalized_comments.get(comment_id)
+                if not linked or csv_comment_note_id(row) != linked[0]:
+                    continue
+                for key, value in csv_time_fields(linked[1], kind="comment").items():
+                    if text(row.get(key), 1000) != value:
+                        changed_ids.add(linked[0])
+                    row[key] = value
+            if not changed_ids:
+                return {"ok": True, "updatedNotes": 0, "updatedComments": 0, "consistencyVerified": True}
+
+            # A time projection must not silently repair or conceal unrelated
+            # drift by overwriting a material snapshot with the SQLite copy.
+            media_dirs = {str(row["note_id"]): text(row.get("media_dir"), 4000) for row in notes}
+            for note_id in sorted(changed_ids):
+                self._verify_note_store_consistency(note_id, media_dirs[note_id], verify_fields=True)
+
+            checkpoints: list[dict[str, Any]] = []
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(changed_ids)):
+                    checkpoints.append(self._capture_sync_checkpoint(note_id, capture_csv=index == 0))
+                mutation_started = True
+                with self._session() as db:
+                    for note_id, normalized in note_updates.items():
+                        db.execute("UPDATE notes SET payload_json=? WHERE note_id=?",
+                                   (json.dumps(normalized, ensure_ascii=False), note_id))
+                    for comment_id, normalized in comment_updates.items():
+                        db.execute("UPDATE comments SET payload_json=? WHERE comment_id=?",
+                                   (json.dumps(normalized, ensure_ascii=False), comment_id))
+                self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "publication-times")
+                for note_id in sorted(changed_ids):
+                    media_dir = self._refresh_material_snapshot_for_note(note_id)
+                    self._verify_note_store_consistency(note_id, media_dir, verify_fields=True)
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                failures = self._rollback_sync_checkpoints(checkpoints)
+                if failures:
+                    raise RuntimeError("时间字段迁移回滚未完成：" + "；".join(failures)) from exc
+                raise
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return {"ok": True, "updatedNotes": len(note_updates), "updatedComments": len(comment_updates),
+                    "consistencyVerified": True}
+
+    def data_overview_media(self, dataset: str, record_id: str, index: str | int | None = None,
+                            revision: str | None = None) -> dict[str, Any]:
+        """Read one record's media without CSV repair, downloads or status writes."""
+        with self.pull_lock, self.lock:
+            return read_overview_media(self.db_path, self._media_root(), dataset, record_id, index, revision)
+
+    def data_overview_comment_target(self, comment_id: str) -> dict[str, Any]:
+        """Resolve exact stored comment text and its parent note for the worker."""
+        with self.pull_lock, self.lock:
+            return read_comment_target(self.db_path, comment_id)
+
+    def data_overview_schema(self) -> dict[str, Any]:
+        """Return every filterable field only after full cross-store verification."""
+        # Use the same lock order as write transactions. This makes the health
+        # verdict, the field catalogue and the issued token one atomic view.
+        with self.pull_lock, self.lock:
+            health = self.data_health()
+            if health.get("summary", {}).get("relationshipsConsistent") is True and not any(
+                item.get("severity") == "critical" for item in health.get("issues", [])
+            ):
+                try:
+                    migration = self.normalize_publication_storage()
+                    if migration.get("updatedNotes") or migration.get("updatedComments"):
+                        health = self.data_health()
+                except Exception as exc:
+                    health.setdefault("issues", []).append({
+                        "id": "publication_time_migration", "severity": "critical",
+                        "title": "时间字段校验未通过", "detail": text(exc, 1200),
+                        "count": 1, "repairable": False, "samples": [],
+                    })
+            relationships_ok = health.get("summary", {}).get("relationshipsConsistent") is True
+            critical = [item for item in health.get("issues", []) if item.get("severity") == "critical"]
+            query_ready = relationships_ok and not critical
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                note_fields = build_field_specs(db, "notes")
+                comment_fields = build_field_specs(db, "comments")
+                record_total = int(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0])
+                note_total = int(db.execute(
+                    f"SELECT COUNT(*) FROM notes n WHERE {DATA_OVERVIEW_NOTE_SCOPE}"
+                ).fetchone()[0])
+                comment_total = int(db.execute(
+                    f"SELECT COUNT(*) FROM comments c JOIN notes n ON n.note_id=c.note_id "
+                    f"WHERE {DATA_OVERVIEW_NOTE_SCOPE}"
+                ).fetchone()[0])
+                business_notes = int(db.execute(
+                    "SELECT COUNT(*) FROM notes WHERE source='existing_xlsx' OR pull_status IN ('synced','partial')"
+                ).fetchone()[0])
+                synchronized_notes = int(db.execute(
+                    f"SELECT COUNT(*) FROM notes n WHERE {DATA_OVERVIEW_NOTE_SCOPE} AND n.status<>'ignored'"
+                ).fetchone()[0])
+                ignored_notes = int(db.execute("SELECT COUNT(*) FROM notes WHERE status='ignored'").fetchone()[0])
+                active_comments = int(db.execute(
+                    f"SELECT COUNT(*) FROM comments c JOIN notes n ON n.note_id=c.note_id "
+                    f"WHERE {DATA_OVERVIEW_NOTE_SCOPE} AND c.is_deleted=0"
+                ).fetchone()[0])
+            finally:
+                db.close()
+            token = self._data_overview_snapshot_token()
+            now = time.time()
+            self._data_overview_approved_tokens = {
+                key: issued for key, issued in self._data_overview_approved_tokens.items() if now - issued < 1800
+            }
+            self._data_overview_read_renewals = {
+                key: issued for key, issued in self._data_overview_read_renewals.items()
+                if key in self._data_overview_approved_tokens
+            }
+            if query_ready:
+                self._data_overview_approved_tokens[token] = now
+                self._data_overview_read_renewals[token] = now
+            return {
+                "ok": True, "version": VERSION, "queryReady": query_ready,
+                "browsingSnapshotSupported": True,
+                "snapshotToken": token if query_ready else "", "health": health,
+                "operators": DATA_OVERVIEW_OPERATORS,
+                "datasets": {
+                    "notes": {
+                        "label": "帖子数据库", "total": note_total, "businessTotal": business_notes,
+                        "synchronizedTotal": synchronized_notes, "ignoredTotal": ignored_notes,
+                        "recordTotal": record_total, "excludedDiscoveryTotal": max(0, record_total - note_total),
+                        "fields": [field.public() for field in note_fields],
+                    },
+                    "comments": {
+                        "label": "评论数据库", "total": comment_total, "activeTotal": active_comments,
+                        "fields": [field.public() for field in comment_fields],
+                    },
+                },
+            }
+
+    def query_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Strict live reads by default; opt-in browsing uses a pinned database copy."""
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        token = text(payload.get("snapshotToken"), 128)
+        if not token:
+            raise ValueError("缺少一致性快照，请重新校验数据总览")
+        if payload.get("useReadSession") is True and payload.get("semanticSearch") is not True:
+            with self._overview_read_sessions.open(self, payload, token) as session:
+                if session is not None:
+                    db, entry = session
+                    result = entry["cache"].pop("first_result", None)
+                    if result is None:
+                        result = self._query_data_overview_db(db, payload, token, entry["cache"])
+                    result.update(readSessionId=entry["id"], browsingSnapshot=True)
+                    return result
+        # Deletion/export/detail/legacy callers keep full live validation.
+        with self.pull_lock, self.lock:
+            token = self._validate_data_overview_read_snapshot(token, "查询")
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                return self._query_data_overview_db(db, payload, token)
+            finally:
+                db.close()
+
+    def _query_data_overview_db(self, db, payload, current_token, query_cache=None):
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if query_cache is not None and "field_specs" in query_cache:
+            field_specs = query_cache["field_specs"]
+        else:
+            field_specs = build_field_specs(db, dataset)
+            if query_cache is not None:
+                query_cache["field_specs"] = field_specs
+        by_key = {field.key: field for field in field_specs}
+        requested_fields = list(dict.fromkeys(
+            text(item, 160) for item in (payload.get("fields") or []) if text(item, 160) in by_key
+        ))
+        if not requested_fields:
+            requested_fields = [field.key for field in field_specs if field.default_visible]
+        if not requested_fields:
+            requested_fields = [field_specs[0].key]
+        if len(requested_fields) > 180:
+            raise ValueError("单次最多显示 180 个字段")
+
+        filter_sql, filter_params, condition_count = compile_filter_group(
+            payload.get("filter") if isinstance(payload.get("filter"), dict) else None, by_key
+        )
+        semantic = payload.get("semanticSearch") is True
+        query_text = str(payload.get("search") or "").strip()
+        search_sql, search_params = ("", []) if semantic else search_clause(text(query_text, 500), dataset)
+        clauses = [DATA_OVERVIEW_NOTE_SCOPE, *[item for item in (filter_sql, search_sql) if item]]
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        parameters = [*filter_params, *search_params]
+        base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
+        select_sql = ", ".join(
+            f"{by_key[key].expression} AS {json.dumps(key)}" for key in requested_fields
+        )
+        page_size = max(1, min(int(payload.get("pageSize") or 50), 200))
+        group_threads = not semantic and effective_thread_grouping(
+            payload.get("sort") if isinstance(payload.get("sort"), list) else [],
+            by_key, dataset, payload.get("groupThreads"), payload.get("threadSortMode", "comment"))
+        if semantic:
+            if not hasattr(self, "_semantic_encoder"):
+                self._semantic_encoder = LocalEncoder(self.db_path.with_name(self.db_path.name + ".semantic.sqlite3"))
+            ids, evidence = semantic_retrieve(
+                db, self._semantic_encoder, dataset, base, where, parameters, query_text,
+                minimum=payload.get("semanticMinScore", 0.5), limit=payload.get("semanticLimit", 200),
+            )
+            total = len(ids)
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(payload.get("page") or 1), page_count))
+            page_ids = ids[(page - 1) * page_size:page * page_size]
+            rows = []
+            if page_ids:
+                key_expr = "n.note_id" if dataset == "notes" else "c.comment_id"
+                marks = ",".join("?" for _ in page_ids)
+                selected = {row["__semantic_id"]: dict(row) for row in db.execute(
+                    f"SELECT {select_sql}, {key_expr} AS __semantic_id FROM {base} "
+                    f"WHERE {key_expr} IN ({marks})", page_ids,
+                )}
+                for record_id in page_ids:
+                    record = selected[record_id]
+                    record.pop("__semantic_id", None)
+                    record.update(evidence[record_id])
+                    rows.append(record)
+        else:
+            if query_cache is not None and "total" in query_cache:
+                total = query_cache["total"]
+            else:
+                total = int(db.execute(f"SELECT COUNT(*) FROM {base}{where}", parameters).fetchone()[0])
+                if query_cache is not None:
+                    query_cache["total"] = total
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(payload.get("page") or 1), page_count))
+            order_by = compile_sort(
+                payload.get("sort") if isinstance(payload.get("sort"), list) else [],
+                by_key, dataset, group_threads=group_threads, thread_sort_mode=payload.get("threadSortMode", "comment"),
+            )
+            rows = [dict(row) for row in db.execute(
+                f"SELECT {select_sql} FROM {base}{where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                (*parameters, page_size, (page - 1) * page_size),
+            ).fetchall()]
+        query_hash = hashlib.sha256(json.dumps({
+            "dataset": dataset, "fields": requested_fields, "search": payload.get("search") or "",
+            "filter": payload.get("filter") or {}, "sort": payload.get("sort") or [],
+            "groupThreads": group_threads, "threadSortMode": payload.get("threadSortMode", "comment"),
+            "semanticSearch": semantic, "semanticMinScore": payload.get("semanticMinScore", 0.5),
+            "semanticLimit": payload.get("semanticLimit", 200),
+            "page": page, "pageSize": page_size,
+        }, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return {
+            "ok": True, "dataset": dataset, "rows": rows, "fields": requested_fields,
+            "total": total, "page": page, "pageSize": page_size, "pageCount": page_count,
+            "filterConditionCount": condition_count, "snapshotToken": current_token,
+            "queryHash": query_hash, "consistentSnapshot": True,
+            "semantic": {"mode": "embedding", "model": SEMANTIC_MODEL,
+                         "limit": max(1, min(int(payload.get("semanticLimit", 200)), 2000)),
+                         "minimumScore": float(payload.get("semanticMinScore", 0.5)),
+                         "note": "向量相关度不是情绪分类或事实置信度；返回阈值以上最相关记录"} if semantic else None,
+        }
+
+    def export_data_overview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return export_filtered_workbook(self, payload)
+
+    def data_overview_values(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return distinct canonical values for one whitelisted field and approved snapshot."""
+        dataset = text(payload.get("dataset"), 30).lower() or "notes"
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请重新校验数据总览")
+        field_key = text(payload.get("field"), 160)
+        search = text(payload.get("search"), 500)
+        limit = max(1, min(int(payload.get("limit") or 120), 200))
+        with self.pull_lock, self.lock:
+            current_token = self._validate_data_overview_read_snapshot(supplied_token, "读取筛选选项")
+            db = self._connect()
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                specs = {field.key: field for field in build_field_specs(db, dataset)}
+                spec = specs.get(field_key)
+                if not spec:
+                    raise ValueError(f"未知筛选字段：{field_key}")
+                if not spec.filterable:
+                    raise ValueError(f"该字段仅用于操作，不能读取筛选选项：{field_key}")
+                base = "notes n" if dataset == "notes" else "comments c JOIN notes n ON n.note_id=c.note_id"
+                value_text = f"TRIM(COALESCE(CAST({spec.expression} AS TEXT),''))"
+                clauses = [DATA_OVERVIEW_NOTE_SCOPE, f"{value_text}<>''"]
+                parameters: list[Any] = []
+                if search:
+                    clauses.append(f"{value_text} LIKE ? ESCAPE '\\' COLLATE NOCASE")
+                    escaped_search = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    parameters.append(f"%{escaped_search}%")
+                where = " WHERE " + " AND ".join(clauses)
+                distinct_count = int(db.execute(
+                    f"SELECT COUNT(DISTINCT {value_text}) FROM {base}{where}", parameters
+                ).fetchone()[0])
+                rows = db.execute(
+                    f"SELECT {spec.expression} value,COUNT(*) count FROM {base}{where} "
+                    f"GROUP BY {spec.expression} ORDER BY count DESC,{value_text} ASC LIMIT ?",
+                    (*parameters, limit),
+                ).fetchall()
+                db.rollback()
+            finally:
+                db.close()
+            values = []
+            for row in rows:
+                value = row["value"]
+                label = ("是" if bool(value) else "否") if spec.data_type == "boolean" else str(value)
+                values.append({"value": value, "label": label, "count": int(row["count"] or 0)})
+            return {
+                "ok": True, "dataset": dataset, "field": field_key, "values": values,
+                "distinctCount": distinct_count, "truncated": distinct_count > len(values),
+                "snapshotToken": current_token, "consistentSnapshot": True,
+            }
+
+    def _delete_data_overview_comments(self, requested_ids: list[str]) -> dict[str, Any]:
+        """Permanently remove comments and descendants from every canonical local store."""
+        _notes_path, comments_path = self._csv_paths()
+        comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        original_csv = comments_path.read_bytes() if comments_path.is_file() else None
+        material_backups: dict[Path, bytes] = {}
+        db = self._connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            requested = set(requested_ids)
+            placeholders = ",".join("?" for _ in requested)
+            initial_rows = db.execute(
+                f"SELECT comment_id,note_id,parent_comment_id FROM comments "
+                f"WHERE comment_id IN ({placeholders})", tuple(requested)
+            ).fetchall()
+            found = {str(row["comment_id"]) for row in initial_rows}
+            missing = sorted(requested - found)
+            if missing:
+                raise ValueError("部分评论已不存在，请刷新后重试：" + "、".join(missing[:5]))
+
+            delete_ids = set(found)
+            frontier = set(found)
+            while frontier:
+                child_placeholders = ",".join("?" for _ in frontier)
+                children = {
+                    str(row[0]) for row in db.execute(
+                        f"SELECT comment_id FROM comments WHERE parent_comment_id IN ({child_placeholders})",
+                        tuple(frontier),
+                    ).fetchall()
+                } - delete_ids
+                if not children:
+                    break
+                delete_ids.update(children)
+                frontier = children
+
+            delete_placeholders = ",".join("?" for _ in delete_ids)
+            selected_rows = [dict(row) for row in db.execute(
+                f"SELECT comment_id,note_id,parent_comment_id FROM comments "
+                f"WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).fetchall()]
+            note_ids = sorted({str(row["note_id"]) for row in selected_rows})
+            delete_by_note = {
+                note_id: {str(row["comment_id"]) for row in selected_rows if str(row["note_id"]) == note_id}
+                for note_id in note_ids
+            }
+
+            kept_comments = [
+                row for row in comment_rows if text(row.get("笔记评论ID"), 256) not in delete_ids
+            ]
+            removed_csv_ids = {
+                text(row.get("笔记评论ID"), 256) for row in comment_rows
+                if text(row.get("笔记评论ID"), 256) in delete_ids
+            }
+            if removed_csv_ids != delete_ids:
+                raise ValueError(
+                    f"评论 CSV 删除前校验失败：SQLite={len(delete_ids)}，CSV={len(removed_csv_ids)}"
+                )
+
+            media_root = self._media_root().resolve()
+            material_payloads: dict[str, tuple[Path, list[dict[str, Any]]]] = {}
+            if note_ids:
+                note_placeholders = ",".join("?" for _ in note_ids)
+                note_rows = db.execute(
+                    f"SELECT note_id,media_dir FROM notes WHERE note_id IN ({note_placeholders})",
+                    tuple(note_ids),
+                ).fetchall()
+                if len(note_rows) != len(note_ids):
+                    raise ValueError("评论关联帖子不完整，已停止删除")
+                for note_row in note_rows:
+                    note_id = str(note_row["note_id"])
+                    media_value = text(note_row["media_dir"], 4000)
+                    if not media_value:
+                        continue
+                    folder = Path(media_value).expanduser()
+                    if not folder.is_dir():
+                        raise ValueError(f"素材目录不存在，已停止删除：{note_id}")
+                    folder = folder.resolve()
+                    if folder.parent != media_root:
+                        raise ValueError("素材目录不在受管 posts_materials 目录内，已停止删除")
+                    material_path = folder / "comments.json"
+                    if not material_path.is_file():
+                        raise ValueError(f"素材 comments.json 缺失，已停止删除：{note_id}")
+                    loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
+                    if not isinstance(loaded, list):
+                        raise ValueError(f"素材 comments.json 格式错误：{note_id}")
+                    material_ids = {
+                        text(item.get("commentId"), 256) for item in loaded
+                        if isinstance(item, dict) and text(item.get("commentId"), 256)
+                    }
+                    if not delete_by_note[note_id].issubset(material_ids):
+                        raise ValueError(f"素材评论与 SQLite 不一致，已停止删除：{note_id}")
+                    filtered = [
+                        dict(item) for item in loaded
+                        if isinstance(item, dict) and text(item.get("commentId"), 256) not in delete_ids
+                    ]
+                    child_counts: dict[str, int] = {}
+                    for item in filtered:
+                        parent_id = text(item.get("parentCommentId"), 256)
+                        if parent_id:
+                            child_counts[parent_id] = child_counts.get(parent_id, 0) + 1
+                    for item in filtered:
+                        comment_id = text(item.get("commentId"), 256)
+                        if comment_id and not text(item.get("parentCommentId"), 256):
+                            item["replyCount"] = child_counts.get(comment_id, 0)
+                    material_backups[material_path] = material_path.read_bytes()
+                    material_payloads[note_id] = (material_path, filtered)
+
+            self._replace_csv_table(comments_path, comment_headers, kept_comments, "overview-comment-delete")
+            for material_path, filtered in material_payloads.values():
+                self._write_json_atomic(material_path, filtered)
+
+            linked_records = 0
+            linked_records += db.execute(
+                f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM reply_generation_history WHERE comment_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            linked_records += db.execute(
+                f"DELETE FROM change_events WHERE target_id IN ({delete_placeholders})",
+                tuple(delete_ids),
+            ).rowcount
+            deleted_database_comments = db.execute(
+                f"DELETE FROM comments WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).rowcount
+            if deleted_database_comments != len(delete_ids):
+                raise ValueError("SQLite 评论删除数量校验失败")
+
+            for note_id in note_ids:
+                db.execute(
+                    """UPDATE comments SET reply_count=(
+                           SELECT COUNT(*) FROM comments child
+                           WHERE child.note_id=comments.note_id
+                             AND child.parent_comment_id=comments.comment_id
+                             AND child.is_deleted=0
+                       ) WHERE note_id=?""",
+                    (note_id,),
+                )
+                counts = db.execute(
+                    """SELECT COUNT(*) active_count,
+                              SUM(CASE WHEN is_deleted=0 AND analysis_is_negative='是' THEN 1 ELSE 0 END) negative_count
+                       FROM comments WHERE note_id=? AND is_deleted=0""",
+                    (note_id,),
+                ).fetchone()
+                db.execute(
+                    "UPDATE notes SET comment_count_collected=?,negative_comment_count=? WHERE note_id=?",
+                    (int(counts["active_count"] or 0), int(counts["negative_count"] or 0), note_id),
+                )
+                linked_records += db.execute("DELETE FROM note_summaries WHERE note_id=?", (note_id,)).rowcount
+
+            if db.execute(
+                f"SELECT COUNT(*) FROM comments WHERE comment_id IN ({delete_placeholders})", tuple(delete_ids)
+            ).fetchone()[0]:
+                raise ValueError("SQLite 评论删除后仍存在残留")
+            if any(text(row.get("笔记评论ID"), 256) in delete_ids for row in kept_comments):
+                raise ValueError("评论 CSV 删除后仍存在残留")
+
+            for note_id in note_ids:
+                database_status = {
+                    str(row["comment_id"]): comment_status_label(row["comment_status"], row["is_deleted"])
+                    for row in db.execute(
+                        "SELECT comment_id,comment_status,is_deleted FROM comments WHERE note_id=?", (note_id,)
+                    ).fetchall()
+                }
+                csv_status = {
+                    text(row.get("笔记评论ID"), 256): comment_status_label(row.get("评论状态"))
+                    for row in kept_comments if csv_comment_note_id(row) == note_id
+                }
+                if database_status != csv_status:
+                    raise ValueError(f"删除后评论 CSV 与 SQLite 不一致：{note_id}")
+                if note_id in material_payloads:
+                    material_status = {
+                        text(item.get("commentId"), 256): comment_status_label(
+                            item.get("commentStatus"), item.get("isDeleted")
+                        ) for item in material_payloads[note_id][1]
+                        if text(item.get("commentId"), 256)
+                    }
+                    if database_status != material_status:
+                        raise ValueError(f"删除后素材评论与 SQLite 不一致：{note_id}")
+
+            db.commit()
+            return {
+                "ok": True, "dataset": "comments", "requestedCount": len(requested_ids),
+                "deletedCount": len(delete_ids), "deletedCommentIds": sorted(delete_ids),
+                "cascadeDeletedCount": max(0, len(delete_ids) - len(requested_ids)),
+                "affectedNoteIds": note_ids, "deletedCsvRows": len(removed_csv_ids),
+                "deletedDatabaseComments": deleted_database_comments,
+                "deletedLinkedDatabaseRecords": linked_records,
+                "materialSnapshotsUpdated": len(material_payloads),
+                "csvVerified": True, "databaseVerified": True, "materialsVerified": True,
+            }
+        except Exception:
+            db.rollback()
+            self._restore_file_bytes(comments_path, original_csv)
+            if comments_path.is_file():
+                self._remember_managed_csv(comments_path)
+            for material_path, original in material_backups.items():
+                self._restore_file_bytes(material_path, original)
+            raise
+        finally:
+            db.close()
+
+    def delete_data_overview_records(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Delete selected overview records only after snapshot and explicit confirmation checks."""
+        dataset = text(payload.get("dataset"), 30).lower()
+        if dataset not in {"notes", "comments"}:
+            raise ValueError("dataset must be notes or comments")
+        raw_ids = payload.get("ids") if isinstance(payload.get("ids"), list) else []
+        ids = list(dict.fromkeys(text(item, 256) for item in raw_ids if text(item, 256)))
+        if not ids:
+            raise ValueError("请至少选择一条要删除的数据")
+        if len(ids) > 100:
+            raise ValueError("单次最多永久删除 100 条记录")
+        if dataset == "notes" and any(not valid_note_id(item) for item in ids):
+            raise ValueError("选择中包含无效的笔记 ID")
+        confirmation = f"DELETE:{dataset}:{len(ids)}"
+        if not bool(payload.get("hardDeleteConfirmed")) or text(payload.get("confirmation"), 128) != confirmation:
+            raise ValueError("永久删除确认不完整")
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请刷新后重试")
+
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验后再删除")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再删除")
+
+            if dataset == "comments":
+                return self._delete_data_overview_comments(ids)
+
+            deleted: list[dict[str, Any]] = []
+            failures: list[dict[str, str]] = []
+            for note_id in ids:
+                try:
+                    deleted.append(self.delete_pulled_note({"noteId": note_id}))
+                except Exception as exc:
+                    failures.append({"noteId": note_id, "error": text(exc, 1000)})
+            if not deleted:
+                detail = "；".join(f"{item['noteId']}：{item['error']}" for item in failures[:3])
+                raise ValueError("帖子删除失败：" + detail)
+            return {
+                "ok": True, "dataset": "notes", "requestedCount": len(ids),
+                "deletedCount": len(deleted), "deletedNoteIds": [item["noteId"] for item in deleted],
+                "deletedCommentCount": sum(int(item.get("deletedDatabaseComments") or 0) for item in deleted),
+                "deletedCsvNoteRows": sum(int(item.get("deletedNoteRows") or 0) for item in deleted),
+                "deletedCsvCommentRows": sum(int(item.get("deletedCommentRows") or 0) for item in deleted),
+                "deletedMaterialDirectoryCount": sum(bool(item.get("mediaDeleted")) for item in deleted),
+                "failureCount": len(failures), "failures": failures,
+                "partial": bool(failures), "csvVerified": True, "databaseVerified": True,
+            }
+
+    def purge_untracked_discoveries(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Remove discovery-only rows without touching synchronized, confirmed or ignored records."""
+        supplied_token = text(payload.get("snapshotToken"), 128)
+        if not supplied_token:
+            raise ValueError("缺少一致性快照，请刷新后重试")
+        dry_run = bool(payload.get("dryRun"))
+        with self.pull_lock, self.lock:
+            issued_at = self._data_overview_approved_tokens.get(supplied_token, 0)
+            if not issued_at or time.time() - issued_at >= 1800:
+                raise ValueError("一致性快照已过期，请重新校验后再清理")
+            current_token = self._data_overview_snapshot_token()
+            if current_token != supplied_token:
+                self._data_overview_approved_tokens.pop(supplied_token, None)
+                raise ValueError("本地数据已变化，请重新校验后再清理")
+
+            db = self._connect()
+            tombstones: list[tuple[Path, Path]] = []
+            committed = False
+            try:
+                candidates = [dict(row) for row in db.execute(
+                    f"SELECT n.note_id,n.status,n.source,n.pull_status,n.media_dir FROM notes n "
+                    f"WHERE NOT {DATA_OVERVIEW_NOTE_SCOPE} ORDER BY n.note_id"
+                ).fetchall()]
+                candidate_ids = [str(row["note_id"]) for row in candidates]
+                by_status = dict(Counter(str(row["status"] or "") for row in candidates))
+                if dry_run:
+                    return {
+                        "ok": True, "dryRun": True, "candidateCount": len(candidate_ids),
+                        "candidateIds": candidate_ids, "byStatus": by_status,
+                        "confirmation": f"PURGE_UNTRACKED_DISCOVERIES:{len(candidate_ids)}",
+                    }
+                confirmation = f"PURGE_UNTRACKED_DISCOVERIES:{len(candidate_ids)}"
+                if not bool(payload.get("hardDeleteConfirmed")) or text(
+                    payload.get("confirmation"), 128
+                ) != confirmation:
+                    raise ValueError("仅发现未入库记录的永久清理确认不完整")
+                if not candidate_ids:
+                    return {
+                        "ok": True, "dryRun": False, "deletedCount": 0,
+                        "deletedCommentCount": 0, "deletedLinkedDatabaseRecords": 0,
+                        "deletedMaterialDirectoryCount": 0, "byStatus": {},
+                    }
+
+                notes_path, comments_path = self._csv_paths()
+                _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+                _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+                candidate_set = set(candidate_ids)
+                csv_note_overlap = sorted(
+                    valid_note_id(row.get("笔记ID")) for row in note_rows
+                    if valid_note_id(row.get("笔记ID")) in candidate_set
+                )
+                csv_comment_overlap = sorted(
+                    text(row.get("笔记评论ID"), 256) for row in comment_rows
+                    if csv_comment_note_id(row) in candidate_set
+                )
+                if csv_note_overlap or csv_comment_overlap:
+                    raise ValueError("候选记录已进入业务 CSV，已停止清理以保护正式数据")
+
+                placeholders = ",".join("?" for _ in candidate_ids)
+                comment_rows_db = db.execute(
+                    f"SELECT comment_id FROM comments WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).fetchall()
+                comment_ids = [str(row[0]) for row in comment_rows_db]
+
+                media_root = self._media_root().resolve()
+                managed_dirs: list[Path] = []
+                for row in candidates:
+                    media_value = text(row.get("media_dir"), 4000)
+                    if not media_value:
+                        continue
+                    folder = Path(media_value).expanduser()
+                    if not folder.exists():
+                        continue
+                    folder = folder.resolve()
+                    if folder.parent != media_root:
+                        raise ValueError("仅发现记录的素材目录不在受管目录内，已停止清理")
+                    if folder not in managed_dirs:
+                        managed_dirs.append(folder)
+                if media_root.exists():
+                    candidate_suffixes = {f"__{note_id}" for note_id in candidate_ids}
+                    for folder in media_root.iterdir():
+                        if not folder.is_dir() or not any(folder.name.endswith(suffix) for suffix in candidate_suffixes):
+                            continue
+                        resolved = folder.resolve()
+                        if resolved not in managed_dirs:
+                            managed_dirs.append(resolved)
+                for index, folder in enumerate(managed_dirs, 1):
+                    tombstone = folder.with_name(
+                        f".{folder.name}.purging-{os.getpid()}-{time.time_ns()}-{index}"
+                    )
+                    folder.rename(tombstone)
+                    tombstones.append((folder, tombstone))
+
+                db.execute("BEGIN IMMEDIATE")
+                linked_records = 0
+                if comment_ids:
+                    comment_placeholders = ",".join("?" for _ in comment_ids)
+                    linked_records += db.execute(
+                        f"DELETE FROM ai_jobs WHERE target_type='comment' AND target_id IN ({comment_placeholders})",
+                        tuple(comment_ids),
+                    ).rowcount
+                    linked_records += db.execute(
+                        f"DELETE FROM ai_analysis_records WHERE target_type='comment' AND target_id IN ({comment_placeholders})",
+                        tuple(comment_ids),
+                    ).rowcount
+                linked_records += db.execute(
+                    f"DELETE FROM ai_jobs WHERE target_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                linked_records += db.execute(
+                    f"DELETE FROM ai_analysis_records WHERE target_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                for table in ("note_summaries", "reply_generation_history", "comment_collection_jobs", "change_events", "watchlist"):
+                    linked_records += db.execute(
+                        f"DELETE FROM {table} WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                    ).rowcount
+                deleted_comments = db.execute(
+                    f"DELETE FROM comments WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                deleted_notes = db.execute(
+                    f"DELETE FROM notes WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).rowcount
+                if deleted_notes != len(candidate_ids):
+                    raise ValueError("仅发现记录的 SQLite 删除数量校验失败")
+                if db.execute(
+                    f"SELECT COUNT(*) FROM notes WHERE note_id IN ({placeholders})", tuple(candidate_ids)
+                ).fetchone()[0]:
+                    raise ValueError("仅发现记录清理后仍存在 SQLite 残留")
+                db.commit()
+                committed = True
+
+                cleanup_errors: list[str] = []
+                for _original, tombstone in tombstones:
+                    try:
+                        if tombstone.exists():
+                            shutil.rmtree(tombstone)
+                    except OSError as exc:
+                        cleanup_errors.append(f"{tombstone.name}: {text(exc, 220)}")
+                return {
+                    "ok": True, "dryRun": False, "deletedCount": deleted_notes,
+                    "deletedCommentCount": deleted_comments,
+                    "deletedLinkedDatabaseRecords": linked_records,
+                    "deletedMaterialDirectoryCount": len(tombstones) - len(cleanup_errors),
+                    "byStatus": by_status, "databaseVerified": True, "csvProtected": True,
+                    "materialCleanupWarning": "；".join(cleanup_errors),
+                }
+            except Exception:
+                if not committed:
+                    db.rollback()
+                    for original, tombstone in reversed(tombstones):
+                        if tombstone.exists() and not original.exists():
+                            tombstone.rename(original)
+                raise
+            finally:
+                db.close()
 
     def start_sync_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_type = text(payload.get("runType"), 40) or "single"
@@ -3682,7 +6081,7 @@ class MonitorStore:
         if priority not in {"high", "normal", "low"}:
             raise ValueError("priority must be high, normal or low")
         timestamp = now_iso()
-        with self.lock, self._session() as db:
+        with self.pull_lock, self.lock, self._session() as db:
             if not db.execute("SELECT 1 FROM notes WHERE note_id=?", (note_id,)).fetchone():
                 raise ValueError("请先扫描或拉取该帖子，再加入观察名单")
             if watched:
@@ -3726,22 +6125,75 @@ class MonitorStore:
 
         with self.lock, self._session() as db:
             note_rows = [dict(row) for row in db.execute(
-                """SELECT note_id,title,url,source,pull_status,media_status,media_dir,media_file_count,
-                   comment_count_collected,access_status,payload_json FROM notes"""
+                """SELECT note_id,title,url,author,content,keyword,tags,source,pull_status,media_status,media_dir,media_file_count,
+                   comment_count_collected,post_sentiment,access_status,access_error,payload_json,semantic_analysis_count,
+                   analysis_is_negative,negative_type,negative_subtype,
+                   post_status,is_deleted,deleted_at,last_presence_checked_at FROM notes"""
             ).fetchall()]
             db_note_ids = {row["note_id"] for row in note_rows}
+            db_note_status = {
+                row["note_id"]: post_status_label(row.get("post_status"), row.get("is_deleted"))
+                for row in note_rows
+            }
+            db_deleted_note_count = sum(bool(row.get("is_deleted")) for row in note_rows)
+            db_note_flag_mismatches = [
+                row["note_id"] for row in note_rows
+                if bool(row.get("is_deleted")) != (post_status_label(row.get("post_status"), row.get("is_deleted")) == POST_STATUS_DELETED)
+            ]
             pulled_ids = {
                 row["note_id"] for row in note_rows
                 if row["source"] == "existing_xlsx" or row["pull_status"] in {"synced", "partial"}
             }
             db_comment_rows = [dict(row) for row in db.execute(
-                "SELECT comment_id,note_id,parent_comment_id,review_status FROM comments"
+                """SELECT comment_id,note_id,parent_comment_id,content,author,author_url,published_at,like_count,
+                          comment_level,payload_json,sentiment,review_status,comment_status,is_deleted,
+                          semantic_analysis_count,analysis_is_negative,negative_type,negative_subtype
+                   FROM comments"""
             ).fetchall()]
             db_comment_count = len(db_comment_rows)
             db_comment_ids = {text(row.get("comment_id"), 256) for row in db_comment_rows}
+            db_comment_status = {
+                text(row.get("comment_id"), 256): comment_status_label(row.get("comment_status"), row.get("is_deleted"))
+                for row in db_comment_rows if text(row.get("comment_id"), 256)
+            }
+            db_comment_semantic = {
+                text(row.get("comment_id"), 256): (
+                    int(row.get("semantic_analysis_count") or 0), text(row.get("analysis_is_negative"), 40),
+                    text(row.get("negative_type"), 1000), text(row.get("negative_subtype"), 2000)
+                ) for row in db_comment_rows if text(row.get("comment_id"), 256)
+            }
+            db_deleted_comment_count = sum(bool(row.get("is_deleted")) for row in db_comment_rows)
+            alias_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            logical_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+            for row in db_comment_rows:
+                comment_id = text(row.get("comment_id"), 256)
+                note_id = text(row.get("note_id"), 128)
+                if not comment_id or not note_id:
+                    continue
+                alias_key = comment_id.removeprefix("comment-")
+                if not comment_id.startswith("legacy-"):
+                    alias_groups.setdefault((note_id, alias_key), []).append(row)
+                normalized_author = re.sub(r"\s+", "", text(row.get("author"), 500)).casefold()
+                normalized_content = re.sub(r"\s+", "", text(row.get("content"), 8000)).casefold()
+                if normalized_content:
+                    logical_groups.setdefault((note_id, normalized_author, normalized_content), []).append(row)
+            comment_alias_candidates = [
+                rows for rows in alias_groups.values()
+                if len(rows) > 1 and len({text(row.get("comment_id"), 256) for row in rows}) > 1
+            ]
+            logical_duplicate_candidates = []
+            for rows in logical_groups.values():
+                ids = {text(row.get("comment_id"), 256) for row in rows}
+                if len(ids) <= 1:
+                    continue
+                normalized_ids = {comment_id.removeprefix("comment-") for comment_id in ids}
+                if len(normalized_ids) > 1:
+                    logical_duplicate_candidates.append(rows)
             actual_comment_counts = {
                 str(row["note_id"]): int(row["count"])
-                for row in db.execute("SELECT note_id,COUNT(*) count FROM comments GROUP BY note_id").fetchall()
+                for row in db.execute(
+                    "SELECT note_id,COUNT(*) count FROM comments WHERE is_deleted=0 GROUP BY note_id"
+                ).fetchall()
             }
             orphan_comments = int(db.execute(
                 "SELECT COUNT(*) FROM comments c LEFT JOIN notes n ON n.note_id=c.note_id WHERE n.note_id IS NULL"
@@ -3760,6 +6212,7 @@ class MonitorStore:
         ]
         missing_media = []
         pending_media = []
+        material_post_status_mismatches: list[str] = []
         for row in note_rows:
             if int(row.get("media_file_count") or 0) <= 0:
                 continue
@@ -3770,6 +6223,19 @@ class MonitorStore:
                 exists = False
             if not exists:
                 (pending_media if row.get("media_status") == "partial" else missing_media).append(row["note_id"])
+                continue
+            note_snapshot = Path(folder) / "note.json"
+            if note_snapshot.is_file():
+                try:
+                    snapshot = json.loads(note_snapshot.read_text(encoding="utf-8-sig"))
+                    snapshot_status = post_status_label(
+                        snapshot.get("postStatus") if isinstance(snapshot, dict) else "",
+                        snapshot.get("isDeleted") if isinstance(snapshot, dict) else None,
+                    )
+                    if snapshot_status != db_note_status.get(row["note_id"]):
+                        material_post_status_mismatches.append(row["note_id"])
+                except (OSError, ValueError):
+                    material_post_status_mismatches.append(row["note_id"])
         review_access = [row["note_id"] for row in note_rows if row.get("access_status") == "check_failed"]
         payload_cross_ids: list[str] = []
         payload_invalid_ids: list[str] = []
@@ -3802,6 +6268,18 @@ class MonitorStore:
         shared_media_ids = [note_id for owners in media_dir_owners.values() if len(owners) > 1 for note_id in owners]
 
         add_issue("orphan_comments", "critical", "存在孤立评论", "评论在 SQLite 中找不到所属帖子。", orphan_comments, False)
+        add_issue(
+            "comment_id_alias_candidates", "info", "评论 ID 存在显式别名迁移候选",
+            "同帖同时存在裸 ID 与 comment- 前缀 ID；不得自动按文本合并，需先导出证据并执行可审计迁移。",
+            len(comment_alias_candidates), False,
+            [" / ".join(text(row.get("comment_id"), 256) for row in rows[:3]) for rows in comment_alias_candidates],
+        )
+        add_issue(
+            "comment_logical_duplicate_candidates", "info", "评论存在跨 ID 逻辑重复候选",
+            "同帖、同作者、同正文出现不同稳定 ID；仅供人工核验，不影响外键一致性，也不会自动合并。",
+            len(logical_duplicate_candidates), False,
+            [" / ".join(text(row.get("comment_id"), 256) for row in rows[:3]) for rows in logical_duplicate_candidates],
+        )
         add_issue("comment_count_mismatch", "warning", "评论计数不一致", "帖子计数与实际 SQLite 评论数量不同。",
                   len(mismatched_counts), True, mismatched_counts)
         add_issue("missing_core", "warning", "帖子核心字段缺失", "已拉取帖子缺少标题或可用链接。",
@@ -3813,6 +6291,9 @@ class MonitorStore:
         add_issue("shared_media_directory", "critical", "多个帖子共用同一素材目录",
                   "comments.json 会互相覆盖，必须拆分为带笔记ID的独立目录。",
                   len(shared_media_ids), False, shared_media_ids)
+        add_issue("material_post_status_mismatch", "critical", "素材快照与 SQLite 帖子状态不一致",
+                  "note.json 的存在/已删除状态必须与 SQLite 一致。",
+                  len(material_post_status_mismatches), False, material_post_status_mismatches)
         add_issue("access_review", "info", "帖子等待访问复核", "这些帖子上次未完成访问核验，不等于打不开。",
                   len(review_access), False, review_access)
         add_issue("sqlite_payload_cross_note_id", "critical", "SQLite 帖子快照发生串帖",
@@ -3842,14 +6323,26 @@ class MonitorStore:
         mapping_review_ids: list[str] = []
         unreviewed_orphan_ids: list[str] = []
         missing_parent_ids: list[str] = []
+        invalid_comment_status_ids: list[str] = []
+        csv_comment_status_by_id: dict[str, str] = {}
+        csv_comment_semantic_by_id: dict[str, tuple[int, str, str, str]] = {}
+        note_semantic_mismatches: list[str] = []
+        note_field_mismatches: list[str] = []
+        comment_field_mismatches: list[str] = []
+        material_field_mismatches: list[str] = []
+        invalid_post_status_ids: list[str] = []
+        csv_post_status_by_id: dict[str, str] = {}
         if not notes_path or not comments_path or not notes_path.exists() or not comments_path.exists():
             add_issue("csv_missing", "critical", "CSV 总表不存在", "当前配置路径下缺少笔记总表或评论总表。", 1, False)
         else:
             try:
                 note_headers, csv_note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
                 comment_headers, csv_comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-                if "笔记ID" not in note_headers or "笔记ID" not in comment_headers or "笔记评论ID" not in comment_headers:
-                    add_issue("csv_schema", "critical", "CSV 表头结构不完整", "笔记或评论表缺少明确的笔记ID/评论ID列。", 1, False)
+                if ("笔记ID" not in note_headers or "笔记ID" not in comment_headers
+                        or "笔记评论ID" not in comment_headers or "评论状态" not in comment_headers
+                        or "帖子状态" not in note_headers):
+                    add_issue("csv_schema", "critical", "CSV 表头结构不完整",
+                              "笔记或评论表缺少笔记ID、评论ID、帖子状态或评论状态列。", 1, False)
                 excel_note_ids = [valid_note_id(row.get("笔记ID")) for row in csv_note_rows]
                 invalid_note_rows = [str(index) for index, note_id in enumerate(excel_note_ids, 2) if not note_id]
                 excel_note_ids = [value for value in excel_note_ids if value]
@@ -3869,12 +6362,60 @@ class MonitorStore:
                             media_differs = csv_media.casefold() != db_media.casefold()
                         if media_differs:
                             media_path_mismatches.append(note_id)
+                    stored_note = db_note_by_id.get(note_id) or {}
+                    csv_semantic = (
+                        nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                        text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000)
+                    )
+                    db_semantic = (
+                        int(stored_note.get("semantic_analysis_count") or 0),
+                        text(stored_note.get("analysis_is_negative"), 40),
+                        text(stored_note.get("negative_type"), 1000), text(stored_note.get("negative_subtype"), 2000)
+                    )
+                    if note_id and stored_note and csv_semantic != db_semantic:
+                        note_semantic_mismatches.append(note_id)
+                    if note_id and stored_note:
+                        core_pairs = (
+                            (row.get("笔记标题"), stored_note.get("title"), 1000),
+                            (row.get("用户昵称"), stored_note.get("author"), 500),
+                            (row.get("笔记内容"), stored_note.get("content"), 20000),
+                            (row.get("来源词"), stored_note.get("keyword"), 200),
+                        )
+                        differs = any(
+                            self._consistent_text(left, limit) != self._consistent_text(right, limit)
+                            for left, right, limit in core_pairs
+                        ) or tag_text(row.get("笔记话题")) != tag_text(stored_note.get("tags")) \
+                            or normalize_xhs_url(row.get("笔记url")) != normalize_xhs_url(stored_note.get("url"))
+                        try:
+                            time_payload = json.loads(stored_note.get("payload_json") or "{}")
+                        except (TypeError, ValueError):
+                            time_payload = {}
+                        if isinstance(time_payload, dict) and isinstance(time_payload.get("publishedTime"), dict):
+                            differs = differs or any(
+                                self._consistent_text(row.get(key), 1000) != value
+                                for key, value in csv_time_fields(time_payload).items()
+                            )
+                        if differs:
+                            note_field_mismatches.append(note_id)
+                    raw_post_status = text(row.get("帖子状态"), 40)
+                    if note_id:
+                        if raw_post_status not in {POST_STATUS_PRESENT, POST_STATUS_DELETED}:
+                            invalid_post_status_ids.append(note_id)
+                        csv_post_status_by_id[note_id] = post_status_label(raw_post_status)
                 for index, row in enumerate(csv_comment_rows, 2):
                     explicit_note_id = valid_note_id(row.get("笔记ID"))
                     url_id = note_url_identity(row.get("原笔记url"))
                     comment_id = text(row.get("笔记评论ID"), 256)
                     if comment_id:
                         csv_comment_ids.append(comment_id)
+                        raw_status = text(row.get("评论状态"), 40)
+                        if raw_status not in {COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED}:
+                            invalid_comment_status_ids.append(comment_id)
+                        csv_comment_status_by_id[comment_id] = comment_status_label(raw_status)
+                        csv_comment_semantic_by_id[comment_id] = (
+                            nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                            text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000)
+                        )
                     if not explicit_note_id:
                         missing_comment_note_ids.append(comment_id or f"row:{index}")
                     if explicit_note_id and url_id and explicit_note_id != url_id:
@@ -3912,6 +6453,73 @@ class MonitorStore:
                     missing_parent_ids.append(comment_id or parent_id)
         csv_missing_db = sorted(csv_comment_id_set - db_comment_ids)
         db_missing_csv = sorted(db_comment_ids - csv_comment_id_set)
+        post_presence_status_mismatches = sorted(
+            note_id for note_id in excel_note_set.intersection(db_note_ids)
+            if csv_post_status_by_id.get(note_id) != db_note_status.get(note_id)
+        )
+        presence_status_mismatches = sorted(
+            comment_id for comment_id in csv_comment_id_set.intersection(db_comment_ids)
+            if csv_comment_status_by_id.get(comment_id) != db_comment_status.get(comment_id)
+        )
+        comment_semantic_mismatches = sorted(
+            comment_id for comment_id in csv_comment_id_set.intersection(db_comment_ids)
+            if csv_comment_semantic_by_id.get(comment_id) != db_comment_semantic.get(comment_id)
+        )
+        db_comment_by_id = {
+            text(row.get("comment_id"), 256): row for row in db_comment_rows if text(row.get("comment_id"), 256)
+        }
+        for row in csv_comment_rows:
+            comment_id = text(row.get("笔记评论ID"), 256)
+            stored = db_comment_by_id.get(comment_id)
+            if not stored:
+                continue
+            core_differs = any((
+                self._consistent_text(csv_comment_note_id(row), 128) != self._consistent_text(stored.get("note_id"), 128),
+                self._consistent_text(row.get("用户昵称"), 500) != self._consistent_text(stored.get("author"), 500),
+                self._consistent_text(row.get("评论用户主页url"), 2000) != self._consistent_text(stored.get("author_url"), 2000),
+                self._consistent_text(row.get("评论内容"), 8000) != self._consistent_text(stored.get("content"), 8000),
+                self._consistent_text(row.get("评论时间"), 100) != self._consistent_text(stored.get("published_at"), 100),
+                self._consistent_text(row.get("父评论ID"), 256) != self._consistent_text(stored.get("parent_comment_id"), 256),
+                nonnegative_int(row.get("点赞量")) != int(stored.get("like_count") or 0),
+                comment_level_value(row.get("评论层级")) != int(stored.get("comment_level") or 1),
+            ))
+            try:
+                time_payload = json.loads(stored.get("payload_json") or "{}")
+            except (TypeError, ValueError):
+                time_payload = {}
+            if isinstance(time_payload, dict) and isinstance(time_payload.get("publishedTime"), dict):
+                core_differs = core_differs or any(
+                    self._consistent_text(row.get(key), 1000) != value
+                    for key, value in csv_time_fields(time_payload, kind="comment").items()
+                )
+            if core_differs:
+                comment_field_mismatches.append(comment_id)
+        csv_note_by_id = {
+            valid_note_id(row.get("笔记ID")): row for row in csv_note_rows if valid_note_id(row.get("笔记ID"))
+        }
+        csv_comments_by_note: dict[str, list[dict[str, Any]]] = {}
+        db_comments_by_note: dict[str, list[dict[str, Any]]] = {}
+        for row in csv_comment_rows:
+            csv_comments_by_note.setdefault(csv_comment_note_id(row), []).append(row)
+        for row in db_comment_rows:
+            db_comments_by_note.setdefault(text(row.get("note_id"), 128), []).append(row)
+        db_note_by_id = {text(row.get("note_id"), 128): row for row in note_rows}
+        for note_id in sorted(pulled_ids.intersection(csv_note_by_id)):
+            stored_note = db_note_by_id.get(note_id) or {}
+            media_dir = text(stored_note.get("media_dir"), 4000)
+            try:
+                has_material = bool(media_dir and Path(media_dir).is_dir())
+            except OSError:
+                has_material = False
+            if not has_material:
+                continue
+            try:
+                self._verify_note_field_consistency(
+                    note_id, csv_note_by_id[note_id], csv_comments_by_note.get(note_id, []),
+                    stored_note, db_comments_by_note.get(note_id, []), media_dir,
+                )
+            except Exception:
+                material_field_mismatches.append(note_id)
         add_issue("csv_invalid_note_rows", "critical", "笔记 CSV 存在无有效 ID 的行",
                   "无法建立稳定外键；重复空 ID 行也会造成界面状态误判。",
                   len(invalid_note_rows), False, invalid_note_rows)
@@ -3921,6 +6529,15 @@ class MonitorStore:
                   "同一帖子必须指向同一个受管素材目录。", len(media_path_mismatches), False, media_path_mismatches)
         add_issue("csv_duplicate_notes", "critical", "CSV 存在重复帖子行", "同一笔记 ID 在笔记总表重复出现。",
                   duplicate_excel, False)
+        add_issue("sqlite_post_status_flag_mismatch", "critical", "SQLite 帖子状态标记不一致",
+                  "post_status 与 is_deleted 必须表达同一存续状态。", len(db_note_flag_mismatches), False,
+                  db_note_flag_mismatches)
+        add_issue("csv_post_status_invalid", "critical", "帖子状态字段存在空值或非法值",
+                  "帖子状态只能是“存在”或“已删除”。", len(invalid_post_status_ids), False,
+                  invalid_post_status_ids)
+        add_issue("csv_sqlite_post_status_mismatch", "critical", "CSV 与 SQLite 帖子状态不一致",
+                  "同一帖子在两个数据源中的存在/已删除状态不同。", len(post_presence_status_mismatches), False,
+                  post_presence_status_mismatches)
         add_issue("csv_comment_missing_note_id", "critical", "评论缺少明确笔记ID",
                   "评论不能只依赖 URL 推断所属帖子。", len(missing_comment_note_ids), False, missing_comment_note_ids)
         add_issue("csv_abnormal_comment_rows", "critical", "评论 CSV 存在拆行或异常行",
@@ -3928,6 +6545,27 @@ class MonitorStore:
                   len(abnormal_comment_rows), False, abnormal_comment_rows)
         add_issue("csv_duplicate_comment_ids", "critical", "评论 ID 重复",
                   "同一个评论ID对应多行，无法保证幂等同步。", duplicate_comment_ids, False)
+        add_issue("csv_comment_status_invalid", "critical", "评论状态字段存在空值或非法值",
+                  "评论状态只能是“存在”或“已删除”。", len(invalid_comment_status_ids), False,
+                  invalid_comment_status_ids)
+        add_issue("csv_sqlite_comment_status_mismatch", "critical", "CSV 与 SQLite 评论状态不一致",
+                  "同一评论在两个数据源中的存在/已删除状态不同。", len(presence_status_mismatches), False,
+                  presence_status_mismatches)
+        add_issue("csv_sqlite_note_field_mismatch", "critical", "笔记 CSV 与 SQLite 字段不一致",
+                  "标题、作者、正文、话题、来源词或链接未同步为同一快照。",
+                  len(set(note_field_mismatches)), True, sorted(set(note_field_mismatches)))
+        add_issue("csv_sqlite_comment_field_mismatch", "critical", "评论 CSV 与 SQLite 字段不一致",
+                  "评论正文、作者、时间、点赞量、层级或父评论字段不一致。",
+                  len(set(comment_field_mismatches)), True, sorted(set(comment_field_mismatches)))
+        add_issue("material_snapshot_field_mismatch", "critical", "素材快照与总表字段不一致",
+                  "note.json、comments.json 或正文快照未与 CSV/SQLite 保持同一字段和状态。",
+                  len(set(material_field_mismatches)), True, sorted(set(material_field_mismatches)))
+        add_issue("csv_sqlite_note_semantic_mismatch", "critical", "笔记语义字段与 SQLite 不一致",
+                  "语义分析次数、差评结论或分类字段未同步。", len(note_semantic_mismatches), False,
+                  note_semantic_mismatches)
+        add_issue("csv_sqlite_comment_semantic_mismatch", "critical", "评论语义字段与 SQLite 不一致",
+                  "语义分析次数、差评结论或分类字段未同步。", len(comment_semantic_mismatches), False,
+                  comment_semantic_mismatches)
         add_issue("csv_comment_url_mismatch", "warning", "评论笔记ID与原笔记 URL 不一致",
                   "同步时可能写入错误帖子。", len(comment_url_mismatches), False, comment_url_mismatches)
         add_issue("csv_orphan_comments", "critical", "评论指向笔记总表之外的帖子",
@@ -3955,26 +6593,353 @@ class MonitorStore:
             "ok": True, "status": status, "score": score, "checkedAt": now_iso(), "issues": issues,
             "summary": {
                 "databaseNotes": len(note_rows), "databaseComments": db_comment_count,
+                "activePosts": len(note_rows) - db_deleted_note_count,
+                "deletedPosts": db_deleted_note_count,
+                "activeComments": db_comment_count - db_deleted_comment_count,
+                "deletedComments": db_deleted_comment_count,
                 "csvNotes": len(excel_note_ids), "csvComments": excel_comment_rows,
                 "excelNotes": len(excel_note_ids), "excelComments": excel_comment_rows,
                 "pulledNotes": len(pulled_ids),
                 "mappingReviewComments": len(mapping_review_ids),
+                "commentIdAliasCandidates": len(comment_alias_candidates),
+                "logicalDuplicateCommentCandidates": len(logical_duplicate_candidates),
                 "abnormalCommentRows": len(abnormal_comment_rows),
                 "csvOnlyCommentIds": len(csv_missing_db), "sqliteOnlyCommentIds": len(db_missing_csv),
                 "relationshipsConsistent": not any(item["id"] in {
                     "csv_invalid_note_rows", "csv_note_url_mismatch", "csv_sqlite_media_path_mismatch", "csv_comment_missing_note_id",
-                    "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_url_mismatch",
+                    "csv_abnormal_comment_rows", "csv_duplicate_comment_ids", "csv_comment_status_invalid",
+                    "sqlite_post_status_flag_mismatch", "csv_post_status_invalid", "csv_sqlite_post_status_mismatch",
+                    "csv_sqlite_comment_status_mismatch", "csv_sqlite_note_field_mismatch",
+                    "csv_sqlite_comment_field_mismatch", "material_snapshot_field_mismatch",
+                    "csv_sqlite_note_semantic_mismatch",
+                    "csv_sqlite_comment_semantic_mismatch", "csv_comment_url_mismatch",
                     "csv_orphan_comments", "csv_sqlite_comment_gap", "shared_media_directory",
-                    "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
+                    "material_post_status_mismatch", "sqlite_payload_cross_note_id", "sqlite_payload_invalid_note_id"
                 } for item in issues),
                 "issueCount": len(issues),
                 "repairableCount": sum(1 for item in issues if item["repairable"]),
             },
         }
 
-    def repair_data_health(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _normalize_csv_cross_store_fields(self) -> dict[str, int]:
+        """Canonicalize fields whose display variants otherwise hide real cross-store drift."""
+        notes_path, comments_path = self._csv_paths()
+        with self.pull_lock:
+            note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            with self.lock, self._session() as db:
+                stored_rows = db.execute(
+                    """SELECT comment_id,author_url,parent_comment_id,payload_json,sentiment,
+                              semantic_analysis_count,analysis_is_negative,negative_type,negative_subtype,
+                              comment_status,is_deleted
+                       FROM comments"""
+                ).fetchall()
+                stored_note_rows = db.execute(
+                    """SELECT note_id,url,post_sentiment,payload_json,media_dir,
+                              semantic_analysis_count,analysis_is_negative,negative_type,negative_subtype,
+                              post_status,is_deleted
+                       FROM notes"""
+                ).fetchall()
+            stored_note_author_urls: dict[str, str] = {}
+            stored_note_urls: dict[str, str] = {}
+            stored_note_sentiments: dict[str, str] = {}
+            stored_note_materials: dict[str, tuple[str, str]] = {}
+            stored_note_semantics: dict[str, tuple[int, str, str, str]] = {}
+            for item in stored_note_rows:
+                try:
+                    note_payload = json.loads(item["payload_json"] or "{}")
+                    if not isinstance(note_payload, dict):
+                        note_payload = {}
+                except (TypeError, ValueError):
+                    note_payload = {}
+                stored_note_author_urls[str(item["note_id"])] = text(note_payload.get("authorUrl"), 2000)
+                stored_note_urls[str(item["note_id"])] = text(item["url"], 4000)
+                stored_note_sentiments[str(item["note_id"])] = persisted_sentiment_label(item["post_sentiment"])
+                stored_note_semantics[str(item["note_id"])] = (
+                    int(item["semantic_analysis_count"] or 0), text(item["analysis_is_negative"], 40),
+                    text(item["negative_type"], 1000), text(item["negative_subtype"], 2000),
+                )
+                media_dir = text(item["media_dir"], 4000)
+                try:
+                    material_files = "\n".join(sorted(
+                        path.name for path in Path(media_dir).iterdir() if path.is_file()
+                    )) if media_dir and Path(media_dir).is_dir() else ""
+                except OSError:
+                    material_files = ""
+                stored_note_materials[str(item["note_id"])] = (media_dir, material_files)
+            stored_comments: dict[str, dict[str, str]] = {}
+            for item in stored_rows:
+                try:
+                    payload = json.loads(item["payload_json"] or "{}")
+                    if not isinstance(payload, dict):
+                        payload = {}
+                except (TypeError, ValueError):
+                    payload = {}
+                stored_comments[str(item["comment_id"])] = {
+                    "authorUrl": text(item["author_url"], 2000),
+                    "parentId": text(item["parent_comment_id"], 256),
+                    "isAuthor": ("是" if bool_value(payload.get("isAuthor")) else "否")
+                    if "isAuthor" in payload else "",
+                    "sentiment": persisted_sentiment_label(item["sentiment"]),
+                    "semantic": (
+                        int(item["semantic_analysis_count"] or 0), text(item["analysis_is_negative"], 40),
+                        text(item["negative_type"], 1000), text(item["negative_subtype"], 2000),
+                    ),
+                    "status": comment_status_label(item["comment_status"], item["is_deleted"]),
+                }
+            tags_changed = 0
+            levels_changed = 0
+            author_urls_filled = 0
+            parent_ids_filled = 0
+            author_flags_filled = 0
+            post_author_urls_aligned = 0
+            note_urls_aligned = 0
+            comment_note_urls_aligned = 0
+            note_sentiments_aligned = 0
+            semantic_fields_aligned = 0
+            comment_sentiments_aligned = 0
+            presence_statuses_aligned = 0
+            material_links_aligned = 0
+            note_statuses = {
+                str(item["note_id"]): post_status_label(item["post_status"], item["is_deleted"])
+                for item in stored_note_rows
+            }
+            for row in note_rows:
+                note_id = valid_note_id(row.get("笔记ID"))
+                stored_url = stored_note_urls.get(note_id, "")
+                raw_post_status = text(row.get("帖子状态"), 40)
+                if note_id in note_statuses and raw_post_status not in {POST_STATUS_PRESENT, POST_STATUS_DELETED}:
+                    row["帖子状态"] = note_statuses[note_id]
+                    presence_statuses_aligned += 1
+                if stored_url and text(row.get("笔记url"), 4000) != stored_url:
+                    row["笔记url"] = stored_url
+                    note_urls_aligned += 1
+                material_dir, material_files = stored_note_materials.get(note_id, ("", ""))
+                if material_dir and (
+                    text(row.get("对应帖子文件夹地址"), 4000) != material_dir
+                    or self._consistent_text(row.get("文件夹内清单"), 50000) != material_files
+                ):
+                    row["对应帖子文件夹地址"] = material_dir
+                    row["文件夹内清单"] = material_files
+                    material_links_aligned += 1
+                stored_sentiment = stored_note_sentiments.get(note_id, "")
+                if stored_sentiment and (
+                    text(row.get("AI情绪判断"), 80) != stored_sentiment
+                    or text(row.get("帖子好坏"), 80) != stored_sentiment
+                ):
+                    row["AI情绪判断"] = stored_sentiment
+                    row["帖子好坏"] = stored_sentiment
+                    note_sentiments_aligned += 1
+                semantic = stored_note_semantics.get(note_id, (0, "", "", ""))
+                if semantic[0] > 0 or any(semantic[1:]):
+                    current_semantic = (
+                        nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                        text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                    )
+                    if current_semantic != semantic:
+                        row["语义分析次数"], row["分析结论是否差评"], row["差评类型"], row["差评子类型"] = semantic
+                        semantic_fields_aligned += 1
+                current = text(row.get("笔记话题"), 6000)
+                normalized = tag_text(current) or ("无话题" if WHITESPACE_RE.sub("", current) == "无话题" else "")
+                if normalized != current:
+                    row["笔记话题"] = normalized
+                    tags_changed += 1
+            for row in comment_rows:
+                stored = stored_comments.get(text(row.get("笔记评论ID"), 256)) or {}
+                raw_comment_status = text(row.get("评论状态"), 40)
+                if stored.get("status") and raw_comment_status not in {COMMENT_STATUS_PRESENT, COMMENT_STATUS_DELETED}:
+                    row["评论状态"] = stored["status"]
+                    presence_statuses_aligned += 1
+                note_id = csv_comment_note_id(row)
+                stored_note_url = stored_note_urls.get(note_id, "")
+                if stored_note_url and text(row.get("原笔记url"), 4000) != stored_note_url:
+                    row["原笔记url"] = stored_note_url
+                    comment_note_urls_aligned += 1
+                material_dir, material_files = stored_note_materials.get(note_id, ("", ""))
+                if material_dir and (
+                    text(row.get("对应帖子文件夹地址"), 4000) != material_dir
+                    or self._consistent_text(row.get("文件夹内清单"), 50000) != material_files
+                ):
+                    row["对应帖子文件夹地址"] = material_dir
+                    row["文件夹内清单"] = material_files
+                    material_links_aligned += 1
+                post_author_url = stored_note_author_urls.get(note_id, "")
+                if post_author_url and text(row.get("帖子用户主页url"), 2000) != post_author_url:
+                    row["帖子用户主页url"] = post_author_url
+                    post_author_urls_aligned += 1
+                if not text(row.get("评论用户主页url"), 2000) and stored.get("authorUrl"):
+                    row["评论用户主页url"] = stored["authorUrl"]
+                    author_urls_filled += 1
+                stored_sentiment = stored.get("sentiment", "")
+                if stored_sentiment and text(row.get("AI情绪判断"), 80) != stored_sentiment:
+                    row["AI情绪判断"] = stored_sentiment
+                    comment_sentiments_aligned += 1
+                semantic = stored.get("semantic", (0, "", "", ""))
+                if semantic[0] > 0 or any(semantic[1:]):
+                    current_semantic = (
+                        nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                        text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                    )
+                    if current_semantic != semantic:
+                        row["语义分析次数"], row["分析结论是否差评"], row["差评类型"], row["差评子类型"] = semantic
+                        semantic_fields_aligned += 1
+                if not text(row.get("父评论ID"), 256) and stored.get("parentId"):
+                    row["父评论ID"] = stored["parentId"]
+                    parent_ids_filled += 1
+                if not text(row.get("是否帖主评论"), 20) and stored.get("isAuthor"):
+                    row["是否帖主评论"] = stored["isAuthor"]
+                    author_flags_filled += 1
+                level = comment_level_value(row.get("评论层级"))
+                if text(row.get("父评论ID"), 256):
+                    level = max(2, level)
+                normalized = f"{level}级评论"
+                if text(row.get("评论层级"), 30) != normalized:
+                    row["评论层级"] = normalized
+                    levels_changed += 1
+            if any((tags_changed, levels_changed, author_urls_filled, parent_ids_filled,
+                    author_flags_filled, post_author_urls_aligned, note_urls_aligned,
+                    comment_note_urls_aligned, note_sentiments_aligned, semantic_fields_aligned,
+                    comment_sentiments_aligned, presence_statuses_aligned, material_links_aligned)):
+                self._replace_csv_pair(
+                    note_headers, note_rows, comment_headers, comment_rows, "field-normalize"
+                )
+            return {
+                "tags": tags_changed, "commentLevels": levels_changed,
+                "commentAuthorUrls": author_urls_filled, "parentCommentIds": parent_ids_filled,
+                "authorFlags": author_flags_filled, "postAuthorUrls": post_author_urls_aligned,
+                "noteUrls": note_urls_aligned, "commentNoteUrls": comment_note_urls_aligned,
+                "noteSentiments": note_sentiments_aligned,
+                "commentSentiments": comment_sentiments_aligned,
+                "semanticFields": semantic_fields_aligned,
+                "presenceStatuses": presence_statuses_aligned,
+                "materialLinks": material_links_aligned,
+            }
+
+    @staticmethod
+    def _material_note_from_db(row: dict[str, Any]) -> dict[str, Any]:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+            if not isinstance(payload, dict):
+                payload = {}
+        except (TypeError, ValueError):
+            payload = {}
+        tags = canonical_tag_items(row.get("tags"))
+        if not tags and text(row.get("tags"), 6000) == "无话题":
+            tags = ["无话题"]
+        return {
+            **browser_note_payload(payload),
+            "noteId": row.get("note_id") or "", "url": row.get("url") or "",
+            "title": row.get("title") or "", "author": row.get("author") or "",
+            "content": row.get("content") or "", "keyword": row.get("keyword") or "",
+            "tags": tags,
+            "postSentiment": persisted_sentiment_label(row.get("post_sentiment")),
+            "accessStatus": row.get("access_status") or "",
+            "accessError": row.get("access_error") or "",
+            "postStatus": post_status_label(row.get("post_status"), row.get("is_deleted")),
+            "isDeleted": bool(row.get("is_deleted")), "deletedAt": row.get("deleted_at") or "",
+            "lastPresenceCheckedAt": row.get("last_presence_checked_at") or "",
+            "semanticAnalysisCount": int(row.get("semantic_analysis_count") or 0),
+            "analysisIsNegative": row.get("analysis_is_negative") or "",
+            "negativeType": row.get("negative_type") or "",
+            "negativeSubtype": row.get("negative_subtype") or "",
+        }
+
+    def _refresh_material_snapshot_for_note(self, note_id: str) -> str:
+        with self.lock, self._session() as db:
+            stored = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+        if stored is None:
+            return ""
+        row = dict(stored)
+        media_dir = text(row.get("media_dir"), 4000)
+        try:
+            folder_exists = bool(media_dir and Path(media_dir).is_dir())
+        except OSError:
+            folder_exists = False
+        if not folder_exists:
+            return ""
+        files = sorted(item.name for item in Path(media_dir).iterdir() if item.is_file())
+        self._write_media_snapshot(
+            {"folder": media_dir, "files": files}, self._material_note_from_db(row),
+            self._comments_as_api(note_id),
+        )
+        actual_count = sum(1 for item in Path(media_dir).iterdir() if item.is_file())
+        with self.lock, self._session() as db:
+            db.execute("UPDATE notes SET media_file_count=? WHERE note_id=?", (actual_count, note_id))
+        return media_dir
+
+    def _refresh_all_material_snapshots(self) -> int:
+        with self.lock, self._session() as db:
+            note_ids = [str(row[0]) for row in db.execute(
+                "SELECT note_id FROM notes WHERE media_dir<>'' AND source='existing_xlsx'"
+            ).fetchall()]
+        return sum(bool(self._refresh_material_snapshot_for_note(note_id)) for note_id in note_ids)
+
+    def repair_data_health(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.pull_lock:
+            with self.lock, self._session() as db:
+                note_ids = {
+                    valid_note_id(row[0]) for row in db.execute(
+                        "SELECT note_id FROM notes UNION SELECT note_id FROM comments"
+                    ).fetchall()
+                }
+            note_ids.discard("")
+            if not note_ids:
+                note_ids.add("checkpoint-empty")
+            checkpoints: list[dict[str, Any]] = []
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(note_ids)):
+                    checkpoints.append(self._capture_sync_checkpoint(
+                        note_id, capture_csv=index == 0, capture_media_binaries=True,
+                        capture_global_database=index == 0,
+                    ))
+                mutation_started = True
+                result = self._repair_data_health_unchecked(payload)
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                rollback_errors = self._rollback_sync_checkpoints(checkpoints)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"数据安全修复失败且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    ) from exc
+                raise
+            if not result.get("ok"):
+                rollback_errors = self._rollback_sync_checkpoints(checkpoints)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"数据安全修复未通过且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    )
+                return {
+                    **result, "rolledBack": True, "health": self.data_health(),
+                    "error": "数据安全修复未通过，已恢复修复前检查点",
+                    "warnings": [*result.get("warnings", []), "修复未通过，已恢复修复前检查点"],
+                }
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return result
+
+    def _repair_data_health_unchecked(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
         actions: list[str] = []
         warnings: list[str] = []
+        try:
+            normalized = self._normalize_csv_cross_store_fields()
+            if any(normalized.values()):
+                actions.append(
+                    f"规范 {normalized['tags']} 个话题、{normalized['commentLevels']} 个评论层级，"
+                    f"补齐 {normalized['commentAuthorUrls']} 个评论主页、"
+                    f"{normalized['parentCommentIds']} 个父评论 ID、"
+                    f"{normalized['authorFlags']} 个帖主标记，并校准 "
+                    f"{normalized['postAuthorUrls']} 个帖子主页链接、"
+                    f"{normalized['noteUrls']} 个帖子链接、"
+                    f"{normalized['commentNoteUrls']} 个评论关联链接、"
+                    f"{normalized['noteSentiments']} 个帖子情绪字段和 "
+                    f"{normalized['materialLinks']} 个素材索引"
+                )
+        except Exception as exc:
+            warnings.append(f"CSV 字段规范化失败：{text(exc, 500)}")
         notes_path = Path(self.seed_xlsx_path) if self.seed_xlsx_path else None
         if notes_path and notes_path.exists():
             try:
@@ -3985,7 +6950,7 @@ class MonitorStore:
         with self.lock, self._session() as db:
             db.execute(
                 """UPDATE notes SET comment_count_collected=(
-                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+                   SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
             )
             actions.append("重算全部帖子评论计数")
             media_rows = db.execute(
@@ -4017,25 +6982,47 @@ class MonitorStore:
                 actions.append(f"迁移 {migrated['updated']} 条旧访问状态")
         except Exception as exc:
             warnings.append(f"访问状态 CSV 回写失败：{text(exc, 500)}")
-        return {"ok": True, "actions": actions, "warnings": warnings, "health": self.data_health()}
+        try:
+            refreshed = self._refresh_all_material_snapshots()
+            if refreshed:
+                actions.append(f"校准 {refreshed} 个素材快照")
+            final_normalized = self._normalize_csv_cross_store_fields()
+            if any(final_normalized.values()) and notes_path:
+                self.seed_from_xlsx(notes_path)
+                actions.append("按最终素材目录再次校准 CSV 索引与 SQLite")
+                refreshed_again = self._refresh_all_material_snapshots()
+                if refreshed_again:
+                    actions.append(f"按最终 CSV/SQLite 状态再次校准 {refreshed_again} 个素材快照")
+        except Exception as exc:
+            warnings.append(f"素材快照校准失败：{text(exc, 500)}")
+        health = self.data_health()
+        if health.get("status") == "critical":
+            warnings.append("安全修复后仍存在 critical 数据问题，未宣告修复成功")
+        return {"ok": not warnings, "actions": actions, "warnings": warnings, "health": health}
 
     @staticmethod
     def _csv_comment_to_api(row: dict[str, Any]) -> dict[str, Any]:
-        level_match = re.search(r"([123])", text(row.get("评论层级"), 30))
-        level = int(level_match.group(1)) if level_match else 1
+        level = comment_level_value(row.get("评论层级"))
         return {
             "commentId": text(row.get("笔记评论ID"), 256),
             "noteId": csv_comment_note_id(row),
             "parentCommentId": text(row.get("父评论ID"), 256),
             "content": text(row.get("评论内容"), 8000),
             "author": text(row.get("用户昵称"), 500),
-            "authorUrl": text(row.get("帖子用户主页url"), 2000),
+            "authorUrl": text(row.get("评论用户主页url"), 2000),
             "publishedAt": text(row.get("评论时间"), 100),
             "likeCount": int(float(text(row.get("点赞量"), 30) or 0)) if re.fullmatch(r"\d+(?:\.\d+)?", text(row.get("点赞量"), 30)) else 0,
             "replyCount": 0,
             "commentLevel": level,
+            "commentType": "子评论" if level >= 2 else "主评论",
             "isAuthor": text(row.get("是否帖主评论"), 20) == "是",
             "sentiment": text(row.get("AI情绪判断"), 80),
+            "commentStatus": comment_status_label(row.get("评论状态")),
+            "isDeleted": comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED,
+            "semanticAnalysisCount": nonnegative_int(row.get("语义分析次数")),
+            "analysisIsNegative": text(row.get("分析结论是否差评"), 40),
+            "negativeType": text(row.get("差评类型"), 1000),
+            "negativeSubtype": text(row.get("差评子类型"), 2000),
         }
 
     @staticmethod
@@ -4047,9 +7034,10 @@ class MonitorStore:
         return {
             "笔记ID": note_id,
             "原笔记url": text(note_row.get("笔记url"), 4000) or f"https://www.xiaohongshu.com/explore/{note_id}",
-            "帖子用户主页url": text(item.get("authorUrl") or item.get("author_url"), 2000),
+            "帖子用户主页url": text(note_row.get("用户主页url"), 2000),
             "笔记评论ID": text(item.get("commentId") or item.get("comment_id"), 256),
             "用户昵称": text(item.get("author"), 500),
+            "评论用户主页url": text(item.get("authorUrl") or item.get("author_url"), 2000),
             "评论内容": text(item.get("content"), 8000),
             "评论时间": text(item.get("publishedAt") or item.get("published_at"), 100),
             "是否帖主评论": "是" if bool_value(item.get("isAuthor")) else "否",
@@ -4061,10 +7049,70 @@ class MonitorStore:
             "AI情绪判断": text(item.get("sentiment"), 80),
             "映射状态": "已映射",
             "映射备注": "",
+            **csv_time_fields(item, kind="comment"),
+            "语义分析次数": nonnegative_int(item.get("semanticAnalysisCount") or item.get("semantic_analysis_count")),
+            "分析结论是否差评": text(item.get("analysisIsNegative") or item.get("analysis_is_negative"), 40),
+            "差评类型": text(item.get("negativeType") or item.get("negative_type"), 1000),
+            "差评子类型": text(item.get("negativeSubtype") or item.get("negative_subtype"), 2000),
+            "评论状态": comment_status_label(
+                item.get("commentStatus") or item.get("comment_status"), item.get("isDeleted") or item.get("is_deleted")
+            ),
         }
 
-    def repair_csv_relationships(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Repair and reconcile notes/comments across CSV, SQLite and material snapshots."""
+    def repair_csv_relationships(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Repair every store under persistent per-note checkpoints."""
+        with self.pull_lock:
+            with self.lock, self._session() as db:
+                note_ids = {
+                    valid_note_id(row[0]) for row in db.execute(
+                        "SELECT note_id FROM notes UNION SELECT note_id FROM comments"
+                    ).fetchall()
+                }
+            note_ids.discard("")
+            try:
+                notes_path, comments_path = self._csv_paths()
+                note_ids.update(
+                    valid_note_id(row.get("笔记ID"))
+                    for row in self._read_csv_table(notes_path, NOTE_CSV_HEADERS)[1]
+                )
+                note_ids.update(
+                    csv_comment_note_id(row)
+                    for row in self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)[1]
+                )
+                note_ids.discard("")
+            except Exception:
+                pass
+            if not note_ids:
+                note_ids.add("checkpoint-empty")
+            checkpoints: list[dict[str, Any]] = []
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(sorted(note_ids)):
+                    checkpoints.append(self._capture_sync_checkpoint(
+                        note_id, capture_csv=index == 0, capture_media_binaries=True,
+                        capture_global_database=index == 0,
+                    ))
+                mutation_started = True
+                result = self._repair_csv_relationships_unchecked(payload)
+                if result.get("warnings") or result.get("health", {}).get("status") == "critical":
+                    raise ValueError("关系修复未通过最终全存储健康检查")
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                rollback_errors = self._rollback_sync_checkpoints(checkpoints)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"关系修复失败且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    ) from exc
+                raise
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return result
+
+    def _repair_csv_relationships_unchecked(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Unchecked relationship repair; public callers provide persistent rollback."""
         notes_path, comments_path = self._csv_paths()
         repair_id = f"csv-relations-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         timestamp = now_iso()
@@ -4212,6 +7260,11 @@ class MonitorStore:
                                 """UPDATE comments SET note_id=?,parent_comment_id=?,content=?,author=?,author_url=?,
                                    published_at=?,like_count=?,comment_level=?,last_seen_at=?,payload_json=?,content_hash=?,
                                    sentiment=CASE WHEN ?<>'' THEN ? ELSE sentiment END,
+                                   semantic_analysis_count=?,analysis_is_negative=?,negative_type=?,negative_subtype=?,
+                                   comment_status=?,is_deleted=?,
+                                   deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ?
+                                                   WHEN ?=0 THEN '' ELSE deleted_at END,
+                                   last_presence_checked_at=?,
                                    review_status=CASE WHEN ? THEN 'mapping_review'
                                       WHEN review_status='mapping_review' THEN 'pending_review' ELSE review_status END,
                                    review_note=CASE WHEN ? THEN ?
@@ -4219,20 +7272,35 @@ class MonitorStore:
                                 (note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
                                  api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, payload_json,
                                  self._content_hash(content_value), sentiment_code(row.get("AI情绪判断")),
-                                 sentiment_code(row.get("AI情绪判断")), int(mapping_review), int(mapping_review),
+                                 sentiment_code(row.get("AI情绪判断")),
+                                 nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                                 text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                                 comment_status_label(row.get("评论状态")),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED), timestamp,
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED), timestamp,
+                                 int(mapping_review), int(mapping_review),
                                  text(row.get("映射备注"), 1000), comment_id),
                             )
                         else:
                             db.execute(
                                 """INSERT INTO comments(comment_id,note_id,parent_comment_id,content,author,author_url,
                                    published_at,like_count,reply_count,comment_url,comment_level,first_seen_at,last_seen_at,
-                                   payload_json,content_hash,review_status,review_note,sentiment)
-                                   VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?)""",
+                                   payload_json,content_hash,review_status,review_note,sentiment,semantic_analysis_count,
+                                   analysis_is_negative,negative_type,negative_subtype,comment_status,is_deleted,
+                                   deleted_at,last_presence_checked_at)
+                                   VALUES(?,?,?,?,?,?,?,?,0,'',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (comment_id, note_id, api["parentCommentId"], content_value, api["author"], api["authorUrl"],
                                  api["publishedAt"], api["likeCount"], api["commentLevel"], timestamp, timestamp,
                                  payload_json, self._content_hash(content_value),
                                  "mapping_review" if mapping_review else "pending_review",
-                                 text(row.get("映射备注"), 1000), sentiment_code(row.get("AI情绪判断"))),
+                                 text(row.get("映射备注"), 1000), sentiment_code(row.get("AI情绪判断")),
+                                 nonnegative_int(row.get("语义分析次数")), text(row.get("分析结论是否差评"), 40),
+                                 text(row.get("差评类型"), 1000), text(row.get("差评子类型"), 2000),
+                                 comment_status_label(row.get("评论状态")),
+                                 int(comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED),
+                                 timestamp if comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED else "",
+                                 timestamp),
                             )
                     db.execute("CREATE TEMP TABLE IF NOT EXISTS repair_comment_ids(comment_id TEXT PRIMARY KEY)")
                     db.execute("DELETE FROM repair_comment_ids")
@@ -4240,7 +7308,7 @@ class MonitorStore:
                     db.execute("DELETE FROM comments WHERE comment_id NOT IN (SELECT comment_id FROM repair_comment_ids)")
                     db.execute(
                         """UPDATE notes SET comment_count_collected=(
-                           SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id)"""
+                           SELECT COUNT(*) FROM comments c WHERE c.note_id=notes.note_id AND c.is_deleted=0)"""
                     )
             except Exception:
                 for target, backup in csv_backups:
@@ -4250,6 +7318,10 @@ class MonitorStore:
             finally:
                 for _target, backup in csv_backups:
                     backup.unlink(missing_ok=True)
+
+            # Re-import the final note rows as the canonical business snapshot
+            # before field-level health checks and material regeneration.
+            self._seed_from_csv(notes_path)
 
             # A historical folder name could be shared by several note IDs.
             # Split it before writing comments.json; otherwise syncing one note
@@ -4307,29 +7379,28 @@ class MonitorStore:
             if shared_media_splits:
                 self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, f"{repair_id}-media-split")
 
+            # Fill source fields that only SQLite/material snapshots retained,
+            # then re-import the canonical rows before regenerating snapshots.
+            self._normalize_csv_cross_store_fields()
+            self._seed_comments_from_csv(comments_path)
+
             material_synced = 0
             with self.lock, self._session() as db:
                 media_rows = [dict(row) for row in db.execute(
-                    "SELECT note_id,title,content,url,payload_json,media_dir FROM notes WHERE media_dir<>''"
+                    "SELECT note_id,media_dir FROM notes WHERE media_dir<>''"
                 ).fetchall()]
             for stored in media_rows:
                 media_dir = text(stored.get("media_dir"), 4000)
                 if not media_dir or not Path(media_dir).is_dir():
                     continue
-                try:
-                    payload = json.loads(stored.get("payload_json") or "{}")
-                    if not isinstance(payload, dict):
-                        payload = {}
-                except (TypeError, ValueError):
-                    payload = {}
-                note = {**payload, "noteId": stored["note_id"], "title": stored["title"],
-                        "content": stored["content"], "url": stored["url"]}
-                files = sorted(item.name for item in Path(media_dir).iterdir() if item.is_file())
-                self._write_media_snapshot(
-                    {"folder": media_dir, "files": files}, note, self._comments_as_api(stored["note_id"])
-                )
-                self._verify_note_store_consistency(stored["note_id"], media_dir)
+                self._refresh_material_snapshot_for_note(stored["note_id"])
+                self._verify_note_store_consistency(stored["note_id"], media_dir, verify_fields=False)
                 material_synced += 1
+            final_normalized = self._normalize_csv_cross_store_fields()
+            if any(final_normalized.values()):
+                self._seed_from_csv(notes_path)
+                self._seed_comments_from_csv(comments_path)
+                material_synced += self._refresh_all_material_snapshots()
             for source_folder in shared_sources_to_remove:
                 with self.lock, self._session() as db:
                     still_referenced = int(db.execute(
@@ -4659,6 +7730,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
 
     def _normalize_snapshot_comments(self, note_id: str, comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Give one browser snapshot canonical IDs before writing every local store."""
+        observation_time = now_iso()
         with self.lock, self._session() as db:
             stored = [dict(row) for row in db.execute(
                 """SELECT comment_id,parent_comment_id,author,content,published_at,payload_json,sentiment
@@ -4670,13 +7742,31 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
              text(row.get("published_at"), 100), text(row.get("parent_comment_id"), 256)): row
             for row in stored
         }
+        by_loose: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for row in stored:
+            key = (text(row.get("author"), 500), text(row.get("content"), 8000),
+                   text(row.get("parent_comment_id"), 256))
+            by_loose.setdefault(key, []).append(row)
+        supplied_by_exact: dict[tuple[str, str, str, str], set[str]] = {}
+        supplied_by_loose: dict[tuple[str, str, str], set[str]] = {}
+        for raw in comments:
+            if not isinstance(raw, dict) or not text(raw.get("content"), 8000):
+                continue
+            supplied_id = text(raw.get("commentId"), 256)
+            if supplied_id:
+                author, content = text(raw.get("author"), 500), text(raw.get("content"), 8000)
+                published_at, parent_id = text(raw.get("publishedAt"), 100), text(raw.get("parentCommentId"), 256)
+                supplied_by_exact.setdefault((author, content, published_at, parent_id), set()).add(supplied_id)
+                supplied_by_loose.setdefault((author, content, parent_id), set()).add(supplied_id)
         aliases: dict[str, str] = {}
         normalized: list[dict[str, Any]] = []
         used: set[str] = set()
         ordered = sorted(
             enumerate(comments),
             key=lambda pair: (max(1, min(int((pair[1] or {}).get("commentLevel") or 1), 3))
-                              if isinstance(pair[1], dict) else 3, pair[0]),
+                              if isinstance(pair[1], dict) else 3,
+                              not bool(text(pair[1].get("commentId"), 256)) if isinstance(pair[1], dict) else True,
+                              pair[0]),
         )
         for _index, raw in ordered:
             if not isinstance(raw, dict) or not text(raw.get("content"), 8000):
@@ -4688,13 +7778,26 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             if supplied_id:
                 canonical_id = supplied_id
             else:
-                existing = by_exact.get((
-                    text(item.get("author"), 500), text(item.get("content"), 8000),
-                    text(item.get("publishedAt"), 100), parent_id,
-                ))
-                canonical_id = text(existing.get("comment_id"), 256) if existing else self._excel_comment_id(
-                    note_id, {**item, "parentCommentId": parent_id}
-                )
+                author, content = text(item.get("author"), 500), text(item.get("content"), 8000)
+                published_at = text(item.get("publishedAt"), 100)
+                key = (author, content, published_at, parent_id)
+                snapshot_ids = supplied_by_exact.get(key, set())
+                if not snapshot_ids and not published_at:
+                    snapshot_ids = supplied_by_loose.get((author, content, parent_id), set())
+                if snapshot_ids:
+                    # A legacy fragment beside stable-ID rows is not another
+                    # uniquely observed comment. Never merge those stable IDs.
+                    if len(snapshot_ids) > 1:
+                        continue
+                    canonical_id = next(iter(snapshot_ids))
+                else:
+                    existing = by_exact.get(key)
+                    if existing is None and not published_at:
+                        candidates = by_loose.get((author, content, parent_id), [])
+                        existing = candidates[0] if len(candidates) == 1 else None
+                    canonical_id = text(existing.get("comment_id"), 256) if existing else self._excel_comment_id(
+                        note_id, {**item, "parentCommentId": parent_id}
+                    )
             if supplied_id:
                 aliases[supplied_id] = canonical_id
             if canonical_id in used:
@@ -4716,8 +7819,35 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             item["commentId"] = canonical_id
             item["parentCommentId"] = parent_id
             item["noteId"] = note_id
+            item = enrich_time_payload(item, observation_time, kind="comment", previous=existing_payload)
             normalized.append(item)
         return normalized
+
+    def _enrich_comment_time_fields(self, note_id: str, comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Time-only projection: keep image-only comments and every stable ID.
+
+        Collection normalization can intentionally reject incomplete browser
+        fragments. A CSV/material writer must never apply that policy to stored
+        history, where a real comment can have images and no text.
+        """
+        with self.lock, self._session() as db:
+            stored = {str(row[0]): row[1] for row in db.execute(
+                "SELECT comment_id,payload_json FROM comments WHERE note_id=?", (note_id,)
+            )}
+        observed = now_iso()
+        result = []
+        for raw in comments:
+            if not isinstance(raw, dict):
+                continue
+            comment_id = text(raw.get("commentId"), 256) or self._excel_comment_id(note_id, raw)
+            try:
+                previous = json.loads(stored.get(comment_id) or "{}")
+                if not isinstance(previous, dict):
+                    previous = {}
+            except (TypeError, ValueError):
+                previous = {}
+            result.append(enrich_time_payload(raw, observed, kind="comment", previous=previous))
+        return result
 
     def _resolve_pull_identity(self, note: dict[str, Any]) -> tuple[str, str]:
         """Resolve a pull strictly by its canonical XHS note ID."""
@@ -5039,7 +8169,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         text_snapshot = "\n".join((
             canonical_note_title(note.get("title"), note.get("content"), 80),
             "",
-            text(note.get("content"), 12000),
+            text(note.get("content"), 20000),
             "",
             f"来源链接：{text(note.get('url'), 2000)}",
         ))
@@ -5063,7 +8193,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         temporary = path.with_name(f".{path.name}.{os.getpid()}-{time.time_ns()}.tmp")
         try:
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, path)
+            replace_material_with_retry(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -5101,7 +8231,18 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "publishedAt": text(row.get("published_at"), 100),
                 "likeCount": int(row.get("like_count") or 0),
                 "replyCount": int(row.get("reply_count") or 0),
+                "commentUrl": text(row.get("comment_url"), 2000),
                 "commentLevel": int(row.get("comment_level") or 1),
+                "commentType": "子评论" if int(row.get("comment_level") or 1) >= 2 else "主评论",
+                "sentiment": persisted_sentiment_label(row.get("sentiment")),
+                "commentStatus": comment_status_label(row.get("comment_status"), row.get("is_deleted")),
+                "isDeleted": bool(row.get("is_deleted")),
+                "deletedAt": text(row.get("deleted_at"), 80),
+                "lastPresenceCheckedAt": text(row.get("last_presence_checked_at"), 80),
+                "semanticAnalysisCount": int(row.get("semantic_analysis_count") or 0),
+                "analysisIsNegative": text(row.get("analysis_is_negative"), 40),
+                "negativeType": text(row.get("negative_type"), 1000),
+                "negativeSubtype": text(row.get("negative_subtype"), 2000),
             })
         return output
 
@@ -5124,13 +8265,31 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     previous = loaded
             except (OSError, ValueError):
                 previous = {}
+        presence = post_status_label(note.get("postStatus"), note.get("isDeleted"))
+        tag_source = note.get("tags") if "tags" in note else previous.get("tags") or []
         metadata = {
             **previous,
+            **browser_note_payload(note),
             "noteId": valid_note_id(note.get("noteId")),
             "url": text(note.get("url"), 2000) or text(previous.get("url"), 2000),
-            "title": canonical_note_title(note.get("title"), note.get("content"), 80),
-            "content": text(note.get("content"), 12000),
-            "tags": note.get("tags") or previous.get("tags") or [],
+            "title": text(note.get("title"), 1000) or canonical_note_title("", note.get("content"), 80),
+            "author": text(note.get("author"), 500),
+            "content": text(note.get("content"), 20000),
+            "keyword": text(note.get("keyword"), 200),
+            "tags": canonical_tag_items(tag_source) or (
+                ["无话题"] if tag_text(tag_source) == "无话题" else []
+            ),
+            "postSentiment": text(note.get("postSentiment"), 80),
+            "accessStatus": text(note.get("accessStatus"), 40),
+            "accessError": text(note.get("accessError"), 1000),
+            "semanticAnalysisCount": nonnegative_int(note.get("semanticAnalysisCount")),
+            "analysisIsNegative": text(note.get("analysisIsNegative"), 40),
+            "negativeType": text(note.get("negativeType"), 1000),
+            "negativeSubtype": text(note.get("negativeSubtype"), 2000),
+            "postStatus": presence,
+            "isDeleted": presence == POST_STATUS_DELETED,
+            "deletedAt": text(note.get("deletedAt"), 80) if presence == POST_STATUS_DELETED else "",
+            "lastPresenceCheckedAt": text(note.get("lastPresenceCheckedAt"), 80) or now_iso(),
             "syncedAt": now_iso(),
         }
         self._write_json_atomic(metadata_path, metadata)
@@ -5141,42 +8300,433 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         temporary = text_path.with_name(f".{text_path.name}.{os.getpid()}-{time.time_ns()}.tmp")
         try:
             temporary.write_text(text_snapshot, encoding="utf-8")
-            os.replace(temporary, text_path)
+            replace_material_with_retry(temporary, text_path)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _verify_note_store_consistency(self, note_id: str, media_dir: str = "") -> dict[str, Any]:
+    def _write_material_note_presence(
+        self, note_id: str, media_dir: str, status: str, checked_at: str, deleted_at: str = ""
+    ) -> bool:
+        folder = Path(text(media_dir, 4000)) if text(media_dir, 4000) else None
+        if not folder or not folder.is_dir():
+            return False
+        path = folder / "note.json"
+        previous: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    previous = loaded
+            except (OSError, ValueError):
+                previous = {}
+        previous.update({
+            "noteId": note_id,
+            "postStatus": post_status_label(status),
+            "isDeleted": post_status_label(status) == POST_STATUS_DELETED,
+            "deletedAt": deleted_at if post_status_label(status) == POST_STATUS_DELETED else "",
+            "lastPresenceCheckedAt": checked_at,
+        })
+        self._write_json_atomic(path, previous)
+        return True
+
+    @staticmethod
+    def _consistent_text(value: Any, limit: int = 20000) -> str:
+        return text(value, limit).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _verify_note_field_consistency(
+        self,
+        note_id: str,
+        csv_note: dict[str, Any],
+        csv_comments: list[dict[str, Any]],
+        db_note: dict[str, Any],
+        db_comments: list[dict[str, Any]],
+        media_dir: str,
+    ) -> dict[str, Any]:
+        """Verify source, semantic and presence fields—not only ID sets."""
+        mismatches: list[str] = []
+
+        def same(label: str, left: Any, right: Any, limit: int = 20000) -> None:
+            if self._consistent_text(left, limit) != self._consistent_text(right, limit):
+                mismatches.append(label)
+
+        try:
+            note_payload = json.loads(db_note.get("payload_json") or "{}")
+            if not isinstance(note_payload, dict):
+                note_payload = {}
+        except (TypeError, ValueError):
+            note_payload = {}
+        same("帖子.标题", csv_note.get("笔记标题"), db_note.get("title"), 1000)
+        same("帖子.作者", csv_note.get("用户昵称"), db_note.get("author"), 500)
+        same("帖子.正文", csv_note.get("笔记内容"), db_note.get("content"))
+        same("帖子.来源词", csv_note.get("来源词"), db_note.get("keyword"), 200)
+        if tag_text(csv_note.get("笔记话题")) != tag_text(db_note.get("tags")):
+            mismatches.append("帖子.话题")
+        if normalize_xhs_url(csv_note.get("笔记url")) != normalize_xhs_url(db_note.get("url")):
+            mismatches.append("帖子.URL")
+        for csv_name, payload_name in NOTE_CSV_SOURCE_FIELDS.items():
+            if payload_name in note_payload:
+                same(f"帖子.{csv_name}", csv_note.get(csv_name), note_payload.get(payload_name), 4000)
+        if "publishedAt" in note_payload:
+            same("帖子.发布日期", csv_note.get("发布日期"), text(note_payload.get("publishedAt"), 100)[:10], 20)
+        if isinstance(note_payload.get("publishedTime"), dict):
+            for name, value in csv_time_fields(note_payload).items():
+                same(f"帖子.{name}", csv_note.get(name), value, 1000)
+        same("帖子.素材目录", csv_note.get("对应帖子文件夹地址"), db_note.get("media_dir"), 4000)
+        actual_material_files: list[str] = []
+        try:
+            if media_dir and Path(media_dir).is_dir():
+                actual_material_files = sorted(path.name for path in Path(media_dir).iterdir() if path.is_file())
+        except OSError:
+            actual_material_files = []
+        csv_note_files = sorted(
+            line.strip() for line in self._consistent_text(csv_note.get("文件夹内清单"), 50000).splitlines()
+            if line.strip()
+        )
+        if actual_material_files and csv_note_files != actual_material_files:
+            mismatches.append("帖子.素材文件清单")
+        if actual_material_files and int(db_note.get("media_file_count") or 0) != len(actual_material_files):
+            mismatches.append("帖子.素材文件计数")
+        expected_sentiment = persisted_sentiment_label(db_note.get("post_sentiment"))
+        same("帖子.AI情绪", csv_note.get("AI情绪判断"), expected_sentiment, 80)
+        same("帖子.好坏", csv_note.get("帖子好坏"), expected_sentiment, 80)
+        expected_access = {
+            "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""
+        }.get(text(db_note.get("access_status"), 40), text(db_note.get("access_status"), 40))
+        same("帖子.访问状态", csv_note.get("访问状态"), expected_access, 100)
+        csv_note_semantic = (
+            nonnegative_int(csv_note.get("语义分析次数")), text(csv_note.get("分析结论是否差评"), 40),
+            text(csv_note.get("差评类型"), 1000), text(csv_note.get("差评子类型"), 2000),
+        )
+        db_note_semantic = (
+            int(db_note.get("semantic_analysis_count") or 0), text(db_note.get("analysis_is_negative"), 40),
+            text(db_note.get("negative_type"), 1000), text(db_note.get("negative_subtype"), 2000),
+        )
+        if csv_note_semantic != db_note_semantic:
+            mismatches.append("帖子.语义字段")
+
+        csv_by_id = {
+            text(row.get("笔记评论ID"), 256): row for row in csv_comments if text(row.get("笔记评论ID"), 256)
+        }
+        db_by_id = {text(row.get("comment_id"), 256): row for row in db_comments}
+        for comment_id in sorted(set(csv_by_id).intersection(db_by_id)):
+            csv_row, db_row = csv_by_id[comment_id], db_by_id[comment_id]
+            prefix = f"评论[{comment_id}]"
+            same(f"{prefix}.笔记ID", csv_comment_note_id(csv_row), db_row.get("note_id"), 128)
+            same(f"{prefix}.作者", csv_row.get("用户昵称"), db_row.get("author"), 500)
+            same(f"{prefix}.作者主页", csv_row.get("评论用户主页url"), db_row.get("author_url"), 2000)
+            same(f"{prefix}.正文", csv_row.get("评论内容"), db_row.get("content"), 8000)
+            same(f"{prefix}.时间", csv_row.get("评论时间"), db_row.get("published_at"), 100)
+            same(f"{prefix}.父评论", csv_row.get("父评论ID"), db_row.get("parent_comment_id"), 256)
+            same(f"{prefix}.素材目录", csv_row.get("对应帖子文件夹地址"), db_note.get("media_dir"), 4000)
+            csv_comment_files = sorted(
+                line.strip() for line in self._consistent_text(csv_row.get("文件夹内清单"), 50000).splitlines()
+                if line.strip()
+            )
+            if actual_material_files and csv_comment_files != actual_material_files:
+                mismatches.append(f"{prefix}.素材文件清单")
+            if normalize_xhs_url(csv_row.get("原笔记url")) != normalize_xhs_url(db_note.get("url")):
+                mismatches.append(f"{prefix}.原笔记URL")
+            if "authorUrl" in note_payload:
+                same(f"{prefix}.帖子作者主页", csv_row.get("帖子用户主页url"), note_payload.get("authorUrl"), 2000)
+            if nonnegative_int(csv_row.get("点赞量")) != int(db_row.get("like_count") or 0):
+                mismatches.append(f"{prefix}.点赞量")
+            if comment_level_value(csv_row.get("评论层级")) != int(db_row.get("comment_level") or 1):
+                mismatches.append(f"{prefix}.评论层级")
+            csv_semantic = (
+                nonnegative_int(csv_row.get("语义分析次数")), text(csv_row.get("分析结论是否差评"), 40),
+                text(csv_row.get("差评类型"), 1000), text(csv_row.get("差评子类型"), 2000),
+            )
+            db_semantic = (
+                int(db_row.get("semantic_analysis_count") or 0), text(db_row.get("analysis_is_negative"), 40),
+                text(db_row.get("negative_type"), 1000), text(db_row.get("negative_subtype"), 2000),
+            )
+            if csv_semantic != db_semantic:
+                mismatches.append(f"{prefix}.语义字段")
+            try:
+                comment_payload = json.loads(db_row.get("payload_json") or "{}")
+                if not isinstance(comment_payload, dict):
+                    comment_payload = {}
+            except (TypeError, ValueError):
+                comment_payload = {}
+            if isinstance(comment_payload.get("publishedTime"), dict):
+                for name, value in csv_time_fields(comment_payload, kind="comment").items():
+                    same(f"{prefix}.{name}", csv_row.get(name), value, 1000)
+            expected_comment_sentiment = persisted_sentiment_label(db_row.get("sentiment"))
+            same(f"{prefix}.AI情绪", csv_row.get("AI情绪判断"), expected_comment_sentiment, 80)
+            if "isAuthor" in comment_payload:
+                expected_author = "是" if bool_value(comment_payload.get("isAuthor")) else "否"
+                if text(csv_row.get("是否帖主评论"), 20) != expected_author:
+                    mismatches.append(f"{prefix}.是否帖主评论")
+
+        material_note: dict[str, Any] | None = None
+        material_comments: list[dict[str, Any]] | None = None
+        if media_dir and Path(media_dir).is_dir():
+            note_path, comments_path = Path(media_dir) / "note.json", Path(media_dir) / "comments.json"
+            if not note_path.is_file():
+                mismatches.append("素材.note.json缺失")
+            if note_path.is_file():
+                loaded_note = json.loads(note_path.read_text(encoding="utf-8-sig"))
+                material_note = loaded_note if isinstance(loaded_note, dict) else {}
+                same("素材.标题", material_note.get("title"), db_note.get("title"), 1000)
+                same("素材.作者", material_note.get("author"), db_note.get("author"), 500)
+                same("素材.正文", material_note.get("content"), db_note.get("content"))
+                same("素材.来源词", material_note.get("keyword"), db_note.get("keyword"), 200)
+                if normalize_xhs_url(material_note.get("url")) != normalize_xhs_url(db_note.get("url")):
+                    mismatches.append("素材.URL")
+                if tag_text(material_note.get("tags")) != tag_text(db_note.get("tags")):
+                    mismatches.append("素材.话题")
+                for payload_name in (
+                    "authorUrl", "authorId", "likeCount", "collectCount", "commentCount", "shareCount",
+                    "publishedAt", "updatedAt", "ipLocation", "ipRegion", "ipRegionSource", "ipRegionVersion", "imageCount", "timeObservedAt",
+                ):
+                    if payload_name in note_payload:
+                        same(f"素材.{payload_name}", material_note.get(payload_name), note_payload.get(payload_name), 4000)
+                for key in ("publishedTime", "updatedTime"):
+                    if key in note_payload and material_note.get(key) != note_payload.get(key):
+                        mismatches.append(f"素材.{key}")
+                same("素材.AI情绪", material_note.get("postSentiment"), expected_sentiment, 80)
+                same("素材.访问状态", material_note.get("accessStatus"), db_note.get("access_status"), 40)
+                material_semantic = (
+                    nonnegative_int(material_note.get("semanticAnalysisCount")),
+                    text(material_note.get("analysisIsNegative"), 40),
+                    text(material_note.get("negativeType"), 1000),
+                    text(material_note.get("negativeSubtype"), 2000),
+                )
+                if material_semantic != db_note_semantic:
+                    mismatches.append("素材.语义字段")
+                body_path = Path(media_dir) / "帖子正文.txt"
+                if not body_path.is_file():
+                    mismatches.append("素材.正文快照缺失")
+                else:
+                    expected_body = "\n".join((
+                        text(db_note.get("title"), 1000), "", text(db_note.get("content"), 20000), "",
+                        f"来源链接：{text(db_note.get('url'), 2000)}",
+                    ))
+                    same("素材.正文快照", body_path.read_text(encoding="utf-8-sig"), expected_body, 25000)
+            if not comments_path.is_file():
+                mismatches.append("素材.comments.json缺失")
+            if comments_path.is_file():
+                loaded_comments = json.loads(comments_path.read_text(encoding="utf-8-sig"))
+                material_comments = loaded_comments if isinstance(loaded_comments, list) else []
+                material_by_id = {
+                    text(row.get("commentId"), 256): row for row in material_comments
+                    if isinstance(row, dict) and text(row.get("commentId"), 256)
+                }
+                for comment_id in sorted(set(material_by_id).intersection(db_by_id)):
+                    material_row, db_row = material_by_id[comment_id], db_by_id[comment_id]
+                    prefix = f"素材评论[{comment_id}]"
+                    same(f"{prefix}.正文", material_row.get("content"), db_row.get("content"), 8000)
+                    same(f"{prefix}.作者", material_row.get("author"), db_row.get("author"), 500)
+                    same(f"{prefix}.作者主页", material_row.get("authorUrl"), db_row.get("author_url"), 2000)
+                    same(f"{prefix}.时间", material_row.get("publishedAt"), db_row.get("published_at"), 100)
+                    stored_time_payload = json.loads(db_row.get("payload_json") or "{}")
+                    for location_key in ("ipRegion", "ipRegionSource", "ipRegionVersion"):
+                        if location_key in stored_time_payload and material_row.get(location_key) != stored_time_payload.get(location_key):
+                            mismatches.append(f"{prefix}.{location_key}")
+                    if isinstance(stored_time_payload.get("publishedTime"), dict):
+                        if material_row.get("publishedTime") != stored_time_payload.get("publishedTime"):
+                            mismatches.append(f"{prefix}.标准时间")
+                    same(f"{prefix}.父评论", material_row.get("parentCommentId"), db_row.get("parent_comment_id"), 256)
+                    if nonnegative_int(material_row.get("likeCount")) != int(db_row.get("like_count") or 0):
+                        mismatches.append(f"{prefix}.点赞量")
+                    if int(material_row.get("commentLevel") or 1) != int(db_row.get("comment_level") or 1):
+                        mismatches.append(f"{prefix}.评论层级")
+                    expected_comment_type = "子评论" if int(db_row.get("comment_level") or 1) >= 2 else "主评论"
+                    same(f"{prefix}.评论类型", material_row.get("commentType"), expected_comment_type, 20)
+                    expected_material_sentiment = persisted_sentiment_label(db_row.get("sentiment"))
+                    same(f"{prefix}.AI情绪", material_row.get("sentiment"), expected_material_sentiment, 80)
+                    material_comment_semantic = (
+                        nonnegative_int(material_row.get("semanticAnalysisCount")),
+                        text(material_row.get("analysisIsNegative"), 40),
+                        text(material_row.get("negativeType"), 1000),
+                        text(material_row.get("negativeSubtype"), 2000),
+                    )
+                    db_comment_semantic = (
+                        int(db_row.get("semantic_analysis_count") or 0),
+                        text(db_row.get("analysis_is_negative"), 40),
+                        text(db_row.get("negative_type"), 1000),
+                        text(db_row.get("negative_subtype"), 2000),
+                    )
+                    if material_comment_semantic != db_comment_semantic:
+                        mismatches.append(f"{prefix}.语义字段")
+        if mismatches:
+            sample = "、".join(mismatches[:6])
+            raise ValueError(f"本地字段一致性校验失败：{len(mismatches)} 项（{sample}）")
+        canonical = {
+            "noteId": note_id,
+            "postStatus": post_status_label(db_note.get("post_status"), db_note.get("is_deleted")),
+            "note": {
+                **{key: db_note.get(key) for key in (
+                    "url", "title", "author", "content", "keyword", "tags", "post_sentiment",
+                    "access_status", "semantic_analysis_count", "analysis_is_negative",
+                    "negative_type", "negative_subtype", "post_status", "is_deleted",
+                )},
+                "source": browser_note_payload(note_payload),
+            },
+            "comments": [{key: row.get(key) for key in (
+                "comment_id", "note_id", "parent_comment_id", "content", "author", "author_url",
+                "published_at", "like_count", "comment_level", "sentiment", "semantic_analysis_count",
+                "analysis_is_negative", "negative_type", "negative_subtype", "comment_status", "is_deleted",
+            )} for row in sorted(db_comments, key=lambda item: text(item.get("comment_id"), 256))],
+        }
+        def digest(value: Any) -> str:
+            return hashlib.sha256(
+                json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+
+        store_hashes = {
+            "sqlite": digest(canonical),
+            "notesCsv": digest(csv_note),
+            "commentsCsv": digest(sorted(
+                csv_comments, key=lambda row: text(row.get("笔记评论ID"), 256)
+            )),
+            "materialNote": digest(material_note) if material_note is not None else "",
+            "materialComments": digest(sorted(
+                material_comments or [], key=lambda row: text(row.get("commentId"), 256)
+            )) if material_comments is not None else "",
+        }
+        state_hash = digest(store_hashes)
+        return {
+            "fieldChecks": 32 + len(db_comments) * 20,
+            "stateHash": state_hash, "storeHashes": store_hashes,
+        }
+
+    def _batch_csv_verification_context(self):
+        """Internal-only scope, entered after every batch write/material refresh."""
+        if __package__:
+            from .csv_verification_context import verification_batch
+        else:
+            from csv_verification_context import verification_batch
+        return verification_batch(
+            self, self._csv_paths(), (NOTE_CSV_HEADERS, COMMENT_CSV_HEADERS),
+            lambda row: valid_note_id(row.get("笔记ID")), csv_comment_note_id,
+            lambda row: text(row.get("笔记评论ID"), 256),
+        )
+
+    def _verify_note_store_consistency(
+        self, note_id: str, media_dir: str = "", verify_fields: bool = True
+    ) -> dict[str, Any]:
+        if __package__:
+            from .csv_verification_context import active_for
+        else:
+            from csv_verification_context import active_for
         notes_path, comments_path = self._csv_paths()
-        _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
-        _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
-        note_matches = sum(valid_note_id(row.get("笔记ID")) == note_id for row in note_rows)
-        csv_ids = {text(row.get("笔记评论ID"), 256) for row in comment_rows
-                   if csv_comment_note_id(row) == note_id and text(row.get("笔记评论ID"), 256)}
+        csv_context = active_for(self, (notes_path, comments_path))
+        if csv_context is None:
+            _note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+            _comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+            matching_note_rows = [row for row in note_rows if valid_note_id(row.get("笔记ID")) == note_id]
+            target_comment_rows = [row for row in comment_rows if csv_comment_note_id(row) == note_id]
+        else:
+            matching_note_rows = [dict(row) for row in csv_context.notes.get(note_id, ())]
+            target_comment_rows = [dict(row) for row in csv_context.comments.get(note_id, ())]
+        note_matches = len(matching_note_rows)
+        csv_post_status = post_status_label(matching_note_rows[0].get("帖子状态")) if note_matches == 1 else ""
+        csv_access_status = {
+            "可打开": "ok", "待复核": "check_failed", "打不开": "unreachable", "": ""
+        }.get(text(matching_note_rows[0].get("访问状态"), 100), "__invalid__") if note_matches == 1 else ""
+        target_comment_ids = [
+            text(row.get("笔记评论ID"), 256) for row in target_comment_rows
+            if text(row.get("笔记评论ID"), 256)
+        ]
+        if len(target_comment_ids) != len(target_comment_rows):
+            raise ValueError("本地一致性校验失败：评论 CSV 存在空评论 ID 行")
+        if len(target_comment_ids) != len(set(target_comment_ids)):
+            raise ValueError("本地一致性校验失败：评论 CSV 存在重复评论 ID 行")
+        csv_status = {
+            text(row.get("笔记评论ID"), 256): comment_status_label(row.get("评论状态"))
+            for row in target_comment_rows if text(row.get("笔记评论ID"), 256)
+        }
+        csv_ids = set(csv_status)
         with self.lock, self._session() as db:
-            db_ids = {str(row[0]) for row in db.execute(
-                "SELECT comment_id FROM comments WHERE note_id=?", (note_id,)
-            ).fetchall()}
+            db_comment_rows = [dict(row) for row in db.execute(
+                "SELECT * FROM comments WHERE note_id=?", (note_id,)
+            ).fetchall()]
+            db_status = {
+                text(row.get("comment_id"), 256): comment_status_label(
+                    row.get("comment_status"), row.get("is_deleted")
+                ) for row in db_comment_rows
+            }
+            db_note_row = db.execute("SELECT * FROM notes WHERE note_id=?", (note_id,)).fetchone()
+            db_note = dict(db_note_row) if db_note_row else {}
+            db_post_status = post_status_label(
+                db_note.get("post_status"), db_note.get("is_deleted")
+            ) if db_note else ""
+        db_ids = set(db_status)
         if note_matches != 1:
             raise ValueError(f"本地一致性校验失败：笔记 CSV 中该帖子有 {note_matches} 行")
+        if csv_post_status != db_post_status:
+            raise ValueError("本地一致性校验失败：笔记 CSV 与 SQLite 的存在/已删除状态不一致")
+        if csv_access_status != text(db_note.get("access_status"), 40):
+            raise ValueError("本地一致性校验失败：笔记 CSV 与 SQLite 的访问状态不一致")
         if csv_ids != db_ids:
             raise ValueError(
                 f"本地一致性校验失败：评论 CSV={len(csv_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
             )
+        if csv_status != db_status:
+            raise ValueError("本地一致性校验失败：评论 CSV 与 SQLite 的存在/已删除状态不一致")
+        cross_note_ids = ({
+            text(row.get("笔记评论ID"), 256) for row in comment_rows
+            if text(row.get("笔记评论ID"), 256) in db_ids and csv_comment_note_id(row) != note_id
+        } if csv_context is None else {
+            comment_id for comment_id in db_ids
+            if csv_context.owners.get(comment_id, frozenset()) - {note_id}
+        })
+        if cross_note_ids:
+            raise ValueError("本地一致性校验失败：评论 ID 同时出现在其他帖子")
         material_ids: set[str] | None = None
+        if media_dir and not Path(media_dir).is_dir():
+            raise ValueError("本地一致性校验失败：SQLite 素材目录不存在")
         if media_dir and Path(media_dir).is_dir():
+            note_snapshot_path = Path(media_dir) / "note.json"
+            if not note_snapshot_path.is_file():
+                raise ValueError("本地一致性校验失败：素材目录缺少 note.json")
+            note_snapshot = json.loads(note_snapshot_path.read_text(encoding="utf-8-sig"))
+            material_post_status = post_status_label(
+                note_snapshot.get("postStatus") if isinstance(note_snapshot, dict) else "",
+                note_snapshot.get("isDeleted") if isinstance(note_snapshot, dict) else None,
+            )
+            if material_post_status != db_post_status:
+                raise ValueError("本地一致性校验失败：素材快照与 SQLite 的帖子状态不一致")
+            if text(note_snapshot.get("accessStatus"), 40) != text(db_note.get("access_status"), 40):
+                raise ValueError("本地一致性校验失败：素材快照与 SQLite 的访问状态不一致")
             material_path = Path(media_dir) / "comments.json"
             if not material_path.is_file():
                 raise ValueError("本地一致性校验失败：素材目录缺少 comments.json")
             loaded = json.loads(material_path.read_text(encoding="utf-8-sig"))
-            material_ids = {text(item.get("commentId"), 256) for item in loaded
-                            if isinstance(item, dict) and text(item.get("commentId"), 256)}
+            if not isinstance(loaded, list):
+                raise ValueError("本地一致性校验失败：comments.json 不是数组")
+            material_id_rows = [
+                text(item.get("commentId"), 256) for item in loaded
+                if isinstance(item, dict) and text(item.get("commentId"), 256)
+            ]
+            if len(material_id_rows) != len(set(material_id_rows)):
+                raise ValueError("本地一致性校验失败：comments.json 存在重复评论 ID")
+            material_status = {
+                text(item.get("commentId"), 256): comment_status_label(
+                    item.get("commentStatus"), item.get("isDeleted")
+                )
+                for item in loaded if isinstance(item, dict) and text(item.get("commentId"), 256)
+            }
+            material_ids = set(material_status)
             if material_ids != db_ids:
                 raise ValueError(
                     f"本地一致性校验失败：素材评论={len(material_ids)}，SQLite={len(db_ids)}，ID 集合不一致"
                 )
+            if material_status != db_status:
+                raise ValueError("本地一致性校验失败：素材快照与 SQLite 的评论状态不一致")
+        field_result = self._verify_note_field_consistency(
+            note_id, matching_note_rows[0],
+            target_comment_rows, db_note, db_comment_rows, media_dir,
+        ) if verify_fields else {"fieldChecks": 0, "stateHash": "", "storeHashes": {}}
+        deleted_count = sum(status == COMMENT_STATUS_DELETED for status in db_status.values())
         return {
             "ok": True, "noteId": note_id, "noteRows": note_matches,
-            "commentIds": len(db_ids), "materialIds": len(material_ids) if material_ids is not None else None,
+            "postStatus": db_post_status,
+            "commentIds": len(db_ids), "activeComments": len(db_ids) - deleted_count,
+            "deletedComments": deleted_count,
+            "materialIds": len(material_ids) if material_ids is not None else None,
+            **field_result,
         }
 
     def _legacy_sync_pull_to_xlsx(
@@ -5217,6 +8767,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             note_sheet = workbook["sheet1_笔记总表"]
             comment_sheet = workbook["sheet2_评论总表"]
             self._ensure_excel_header(note_sheet, "访问状态")
+            self._ensure_excel_header(comment_sheet, "评论状态")
             note_headers = self._excel_headers(note_sheet)
             comment_headers = self._excel_headers(comment_sheet)
             if "笔记ID" not in note_headers:
@@ -5344,6 +8895,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     "对应帖子文件夹地址": media_folder,
                     "文件夹内清单": media_files,
                     "AI情绪判断": text(item.get("sentiment"), 80),
+                    "评论状态": COMMENT_STATUS_PRESENT,
                 }
                 for name, value in comment_fields.items():
                     column = comment_headers.get(name)
@@ -5403,12 +8955,47 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         self._ensure_seed_workbook(notes_path)
         media_result = media_result or {}
         media_folder = text(media_result.get("folder"), 4000)
-        media_files = "\n".join(text(item, 300) for item in (media_result.get("files") or []) if text(item, 300))
+        media_file_names = [
+            text(item, 300) for item in (media_result.get("files") or []) if text(item, 300)
+        ]
+        try:
+            if media_folder and Path(media_folder).is_dir():
+                media_file_names.extend(path.name for path in Path(media_folder).iterdir() if path.is_file())
+        except OSError:
+            pass
+        if media_folder:
+            media_file_names.extend(("note.json", "comments.json", "帖子正文.txt"))
+        media_files = "\n".join(sorted(dict.fromkeys(media_file_names)))
         note_id = valid_note_id(note.get("noteId"))
         if not note_id:
             raise ValueError("noteId is required")
+        comments = self._enrich_comment_time_fields(note_id, comments)
         note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
         comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        existing_comment_ids = [
+            text(row.get("笔记评论ID"), 256) for row in comment_rows
+            if text(row.get("笔记评论ID"), 256)
+        ]
+        duplicate_existing_ids = [
+            comment_id for comment_id, count in Counter(existing_comment_ids).items() if count > 1
+        ]
+        if duplicate_existing_ids:
+            raise ValueError(
+                f"评论 CSV 已存在重复评论 ID，已停止同步：{'、'.join(duplicate_existing_ids[:8])}"
+            )
+        incoming_comment_ids = {
+            text(item.get("commentId"), 256) for item in comments
+            if isinstance(item, dict) and text(item.get("commentId"), 256)
+        }
+        cross_note_ids = {
+            text(row.get("笔记评论ID"), 256) for row in comment_rows
+            if text(row.get("笔记评论ID"), 256) in incoming_comment_ids
+            and csv_comment_note_id(row) not in {"", note_id}
+        }
+        if cross_note_ids:
+            raise ValueError(
+                f"评论 ID 已属于其他帖子，已停止串帖写入：{'、'.join(sorted(cross_note_ids)[:8])}"
+            )
 
         existing_index = next((index for index, row in enumerate(note_rows)
                                if valid_note_id(row.get("笔记ID")) == note_id), None)
@@ -5433,63 +9020,91 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         stored_url_id = note_url_identity(note_url)
         if stored_url_id and stored_url_id != note_id:
             note_url = normalize_xhs_url(f"https://www.xiaohongshu.com/explore/{note_id}")
-        note_tags = tag_text(note.get("tags")) or ("无话题" if note.get("detailRead") else "")
+        note_tags = tag_text(note.get("tags")) if "tags" in note else text(
+            note_row_data.get("笔记话题"), 6000
+        )
+        note["url"] = note_url
+        if note_tags:
+            note["tags"] = canonical_tag_items(note_tags) or (["无话题"] if note_tags == "无话题" else [])
         note_fields = {
             "笔记url": note_url, "用户主页url": text(note.get("authorUrl"), 2000),
             "用户昵称": text(note.get("author"), 500),
             "笔记标题": canonical_note_title(note.get("title"), note.get("content"), 80),
-            "笔记内容": text(note.get("content"), 12000), "笔记话题": note_tags,
+            "笔记内容": text(note.get("content"), 20000), "笔记话题": note_tags,
             "点赞量": note.get("likeCount", ""), "收藏量": note.get("collectCount", ""),
             "评论量": note.get("commentCount", ""), "分享量": note.get("shareCount", ""),
             "发布时间": text(note.get("publishedAt"), 100), "更新时间": text(note.get("updatedAt"), 100),
             "IP地址": text(note.get("ipLocation"), 100),
-            "图片数量": note.get("imageCount", len(note.get("imageUrls") or [])),
+            "图片数量": note.get("imageCount") if "imageCount" in note else (
+                len(note.get("imageUrls") or []) if "imageUrls" in note else ""
+            ),
             "发布日期": text(note.get("publishedAt"), 100)[:10], "来源词": text(note.get("keyword"), 200),
             "笔记ID": note_id, "博主ID": text(note.get("authorId"), 256),
             "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
             "AI情绪判断": text(note.get("postSentiment"), 80), "帖子好坏": text(note.get("postSentiment"), 80),
             "访问状态": "可打开",
+            "帖子状态": POST_STATUS_PRESENT,
+            **csv_time_fields(note),
         }
         for name, value in note_fields.items():
-            set_note_value(name, value)
+            source_key = NOTE_CSV_SOURCE_FIELDS.get(name)
+            supplied_source = source_key is not None and source_key in note
+            supplied_date = name == "发布日期" and "publishedAt" in note
+            if name in NOTE_TIME_HEADERS or supplied_source or supplied_date:
+                # The final merged payload already preserves omitted source
+                # keys. Do not retain an old CSV value over an explicit blank.
+                note_row_data[name] = value
+            else:
+                set_note_value(name, value)
 
         removed_comments = 0
-        if replace_comments:
-            retained = [row for row in comment_rows if csv_comment_note_id(row) != note_id]
-            removed_comments = len(comment_rows) - len(retained)
-            comment_rows = retained
-        else:
-            for row in comment_rows:
-                if csv_comment_note_id(row) == note_id:
-                    row["笔记ID"] = note_id
-                    row["映射状态"] = "已映射"
-                    row["映射备注"] = ""
+        previously_present_ids: set[str] = set()
+        for row in comment_rows:
+            if csv_comment_note_id(row) != note_id:
+                continue
+            row["笔记ID"] = note_id
+            row["原笔记url"] = note_url
+            if "authorUrl" in note:
+                row["帖子用户主页url"] = text(note.get("authorUrl"), 2000)
+            if media_folder:
+                row["对应帖子文件夹地址"] = media_folder
+                row["文件夹内清单"] = media_files
+            row["映射状态"] = "已映射"
+            row["映射备注"] = ""
+            previous_status = comment_status_label(row.get("评论状态"))
+            if not text(row.get("评论状态"), 40):
+                row["评论状态"] = COMMENT_STATUS_PRESENT
+            if replace_comments:
+                if previous_status != COMMENT_STATUS_DELETED and text(row.get("笔记评论ID"), 256):
+                    previously_present_ids.add(text(row.get("笔记评论ID"), 256))
+                row["评论状态"] = COMMENT_STATUS_DELETED
 
         by_id: dict[str, int] = {}
-        by_key: dict[tuple[str, str, str, str], int] = {}
-        by_loose: dict[tuple[str, str, str], int] = {}
+        by_key: dict[tuple[str, str, str, str, str], int] = {}
+        by_loose: dict[tuple[str, str, str, str], int] = {}
         for index, row in enumerate(comment_rows):
             row_id = text(row.get("笔记评论ID"), 256)
             if row_id:
                 by_id[row_id] = index
-            key = (csv_comment_note_id(row), text(row.get("用户昵称"), 500),
+            key = (csv_comment_note_id(row), text(row.get("父评论ID"), 256), text(row.get("用户昵称"), 500),
                    text(row.get("评论内容"), 8000), text(row.get("评论时间"), 100))
             if any(key):
                 by_key[key] = index
-                by_loose[key[:3]] = index
+                by_loose[key[:4]] = index
         inserted_comments = 0
         duplicate_comments = 0
         for item in comments:
             if not isinstance(item, dict) or not text(item.get("content"), 8000):
                 continue
+            supplied_id = text(item.get("commentId"), 256)
             generated_id = self._excel_comment_id(note_id, item)
-            key = (note_url_identity(note_url) or note_id, text(item.get("author"), 500),
+            key = (note_url_identity(note_url) or note_id, text(item.get("parentCommentId"), 256), text(item.get("author"), 500),
                    text(item.get("content"), 8000), text(item.get("publishedAt"), 100))
             row_index = by_id.get(generated_id)
-            if row_index is None:
+            if row_index is None and not supplied_id:
                 row_index = by_key.get(key)
-            if row_index is None:
-                row_index = by_loose.get(key[:3])
+            if row_index is None and not supplied_id:
+                row_index = by_loose.get(key[:4])
             is_new_comment = row_index is None
             if is_new_comment:
                 comment_row: dict[str, Any] = {name: "" for name in comment_headers}
@@ -5499,34 +9114,66 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             else:
                 comment_row = comment_rows[row_index]
                 duplicate_comments += 1
-            level = max(1, min(int(item.get("commentLevel") or 1), 3))
+                if not supplied_id:
+                    generated_id = text(comment_row.get("笔记评论ID"), 256) or generated_id
+            incoming_parent_id = text(item.get("parentCommentId"), 256)
+            effective_parent_id = incoming_parent_id or text(comment_row.get("父评论ID"), 256)
+            incoming_level = item.get("commentLevel")
+            level = comment_level_value(incoming_level) if incoming_level not in (None, "") else (
+                comment_level_value(comment_row.get("评论层级")) if not is_new_comment else 1
+            )
+            if effective_parent_id:
+                level = max(2, level)
+            author_url = text(item.get("authorUrl"), 2000) or text(comment_row.get("评论用户主页url"), 2000)
+            is_author = (
+                "是" if bool_value(item.get("isAuthor")) else "否"
+            ) if "isAuthor" in item else (text(comment_row.get("是否帖主评论"), 20) or "否")
+            like_count = item.get("likeCount") if "likeCount" in item else (
+                comment_row.get("点赞量", 0) if not is_new_comment else 0
+            )
             fields = {
                 "笔记ID": note_id, "原笔记url": note_url,
                 "帖子用户主页url": text(note.get("authorUrl"), 2000),
                 "笔记评论ID": generated_id, "用户昵称": text(item.get("author"), 500),
+                "评论用户主页url": author_url,
                 "评论内容": text(item.get("content"), 8000), "评论时间": text(item.get("publishedAt"), 100),
-                "是否帖主评论": "是" if bool_value(item.get("isAuthor")) else "否",
-                "点赞量": item.get("likeCount", 0), "评论层级": f"{level}级评论",
-                "父评论ID": text(item.get("parentCommentId"), 256),
+                "是否帖主评论": is_author,
+                "点赞量": like_count, "评论层级": f"{level}级评论",
+                "父评论ID": effective_parent_id,
                 "对应帖子文件夹地址": media_folder, "文件夹内清单": media_files,
                 "AI情绪判断": text(item.get("sentiment"), 80),
                 "映射状态": "已映射", "映射备注": "",
+                "评论状态": COMMENT_STATUS_PRESENT,
+                **csv_time_fields(item, kind="comment"),
             }
+            preserve_when_blank = {
+                "帖子用户主页url", "评论用户主页url", "评论时间", "父评论ID", "AI情绪判断"
+            }
+            if "authorUrl" in note:
+                preserve_when_blank.discard("帖子用户主页url")
             for name, value in fields.items():
                 if name not in comment_headers:
                     comment_headers.append(name)
                     for row in comment_rows:
                         row.setdefault(name, "")
+                if not is_new_comment and name in preserve_when_blank and value in (None, ""):
+                    continue
                 comment_row[name] = "" if value is None else value
             by_id[generated_id] = row_index
             by_key[key] = row_index
-            by_loose[key[:3]] = row_index
+            by_loose[key[:4]] = row_index
 
+        if replace_comments:
+            removed_comments = sum(
+                text(row.get("笔记评论ID"), 256) in previously_present_ids
+                and comment_status_label(row.get("评论状态")) == COMMENT_STATUS_DELETED
+                for row in comment_rows if csv_comment_note_id(row) == note_id
+            )
         self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "sync")
         return {
             "ok": True, "path": str(notes_path), "commentsPath": str(comments_path),
             "postAdded": int(is_new_note), "commentAdded": inserted_comments,
-            "commentRemoved": removed_comments,
+            "commentRemoved": removed_comments, "commentMarkedDeleted": removed_comments,
             "commentSkipped": duplicate_comments, "deduplicated": (not is_new_note) or duplicate_comments > 0,
             "matchedBy": matched_by, "noteRow": int(existing_index) + 2,
         }
@@ -5542,12 +9189,13 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
             "点赞量", "收藏量", "评论量", "分享量", "发布时间", "更新时间", "IP地址",
             "图片数量", "发布日期", "来源词", "笔记ID", "博主ID",
             "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "帖子好坏",
-            "访问状态",
+            "访问状态", "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "帖子状态",
         ]
         comment_headers = [
-            "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
+            "笔记ID", "原笔记url", "帖子用户主页url", "笔记评论ID", "用户昵称", "评论内容",
             "评论时间", "是否帖主评论", "点赞量", "评论层级", "父评论ID",
-            "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断",
+            "对应帖子文件夹地址", "文件夹内清单", "AI情绪判断", "映射状态", "映射备注",
+            "语义分析次数", "分析结论是否差评", "差评类型", "差评子类型", "评论状态",
         ]
         xlsx_path.parent.mkdir(parents=True, exist_ok=True)
         workbook = Workbook()
@@ -5691,9 +9339,73 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 "byStatus": by_status, "items": normalized}
 
     def set_note_access_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Persist one sync run's reachability results in one CSV transaction."""
+        """Persist access/presence atomically and verify every retained business row."""
+        note_ids = list(dict.fromkeys(
+            valid_note_id(item.get("noteId")) for item in (payload.get("items") or []) if isinstance(item, dict)
+        ))
+        note_ids = [note_id for note_id in note_ids if note_id]
+        if not note_ids:
+            raise ValueError("items must contain at least one noteId")
+        with self.pull_lock:
+            checkpoints: list[dict[str, Any]] = []
+            mutation_started = False
+            try:
+                for index, note_id in enumerate(note_ids):
+                    checkpoints.append(self._capture_sync_checkpoint(
+                        note_id, capture_csv=index == 0
+                    ))
+                mutation_started = True
+                result = self._set_note_access_statuses_unchecked(payload)
+                result_items = result.get("items", [])
+                result_ids = [valid_note_id(item.get("noteId")) for item in result_items]
+                if len(result_items) != len(note_ids) or set(result_ids) != set(note_ids):
+                    raise ValueError("批量状态同步结果与请求帖子集合不一致")
+                invalid_rows = [
+                    item["noteId"] for item in result_items if int(item.get("excelRows") or 0) != 1
+                ]
+                if invalid_rows:
+                    raise ValueError(
+                        f"批量状态同步要求每个帖子在笔记 CSV 中恰有一行：{'、'.join(invalid_rows[:8])}"
+                    )
+                verified: list[dict[str, Any]] = []
+                for item in result_items:
+                    self._refresh_material_snapshot_for_note(item["noteId"])
+                with self.lock, self._session() as db:
+                    placeholders = ",".join("?" for _ in note_ids)
+                    media_by_id = {
+                        str(row["note_id"]): text(row["media_dir"], 4000)
+                        for row in db.execute(
+                            f"SELECT note_id,media_dir FROM notes WHERE note_id IN ({placeholders})", note_ids
+                        ).fetchall()
+                    }
+                with self._batch_csv_verification_context():
+                    for item in result_items:
+                        verified.append(self._verify_note_store_consistency(
+                            item["noteId"], media_by_id.get(item["noteId"], ""), verify_fields=True
+                        ))
+                    if len(verified) != len(note_ids):
+                        raise ValueError("批量状态同步未完成全部帖子的一致性校验")
+                output = {**result, "consistencyVerified": True, "verified": verified}
+            except Exception as exc:
+                if not mutation_started:
+                    for checkpoint in reversed(checkpoints):
+                        self._discard_sync_checkpoint(checkpoint)
+                    raise
+                rollback_errors = self._rollback_sync_checkpoints(checkpoints)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"批量状态同步失败且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    ) from exc
+                raise
+            for checkpoint in reversed(checkpoints):
+                self._discard_sync_checkpoint(checkpoint)
+            return output
+
+    def _set_note_access_statuses_unchecked(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Update access, post presence and dependent comment presence in one retained-row transaction."""
         raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
         labels = {"ok": "可打开", "check_failed": "待复核", "unreachable": "打不开", "": ""}
+        workflows = {"", "new", "known", "confirmed", "ignored"}
         deduplicated: dict[str, dict[str, Any]] = {}
         for raw in raw_items:
             if isinstance(raw, dict):
@@ -5702,6 +9414,7 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     deduplicated[note_id] = raw
         if not deduplicated:
             raise ValueError("items must contain at least one noteId")
+
         normalized: list[dict[str, Any]] = []
         for note_id, raw in deduplicated.items():
             requested = text(raw.get("status"), 40).strip().lower()
@@ -5709,66 +9422,256 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 requested = "check_failed"
             if requested not in labels:
                 raise ValueError("status must be ok, check_failed, unreachable or empty")
+            forced_post_status = text(raw.get("forcePostStatus"), 40)
+            if forced_post_status and forced_post_status not in {POST_STATUS_PRESENT, POST_STATUS_DELETED}:
+                raise ValueError("forcePostStatus must be 存在 or 已删除")
+            workflow_status = text(raw.get("workflowStatus"), 40).strip().lower()
+            if workflow_status not in workflows:
+                raise ValueError("workflowStatus is invalid")
+            preserve_access = bool_value(raw.get("preserveAccess"))
+            cascade_comments = (
+                bool_value(raw.get("cascadeComments"))
+                or requested == "unreachable"
+                or forced_post_status == POST_STATUS_DELETED
+            )
+            restore_ignored = bool_value(raw.get("restoreIgnoredComments"))
+            deletion_reason = text(raw.get("commentDeletionReason"), 80) or (
+                "parent_ignored" if workflow_status == "ignored" else "parent_deleted"
+            )
             normalized.append({
                 "noteId": note_id, "status": requested, "excelStatus": labels[requested],
                 "error": "" if requested == "ok" else text(raw.get("error"), 1000),
-                "result": text(raw.get("result"), 80) or {"ok": "opened", "check_failed": "inconclusive",
-                           "unreachable": "confirmed_v2", "": ""}[requested],
+                "result": text(raw.get("result"), 80) or {
+                    "ok": "opened", "check_failed": "inconclusive", "unreachable": "confirmed_v2", "": ""
+                }[requested],
                 "checkedAt": text(raw.get("checkedAt"), 80) or now_iso(),
+                "preserveAccess": preserve_access, "forcePostStatus": forced_post_status,
+                "workflowStatus": workflow_status, "cascadeComments": cascade_comments,
+                "restoreIgnoredComments": restore_ignored, "commentDeletionReason": deletion_reason,
             })
-        notes_path, _comments_path = self._csv_paths()
-        headers, rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
-        if "访问状态" not in headers:
-            headers.append("访问状态")
-            for row in rows:
-                row["访问状态"] = ""
+
+        notes_path, comments_path = self._csv_paths()
+        note_headers, note_rows = self._read_csv_table(notes_path, NOTE_CSV_HEADERS)
+        comment_headers, comment_rows = self._read_csv_table(comments_path, COMMENT_CSV_HEADERS)
+        for required, default in (("访问状态", ""), ("帖子状态", POST_STATUS_PRESENT)):
+            if required not in note_headers:
+                note_headers.append(required)
+                for row in note_rows:
+                    row[required] = default
+        if "评论状态" not in comment_headers:
+            comment_headers.append("评论状态")
+            for row in comment_rows:
+                row["评论状态"] = COMMENT_STATUS_PRESENT
         rows_by_id: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
+        for row in note_rows:
             row_id = valid_note_id(row.get("笔记ID"))
             if row_id:
                 rows_by_id.setdefault(row_id, []).append(row)
-        with self.pull_lock:
-            with self.lock, self._session() as db:
-                for item in normalized:
-                    stored = db.execute("SELECT title,access_status FROM notes WHERE note_id=?", (item["noteId"],)).fetchone()
-                    if not stored:
-                        raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
-                    item["previousStatus"] = text(stored["access_status"], 40)
-                    item["title"] = text(stored["title"], 1000)
-                    matched = rows_by_id.get(item["noteId"], [])
-                    for row in matched:
-                        row["访问状态"] = item["excelStatus"]
-                    item["excelRows"] = len(matched)
-            self._replace_csv_table(notes_path, headers, rows, "access")
-            with self.lock, self._session() as db:
-                for item in normalized:
-                    db.execute(
-                        """UPDATE notes SET access_status=?,access_error=?,last_access_checked_at=?,access_check_result=?
-                           WHERE note_id=?""",
-                        (item["status"], item["error"], item["checkedAt"], item["result"], item["noteId"]),
+
+        with self.lock, self._session() as db:
+            for item in normalized:
+                stored = db.execute(
+                    """SELECT title,status,source,pull_status,access_status,access_error,
+                              last_access_checked_at,access_check_result,post_status,is_deleted,
+                              deleted_at,media_dir FROM notes WHERE note_id=?""",
+                    (item["noteId"],),
+                ).fetchone()
+                if not stored:
+                    raise ValueError(f"本地数据库中未找到帖子：{item['noteId']}")
+                item["previousStatus"] = text(stored["access_status"], 40)
+                item["previousWorkflowStatus"] = text(stored["status"], 40)
+                item["previousPostStatus"] = post_status_label(stored["post_status"], stored["is_deleted"])
+                previous_result = text(stored["access_check_result"], 80)
+                previous_is_conclusive = (
+                    item["previousStatus"] == "ok"
+                    or (
+                        item["previousStatus"] == "unreachable"
+                        and previous_result in {"confirmed_v2", "manual_confirmed_deleted"}
                     )
-                    previous, current = item.get("previousStatus") or "", item["status"]
-                    if previous != current and bool(previous or current in {"check_failed", "unreachable"}):
-                        human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
-                        db.execute(
-                            """INSERT INTO change_events
-                               (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
-                               VALUES (?,?,?,?,?,?,?,?)""",
-                            (max(0, int(payload.get("runId") or 0)), item["noteId"], "access_status_changed",
-                             item.get("title") or "", f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}",
-                             json.dumps({"status": previous}, ensure_ascii=False),
-                             json.dumps({"status": current, "error": item["error"]}, ensure_ascii=False), item["checkedAt"]),
-                        )
+                )
+                if item["status"] == "check_failed" and previous_is_conclusive and not item["preserveAccess"]:
+                    # A timeout, login gate or DOM extraction failure is an
+                    # inconclusive attempt, not evidence that a previously
+                    # verified page changed reachability. Preserve the durable
+                    # verdict while returning diagnostics for this attempt.
+                    item["attemptedStatus"] = item["status"]
+                    item["attemptedResult"] = item["result"]
+                    item["attemptedError"] = item["error"]
+                    item["inconclusivePreserved"] = True
+                    item["preserveAccess"] = True
+                if item["preserveAccess"]:
+                    item["status"] = item["previousStatus"] if item["previousStatus"] in labels else ""
+                    item["excelStatus"] = labels[item["status"]]
+                    item["error"] = text(stored["access_error"], 1000)
+                    item["result"] = previous_result
+                    item["checkedAt"] = text(stored["last_access_checked_at"], 80) or item["checkedAt"]
+                item["postStatus"] = item["forcePostStatus"] or (
+                    POST_STATUS_DELETED if item["status"] == "unreachable"
+                    else POST_STATUS_PRESENT if item["status"] == "ok"
+                    else item["previousPostStatus"]
+                )
+                item["isDeleted"] = item["postStatus"] == POST_STATUS_DELETED
+                item["deletedAt"] = (
+                    text(stored["deleted_at"], 80) or item["checkedAt"]
+                ) if item["isDeleted"] else ""
+                item["mediaDir"] = text(stored["media_dir"], 4000)
+                item["title"] = text(stored["title"], 1000)
+                item["workflowStatus"] = item["workflowStatus"] or item["previousWorkflowStatus"]
+                item["commentMutations"] = []
+                for comment in db.execute(
+                    """SELECT comment_id,payload_json,comment_status,is_deleted,deleted_at
+                       FROM comments WHERE note_id=?""", (item["noteId"],)
+                ).fetchall():
+                    try:
+                        comment_payload = json.loads(comment["payload_json"] or "{}")
+                        if not isinstance(comment_payload, dict):
+                            comment_payload = {}
+                    except (TypeError, ValueError):
+                        comment_payload = {}
+                    comment_id = text(comment["comment_id"], 256)
+                    if item["cascadeComments"] and not bool(comment["is_deleted"]):
+                        comment_payload.update({
+                            "commentId": comment_id, "noteId": item["noteId"],
+                            "commentStatus": COMMENT_STATUS_DELETED, "isDeleted": True,
+                            "deletedAt": text(comment["deleted_at"], 80) or item["checkedAt"],
+                            "lastPresenceCheckedAt": item["checkedAt"],
+                            "presenceReason": item["commentDeletionReason"],
+                            "presenceReasonAt": item["checkedAt"],
+                        })
+                        item["commentMutations"].append({
+                            "commentId": comment_id, "status": COMMENT_STATUS_DELETED,
+                            "isDeleted": True, "deletedAt": text(comment["deleted_at"], 80) or item["checkedAt"],
+                            "payload": comment_payload,
+                        })
+                    elif (
+                        item["restoreIgnoredComments"]
+                        and bool(comment["is_deleted"])
+                        and text(comment_payload.get("presenceReason"), 80) == "parent_ignored"
+                    ):
+                        comment_payload.update({
+                            "commentId": comment_id, "noteId": item["noteId"],
+                            "commentStatus": COMMENT_STATUS_PRESENT, "isDeleted": False,
+                            "deletedAt": "", "lastPresenceCheckedAt": item["checkedAt"],
+                        })
+                        comment_payload.pop("presenceReason", None)
+                        comment_payload.pop("presenceReasonAt", None)
+                        item["commentMutations"].append({
+                            "commentId": comment_id, "status": COMMENT_STATUS_PRESENT,
+                            "isDeleted": False, "deletedAt": "", "payload": comment_payload,
+                        })
+
+                matched = rows_by_id.get(item["noteId"], [])
+                for row in matched:
+                    row["访问状态"] = item["excelStatus"]
+                    row["帖子状态"] = item["postStatus"]
+                item["excelRows"] = len(matched)
+                mutation_by_id = {entry["commentId"]: entry for entry in item["commentMutations"]}
+                item["commentsMarkedDeleted"] = sum(entry["isDeleted"] for entry in item["commentMutations"])
+                item["commentsRestored"] = sum(not entry["isDeleted"] for entry in item["commentMutations"])
+                for row in comment_rows:
+                    if csv_comment_note_id(row) != item["noteId"]:
+                        continue
+                    mutation = mutation_by_id.get(text(row.get("笔记评论ID"), 256))
+                    if mutation:
+                        row["评论状态"] = mutation["status"]
+                    elif item["cascadeComments"]:
+                        row["评论状态"] = COMMENT_STATUS_DELETED
+
+        self._replace_csv_pair(note_headers, note_rows, comment_headers, comment_rows, "access-presence")
+        with self.lock, self._session() as db:
+            for item in normalized:
+                presence_changed = item["previousPostStatus"] != item["postStatus"]
+                presence_confirmed = presence_changed or item["status"] in {"ok", "unreachable"}
+                db.execute(
+                    """UPDATE notes SET
+                       access_status=CASE WHEN ? THEN access_status ELSE ? END,
+                       access_error=CASE WHEN ? THEN access_error ELSE ? END,
+                       last_access_checked_at=CASE WHEN ? THEN last_access_checked_at ELSE ? END,
+                       access_check_result=CASE WHEN ? THEN access_check_result ELSE ? END,
+                       status=?,last_seen_at=?,post_status=?,is_deleted=?,
+                       deleted_at=CASE WHEN ?=1 AND deleted_at='' THEN ? WHEN ?=0 THEN '' ELSE deleted_at END,
+                       last_presence_checked_at=CASE WHEN ? THEN ? ELSE last_presence_checked_at END
+                       WHERE note_id=?""",
+                    (int(item["preserveAccess"]), item["status"], int(item["preserveAccess"]), item["error"],
+                     int(item["preserveAccess"]), item["checkedAt"], int(item["preserveAccess"]), item["result"],
+                     item["workflowStatus"], item["checkedAt"], item["postStatus"], int(item["isDeleted"]),
+                     int(item["isDeleted"]), item["checkedAt"], int(item["isDeleted"]),
+                     int(presence_confirmed), item["checkedAt"], item["noteId"]),
+                )
+                for mutation in item["commentMutations"]:
+                    db.execute(
+                        """UPDATE comments SET comment_status=?,is_deleted=?,deleted_at=?,
+                           last_presence_checked_at=?,payload_json=? WHERE note_id=? AND comment_id=?""",
+                        (mutation["status"], int(mutation["isDeleted"]), mutation["deletedAt"],
+                         item["checkedAt"], json.dumps(mutation["payload"], ensure_ascii=False),
+                         item["noteId"], mutation["commentId"]),
+                    )
+                active_count = int(db.execute(
+                    "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (item["noteId"],)
+                ).fetchone()[0])
+                negative_count = int(db.execute(
+                    """SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0
+                       AND is_negative=1 AND ai_confidence>=0.85""", (item["noteId"],)
+                ).fetchone()[0])
+                db.execute(
+                    "UPDATE notes SET comment_count_collected=?,negative_comment_count=? WHERE note_id=?",
+                    (active_count, negative_count, item["noteId"]),
+                )
+                previous, current = item.get("previousStatus") or "", item["status"]
+                previous_post, current_post = item["previousPostStatus"], item["postStatus"]
+                previous_workflow, current_workflow = item["previousWorkflowStatus"], item["workflowStatus"]
+                if (
+                    previous != current
+                    or previous_post != current_post
+                    or previous_workflow != current_workflow
+                    or item["commentMutations"]
+                ):
+                    human = {"": "未核验", "ok": "可打开", "check_failed": "待复核", "unreachable": "打不开"}
+                    summary = f"访问状态：{human.get(previous, previous)} → {human.get(current, current)}"
+                    if previous_post != current_post:
+                        summary += f"；帖子状态：{previous_post} → {current_post}（本地记录保留）"
+                    if item["commentsMarkedDeleted"]:
+                        summary += f"；关联评论标记已删除 {item['commentsMarkedDeleted']} 条"
+                    if item["commentsRestored"]:
+                        summary += f"；恢复忽略关联评论 {item['commentsRestored']} 条"
+                    db.execute(
+                        """INSERT INTO change_events
+                           (run_id,note_id,event_type,title,summary,before_json,after_json,created_at)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (max(0, int(payload.get("runId") or 0)), item["noteId"], "presence_status_changed",
+                         item.get("title") or "", summary,
+                         json.dumps({"status": previous, "postStatus": previous_post,
+                                     "workflowStatus": previous_workflow}, ensure_ascii=False),
+                         json.dumps({"status": current, "postStatus": current_post,
+                                     "workflowStatus": current_workflow, "error": item["error"],
+                                     "commentsMarkedDeleted": item["commentsMarkedDeleted"],
+                                     "commentsRestored": item["commentsRestored"]}, ensure_ascii=False),
+                         item["checkedAt"]),
+                    )
+
         by_status = dict(Counter(item["status"] for item in normalized))
-        return {"ok": True, "updated": len(normalized), "excelRows": sum(item["excelRows"] for item in normalized),
-                "byStatus": by_status, "items": normalized, "path": str(notes_path)}
+        for item in normalized:
+            item.pop("commentMutations", None)
+        return {
+            "ok": True, "updated": len(normalized),
+            "excelRows": sum(item["excelRows"] for item in normalized),
+            "markedDeleted": sum(bool(item["isDeleted"]) for item in normalized),
+            "commentsMarkedDeleted": sum(int(item["commentsMarkedDeleted"]) for item in normalized),
+            "commentsRestored": sum(int(item["commentsRestored"]) for item in normalized),
+            "byStatus": by_status, "items": normalized, "path": str(notes_path),
+        }
 
     def set_note_access_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         result = self.set_note_access_statuses({"items": [payload], "runId": payload.get("runId")})
         item = result["items"][0]
         return {"ok": True, "noteId": item["noteId"], "accessStatus": item["status"],
                 "excelStatus": item["excelStatus"], "excelRows": item["excelRows"],
-                "checkedAt": item["checkedAt"]}
+                "postStatus": item["postStatus"], "isDeleted": item["isDeleted"],
+                "commentsMarkedDeleted": int(item.get("commentsMarkedDeleted") or 0),
+                "commentsRestored": int(item.get("commentsRestored") or 0),
+                "checkedAt": item["checkedAt"],
+                "consistencyVerified": result.get("consistencyVerified") is True,
+                "verified": result.get("verified", [])}
 
     def reconcile_legacy_access_statuses(self) -> dict[str, Any]:
         """Downgrade statuses produced by the pre-v0.22.4 loose detector."""
@@ -5789,40 +9692,41 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
     def list_unreachable_notes(self) -> list[dict[str, Any]]:
         with self.lock, self._session() as db:
             rows = db.execute(
-                """SELECT note_id,title,url,access_error,last_access_checked_at
+                """SELECT note_id,title,url,access_error,last_access_checked_at,
+                          post_status,is_deleted,deleted_at,last_presence_checked_at
                    FROM notes WHERE access_status='unreachable' AND status<>'ignored'
                    ORDER BY last_access_checked_at DESC, first_seen_at DESC"""
             ).fetchall()
         return [dict(row) for row in rows]
 
     def delete_unreachable_notes(self, _payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Delete every note marked unreachable, including comments and managed media."""
+        """Legacy endpoint: retain unreachable posts and mark them deleted instead of purging rows."""
         targets = self.list_unreachable_notes()
-        deleted: list[dict[str, Any]] = []
-        failures: list[dict[str, Any]] = []
-        for item in targets:
-            try:
-                result = self.delete_pulled_note({"noteId": item["note_id"]})
-                deleted.append({"noteId": item["note_id"], "title": item.get("title") or "", **result})
-            except Exception as exc:
-                failures.append({
-                    "noteId": item["note_id"],
-                    "title": item.get("title") or "",
-                    "error": text(exc, 1000),
-                })
+        if not targets:
+            return {"ok": True, "targetCount": 0, "markedDeletedCount": 0, "deletedCount": 0,
+                    "failedCount": 0, "marked": [], "deleted": [], "failures": [],
+                    "excelVerified": True, "databaseVerified": True,
+                    "consistencyVerified": True, "verified": []}
+        result = self.set_note_access_statuses({"items": [
+            {"noteId": item["note_id"], "status": "unreachable", "result": "confirmed_v2",
+             "error": item.get("access_error") or "双重证据确认帖子已删除或下架"}
+            for item in targets
+        ]})
+        marked = [{"noteId": item["noteId"], "title": item.get("title") or "",
+                   "postStatus": item["postStatus"], "isDeleted": item["isDeleted"]}
+                  for item in result.get("items", [])]
         return {
-            "ok": not failures,
-            "targetCount": len(targets),
-            "deletedCount": len(deleted),
-            "failedCount": len(failures),
-            "deletedCommentRows": sum(int(item.get("deletedCommentRows", 0) or 0) for item in deleted),
-            "deletedDatabaseComments": sum(int(item.get("deletedDatabaseComments", 0) or 0) for item in deleted),
-            "deletedLinkedDatabaseRecords": sum(int(item.get("deletedLinkedDatabaseRecords", 0) or 0) for item in deleted),
-            "excelVerified": all(bool(item.get("excelVerified")) for item in deleted),
-            "databaseVerified": all(bool(item.get("databaseVerified")) for item in deleted),
-            "deleted": deleted,
-            "failures": failures,
-            "error": "；".join(item["error"] for item in failures[:3]),
+            "ok": True, "targetCount": len(targets), "markedDeletedCount": len(marked),
+            # Keep the legacy counter populated so an older loaded extension
+            # treats this non-destructive operation as successful.
+            "deletedCount": len(marked), "failedCount": 0,
+            "deletedCommentRows": 0, "deletedDatabaseComments": 0,
+            "deletedLinkedDatabaseRecords": 0,
+            "excelVerified": True, "databaseVerified": True,
+            "marked": marked, "deleted": marked, "failures": [],
+            "nonDestructive": True,
+            "consistencyVerified": result.get("consistencyVerified") is True,
+            "verified": result.get("verified", []),
         }
 
     def _legacy_delete_pulled_note(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -6230,20 +10134,53 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                     print(f"[bridge] CSV 被占用，AI 情绪回写跳过：{path}", flush=True)
 
     def pull_to_excel(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Serialize and deduplicate one complete pull transaction."""
+        """Serialize one complete pull and roll every store back if verification fails."""
+        validate_snapshot_identity(payload)
+        raw_note = payload.get("note") if isinstance(payload.get("note"), dict) else payload
+        note_id = valid_note_id((raw_note or {}).get("noteId"))
+        if not note_id:
+            raise ValueError("noteId is required")
         with self.pull_lock:
-            return self._pull_to_excel_locked(payload)
+            checkpoint = self._capture_sync_checkpoint(note_id, capture_media_binaries=True)
+            try:
+                result = self._pull_to_excel_locked(payload)
+            except Exception as exc:
+                rollback_errors = self._rollback_sync_checkpoints([checkpoint])
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"拉取失败且回滚未完全成功：{'；'.join(rollback_errors)}"
+                    ) from exc
+                raise
+            self._discard_sync_checkpoint(checkpoint)
+            return result
 
     def _pull_to_excel_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Persist a completed browser read and make it visible in Excel."""
         raw_note = payload.get("note") if isinstance(payload.get("note"), dict) else payload
-        note = dict(raw_note or {})
+        note = browser_note_payload(raw_note)
+        if "tags" in note and tag_text(note.get("tags")) == "无话题":
+            note["tags"] = ["无话题"]
         incoming_note_id = valid_note_id(note.get("noteId"))
         if not incoming_note_id:
             raise ValueError("noteId is required")
         note["title"] = canonical_note_title(note.get("title"), note.get("content"), 80)
         note_id, prewrite_matched_by = self._resolve_pull_identity(note)
-        note["noteId"] = note_id
+        self._normalize_csv_cross_store_fields()
+        with self.lock, self._session() as db:
+            previous = db.execute("SELECT payload_json FROM notes WHERE note_id=?", (note_id,)).fetchone()
+        try:
+            previous_payload = json.loads(previous[0] or "{}") if previous else {}
+            if not isinstance(previous_payload, dict):
+                previous_payload = {}
+        except (TypeError, ValueError):
+            previous_payload = {}
+        incoming_publication = text(note.get("publishedAt"), 100)
+        incoming_observed_at = text(note.get("timeObservedAt"), 80)
+        note = {**browser_note_payload(previous_payload), **note, "noteId": note_id}
+        if incoming_publication:
+            note["timeObservedAt"] = incoming_observed_at or text(payload.get("collectedAt"), 80) or now_iso()
+            note["timeReferenceSource"] = "capture"
+        note = enrich_time_payload(note, text(payload.get("collectedAt"), 80) or now_iso(), previous=previous_payload)
         comments = payload.get("comments") or []
         if not isinstance(comments, list):
             raise ValueError("comments must be an array")
@@ -6264,28 +10201,43 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         try:
             self.confirm(note)
             comments = self._normalize_snapshot_comments(note_id, comments)
+            comment_status = comment_snapshot_status(payload, len(comments), comment_status)
             comment_result = self.upsert_comments({
                 "noteId": note_id,
                 "comments": comments,
                 "expectedCount": expected_count,
                 "status": "failed" if comment_status == "failed" else comment_status,
+                "collectionEvidence": payload.get("collectionEvidence"),
+                "explicitEmptyVerified": payload.get("explicitEmptyVerified"),
                 "error": comment_error,
                 "collectedAt": text(payload.get("collectedAt"), 80) or now_iso(),
             })
+            comment_status = comment_result["status"]
             try:
                 media_result = self._download_note_media(note)
+                if media_result.get("status") != "complete":
+                    raise ValueError(
+                        f"素材下载未完整，已停止本次同步：{text(media_result.get('error'), 1000) or '存在下载失败'}"
+                    )
                 self._write_media_comments(media_result, comments)
             except Exception as exc:
-                media_result = {
-                    "status": "failed",
-                    "folder": "",
-                    "files": [],
-                    "fileCount": 0,
-                    "imageCount": 0,
-                    "videoCount": 0,
-                    "error": text(exc, 1000),
-                }
-            xlsx_result = self._sync_pull_to_xlsx(note, comments, media_result)
+                try:
+                    failed_folder = self._resolve_media_folder(note)
+                    if failed_folder.is_dir():
+                        media_result["folder"] = str(failed_folder)
+                except Exception:
+                    pass
+                raise ValueError(f"素材快照写入失败，已停止本次同步：{text(exc, 1000)}") from exc
+            trusted_complete = comment_status == "likely_complete"
+            xlsx_result = self._sync_pull_to_xlsx(
+                note, comments, media_result, replace_comments=trusted_complete
+            )
+            presence_checked_at = now_iso()
+            deleted_marked = self._mark_missing_comments_deleted(
+                note_id,
+                [text(item.get("commentId"), 256) for item in comments if text(item.get("commentId"), 256)],
+                presence_checked_at,
+            ) if trusted_complete else 0
         except Exception as exc:
             with self.lock, self._session() as db:
                 db.execute(
@@ -6306,29 +10258,43 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
         errors = [item for item in (comment_error, text(media_result.get("error"), 1000)) if item]
         final_error = "；".join(errors) if partial else ""
         with self.lock, self._session() as db:
+            active_comment_count = int(db.execute(
+                "SELECT COUNT(*) FROM comments WHERE note_id=? AND is_deleted=0", (note_id,)
+            ).fetchone()[0])
             db.execute(
                 """UPDATE notes SET status='known', is_relevant=1, source='existing_xlsx', relevance_status='relevant', relevance_source='pull',
                    pull_status=?, pull_error=?, last_pull_at=?, excel_synced_at=?,
+                   comment_count_collected=?,comment_collection_status=?,
                    excel_sync_path=?, media_status=?, media_dir=?, media_file_count=?, media_error=?,
-                   access_status='ok', access_error='', last_access_checked_at=?, access_check_result='opened'
+                   access_status='ok', access_error='', last_access_checked_at=?, access_check_result='opened',
+                   post_status=?,is_deleted=0,deleted_at='',last_presence_checked_at=?,
+                   url=?,title=?,author=?,content=?,keyword=?,tags=?,payload_json=?
                    WHERE note_id=?""",
                 (
-                    final_status, final_error, timestamp, timestamp, xlsx_result["path"],
-                    media_result.get("status", "failed"), media_result.get("folder", ""),
-                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp, note_id,
+                    final_status, final_error, timestamp, timestamp,
+                    active_comment_count, comment_status,
+                    xlsx_result["path"], media_result.get("status", "failed"), media_result.get("folder", ""),
+                    int(media_result.get("fileCount", 0) or 0), text(media_result.get("error"), 1000), timestamp,
+                    POST_STATUS_PRESENT, timestamp,
+                    text(note.get("url"), 4000), text(note.get("title"), 1000),
+                    text(note.get("author"), 500), text(note.get("content"), 20000),
+                    text(note.get("keyword"), 200), tag_text(note.get("tags")),
+                    json.dumps(note, ensure_ascii=False), note_id,
                 ),
             )
-        all_local_comments = self._comments_as_api(note_id)
         if media_result.get("folder"):
-            self._write_media_snapshot(media_result, note, all_local_comments)
+            self._refresh_material_snapshot_for_note(note_id)
         consistency = self._verify_note_store_consistency(note_id, text(media_result.get("folder"), 4000))
         return {
             "ok": True,
             "noteId": note_id,
             "incomingNoteId": incoming_note_id,
             "status": "known",
+            "postStatus": POST_STATUS_PRESENT,
+            "isDeleted": False,
             "pullStatus": final_status,
             "commentStatus": comment_status,
+            "currentCount": len(comments), "canPrune": trusted_complete,
             "commentError": comment_error,
             "postAdded": xlsx_result["postAdded"],
             "commentAdded": xlsx_result["commentAdded"],
@@ -6340,7 +10306,8 @@ th{{font-size:12px;color:#6e6e73}}ul{{padding:0;list-style:none}}li{{display:fle
                 prewrite_matched_by if prewrite_matched_by != "new"
                 else text(xlsx_result.get("matchedBy"), 40) or "new"
             ),
-            "commentCount": comment_result["collectedCount"],
+            "commentCount": active_comment_count,
+            "commentMarkedDeleted": deleted_marked,
             "excelPath": xlsx_result["path"],
             "excelRow": int(xlsx_result.get("noteRow", 0) or 0),
             "mediaStatus": media_result.get("status", "failed"),
@@ -6513,9 +10480,32 @@ Write-Output $openedWith
 
 class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "XhsMonitorBridge/0.7"
+    _overview_read_paths = frozenset({"/api/data-overview/media", "/api/data-overview/comment-target", "/api/data-overview/export"})
+
+    def _overview_origin_allowed(self) -> bool:
+        origins = self.headers.get_all("Origin", [])
+        if not origins:
+            return True  # Local CLI/tests do not send an Origin header.
+        if len(origins) != 1:
+            return False
+        origin = origins[0]
+        if CHROME_EXTENSION_ORIGIN_RE.fullmatch(origin):
+            return True
+        # Network pages require an exact, explicitly configured origin. In
+        # particular, neither opaque "null" nor localhost-prefix matches pass.
+        try:
+            parsed = urlparse(origin)
+            valid_origin = (parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+                            and parsed.username is None and parsed.password is None
+                            and not (parsed.path or parsed.params or parsed.query or parsed.fragment))
+            return bool(valid_origin and origin in allowed_extension_origins())
+        except ValueError:
+            return False
 
     def _cors_origin(self) -> str:
         origin = self.headers.get("Origin", "")
+        if urlparse(self.path).path in self._overview_read_paths:
+            return origin if origin and self._overview_origin_allowed() else "null"
         if not origin or origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1"):
             return origin or "*"
         if CHROME_EXTENSION_ORIGIN_RE.fullmatch(origin) and origin in allowed_extension_origins():
@@ -6530,6 +10520,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", self._cors_origin())
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if urlparse(self.path).path in self._overview_read_paths:
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -6548,10 +10541,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return self.server.store  # type: ignore[attr-defined]
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if urlparse(self.path).path in self._overview_read_paths and not self._overview_origin_allowed():
+            self._send_json(403, {"ok": False, "error": "untrusted overview Origin"})
+            return
         self._send_json(204, {})
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path in self._overview_read_paths and not self._overview_origin_allowed():
+            self._send_json(403, {"ok": False, "error": "untrusted overview Origin"})
+            return
         try:
             if parsed.path == "/api/health":
                 self._send_json(200, {"ok": True, "version": VERSION, "service": "xhs-monitor-bridge"})
@@ -6566,12 +10565,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 status = text(query.get("status", [""])[0], 30)
                 limit = int(query.get("limit", [100])[0])
-                self._send_json(200, {"ok": True, "notes": self.store.list_notes(status, limit)})
+                include_deleted = text(query.get("includeDeleted", ["true"])[0], 10).lower() not in {"0", "false", "no"}
+                self._send_json(200, {"ok": True, "includeDeleted": include_deleted,
+                                      "notes": self.store.list_notes(status, limit, include_deleted)})
             elif parsed.path == "/api/notes/unreachable":
                 notes = self.store.list_unreachable_notes()
                 self._send_json(200, {"ok": True, "count": len(notes), "notes": notes})
             elif parsed.path == "/api/data-health":
                 self._send_json(200, self.store.data_health())
+            elif parsed.path == "/api/data-overview/schema":
+                self._send_json(200, self.store.data_overview_schema())
+            elif parsed.path == "/api/data-overview/media":
+                query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=4)
+                if set(query) - {"dataset", "recordId", "index", "revision"} or any(len(values) != 1 for values in query.values()):
+                    raise ValueError("invalid media query parameters")
+                self._send_json(200, self.store.data_overview_media(
+                    query.get("dataset", [""])[0], query.get("recordId", [""])[0],
+                    query.get("index", [None])[0],
+                    query.get("revision", [None])[0],
+                ))
+            elif parsed.path == "/api/data-overview/comment-target":
+                query = parse_qs(parsed.query, keep_blank_values=True, max_num_fields=1)
+                if set(query) - {"commentId"}:
+                    raise ValueError("invalid comment-target query parameters")
+                self._send_json(200, self.store.data_overview_comment_target(query.get("commentId", [""])[0]))
             elif parsed.path == "/api/changes":
                 query = parse_qs(parsed.query)
                 limit = int(query.get("limit", [100])[0])
@@ -6590,7 +10607,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 note_id = text(query.get("noteId", [""])[0], 128)
                 limit = int(query.get("limit", [500])[0])
-                self._send_json(200, {"ok": True, "comments": self.store.list_comments(note_id, limit)})
+                include_deleted = text(query.get("includeDeleted", ["true"])[0], 10).lower() not in {"0", "false", "no"}
+                comments = self.store.list_comments(note_id, limit, include_deleted)
+                self._send_json(200, {"ok": True, "includeDeleted": include_deleted, "comments": comments})
             elif parsed.path == "/api/ai/settings":
                 self._send_json(200, self.store.ai_settings_public())
             elif parsed.path == "/api/ai/status":
@@ -6628,24 +10647,51 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": str(exc)})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/api/data-overview/export" and not self._overview_origin_allowed():
+            self._send_json(403, {"ok": False, "error": "untrusted overview Origin"})
+            return
         try:
             payload = self._read_json()
-            if self.path == "/api/scan":
+            if self.path.startswith("/api/agent-analysis/"):
+                result = agent_analysis.handle(self.store, self.path.rsplit("/", 1)[-1], payload)
+            elif self.path == "/api/scan":
                 result = self.store.scan(payload)
             elif self.path == "/api/pull":
                 result = self.store.pull_to_excel(payload)
             elif self.path == "/api/note/delete":
-                result = self.store.delete_pulled_note(payload)
+                note_id = valid_note_id(payload.get("noteId"))
+                hard_confirmed = bool(payload.get("hardDeleteConfirmed")) and text(
+                    payload.get("confirmation"), 128
+                ) == note_id
+                if hard_confirmed:
+                    result = self.store.delete_pulled_note(payload)
+                else:
+                    marked = self.store.set_note_access_status({
+                        "noteId": note_id, "status": "unreachable",
+                        "result": "manual_confirmed_deleted",
+                        "error": "用户确认帖子已删除或下架；本地记录保留",
+                    })
+                    result = {**marked, "nonDestructive": True, "markedDeletedCount": 1}
             elif self.path == "/api/note/access-status":
                 result = self.store.set_note_access_status(payload)
             elif self.path == "/api/notes/access-status/batch":
                 result = self.store.set_note_access_statuses(payload)
-            elif self.path == "/api/notes/unreachable/delete":
+            elif self.path in {"/api/notes/unreachable/delete", "/api/notes/unreachable/mark-deleted"}:
                 result = self.store.delete_unreachable_notes(payload)
             elif self.path == "/api/data-health/repair":
                 result = self.store.repair_data_health(payload)
             elif self.path == "/api/data-health/repair-relations":
                 result = self.store.repair_csv_relationships(payload)
+            elif self.path == "/api/data-overview/query":
+                result = self.store.query_data_overview(payload)
+            elif self.path == "/api/data-overview/export":
+                result = self.store.export_data_overview(payload)
+            elif self.path == "/api/data-overview/values":
+                result = self.store.data_overview_values(payload)
+            elif self.path == "/api/data-overview/delete":
+                result = self.store.delete_data_overview_records(payload)
+            elif self.path == "/api/data-overview/discoveries/purge":
+                result = self.store.purge_untracked_discoveries(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
             elif self.path == "/api/watchlist":
@@ -6679,22 +10725,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/comments/collection/start":
                 result = self.store.start_comment_collection(payload)
             elif self.path == "/api/excel/reload":
-                seed_path = getattr(self.store, "seed_xlsx_path", None)
-                if not seed_path:
-                    raise ValueError("未配置 CSV 总表路径")
-                inserted = self.store.seed_from_xlsx(Path(seed_path))
-                access_migration: dict[str, Any] = {"updated": 0}
-                migration_error = ""
-                try:
-                    access_migration = self.store.reconcile_legacy_access_statuses()
-                except Exception as exc:
-                    # Database statuses were already made conservative by the
-                    # schema migration. Keep reload usable when Excel happens
-                    # to be open; the next sync/reload will retry the label.
-                    migration_error = text(exc, 1000)
-                result = {"ok": True, "inserted": inserted, "path": str(seed_path),
-                          "accessMigration": access_migration.get("updated", 0),
-                          "accessMigrationError": migration_error}
+                result = self.store.reload_data_files()
             elif self.path == "/api/ai/settings":
                 result = self.store.save_ai_settings(payload)
             elif self.path == "/api/ai/test":

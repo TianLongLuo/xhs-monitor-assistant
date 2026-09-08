@@ -1,0 +1,9 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+<title>磁吸窗口占位回归</title>
+<style>
+body{margin:0;padding:16px;background:#f5f5f7;color:#1d1d1f;font:14px system-ui}header{display:flex;gap:12px;align-items:center;margin-bottom:12px}button,select{padding:7px 10px}#summary{font-weight:600}#results{max-height:160px;overflow:auto}#frame{border:1px solid #d2d2d7;border-radius:16px}li[data-status=failed]{color:#d70015}li[data-status=passed]{color:#248a3d}
+</style>
+<header><strong>磁吸占位 · 合成页面</strong><button id="run">运行布局回归</button><select id="view" aria-label="预览尺寸"><option value="1480,940">1480 × 940 · 侧栏开启</option><option value="1200,820">1200 × 820</option><option value="900,760">900 × 760 · 上下排列</option><option value="390,760">390 × 760 · 窄屏</option><option value="1920,1080">1920 × 1080</option></select><span id="summary" role="status">等待运行</span></header>
+<ol id="results"></ol><iframe id="frame" title="帖子与磁吸窗口预览" width="1480" height="940" src="process-layout.inner.html?xhs_monitor_batch=1"></iframe>
+<script src="process-layout.fixture.js"></script></html>
