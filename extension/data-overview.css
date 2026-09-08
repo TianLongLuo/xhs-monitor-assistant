@@ -425,10 +425,9 @@ td.find-current { outline: 2px solid #e39500; outline-offset: -2px; background: 
 .detail-comment-parent { margin: 0 0 7px; color: #67788d; font-size: 11px; overflow-wrap: anywhere; }
 .detail-comment .detail-prose { font-size: 12px; }
 .detail-comment-actions { display: flex; flex-wrap: wrap; align-items: start; gap: 8px; margin-top: 12px; }
-.detail-comment-photos { min-width: 0; max-width: 100%; font-size: 11px; color: var(--blue); }
-.detail-comment-photos > summary { padding: 7px 0; cursor: pointer; }
-.detail-comment-photos[open] { flex-basis: 100%; }
-.detail-comment:focus-visible, .detail-comment-photos > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.detail-comment-images { margin-top: 12px; min-width: 0; }
+.detail-comment-images[hidden] { display: none; }
+.detail-comment:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
 @media (max-width: 480px) { .detail-comment { padding: 10px; } .detail-comment-reply { margin-left: 8px; } }
 .detail-id { display: block; margin-top: 10px; color: var(--quiet); font-family: var(--data-font); font-size: 9px; overflow-wrap: anywhere; }
 .detail-all-fields { margin-top: 24px; padding-top: 8px; border-top: 1px solid var(--line-strong); }

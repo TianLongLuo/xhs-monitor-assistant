@@ -200,12 +200,12 @@ test("DOM highlights current comment, deleted badge, reply parent and literal fu
   assert.ok(current.all().some(e => e.className === "detail-comment-current" && e.textContent === "当前评论"));
   assert.ok(current.all().some(e => e.className === "detail-comment-deleted" && e.textContent === "已删除"));
   assert.ok(!container.all().some(e => ["img", "script"].includes(e.tagName)));
-  assert.equal(mounts.length, 0, "Comment images must not eagerly trigger requests");
-  const photos = current.all().find(e => e.className === "detail-comment-photos");
-  photos.events.toggle(); assert.equal(mounts.length, 0);
-  photos.open = true; photos.events.toggle(); photos.events.toggle();
-  assert.equal(mounts.length, 1); assert.equal(mounts[0][1].recordId, "comment-1");
-  assert.equal(mounts[0][1].dataset, "comments");
+  assert.equal(mounts.length, 3, "Every comment automatically mounts its image area");
+  assert.ok(!container.all().some(e => e.tagName === "summary"));
+  assert.ok(!container.textContent.includes("查看评论图片"));
+  assert.equal(mounts[1][1].recordId, "comment-1");
+  assert.equal(mounts[1][1].dataset, "comments");
+  for (const mount of mounts) assert.deepEqual(mount[2], {layout: "detail", previewLimit: 3, eager: false, hideEmpty: true});
   current.all().find(e => e.dataset.action === "locate_comment").events.click();
   assert.equal(actions[0].value, "comment-1");
   container.all().find(e => e.tagName === "button" && e.textContent === "定位当前评论").events.click();

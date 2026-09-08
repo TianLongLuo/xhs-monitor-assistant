@@ -168,20 +168,13 @@
           locate.dataset.action = "locate_comment"; locate.dataset.value = row.comment_id;
           locate.addEventListener("click", () => { if (isCurrent()) onAction(locate); });
           actions.append(locate);
-          if (gallery) {
-            const photos = node("details", "detail-comment-photos");
-            photos.append(node("summary", "", "查看评论图片"));
-            const album = node("div", "detail-album"); photos.append(album);
-            let mounted = false;
-            photos.addEventListener("toggle", () => {
-              if (!photos.open || mounted || !isCurrent()) return;
-              mounted = true;
-              gallery.mount(album, { dataset: "comments", recordId: row.comment_id, title: row.author || "评论图片" },
-                { layout: "detail", previewLimit: 3, eager: true });
-            });
-            actions.append(photos);
-          }
           article.append(actions); list.append(article);
+          if (gallery) {
+            const album = node("div", "detail-album detail-comment-images");
+            article.append(album);
+            gallery.mount(album, { dataset: "comments", recordId: row.comment_id, title: row.author || "评论图片" },
+              { layout: "detail", previewLimit: 3, eager: false, hideEmpty: true });
+          }
         }
         loaded = batch.loaded;
         title.textContent = `全部本地评论 · ${batch.total} 条`;

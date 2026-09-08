@@ -233,3 +233,115 @@ test("metadata failure offers explicit retry without repeating successful metada
   assert.equal(visibleThumbs(cell).length, 2); assert.equal(attempts, 2);
   h.resize(stripOf(cell), 1000); await settle(); assert.equal(imagesRequested(h).length, 2);
 });
+
+test("hideEmpty comment album stays idle offscreen and automatically renders three images when visible without clicks", async () => {
+  const h = harness({ total: 5 }), cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "comment-auto" },
+    { layout: "detail", previewLimit: 3, eager: false, hideEmpty: true });
+  await settle();
+  assert.equal(h.requests.length, 0); assert.equal(cell.hidden, false);
+  assert.ok(h.intersections[0].targets.has(cell));
+  h.visible(cell, false); await settle(); assert.equal(h.requests.length, 0);
+  h.visible(cell); h.visible(cell); await settle();
+  assert.equal(h.requests.filter(r => r.index === undefined).length, 1);
+  assert.deepEqual(imagesRequested(h).map(r => r.index), [0, 1, 2]);
+  assert.ok(h.requests.every(r => r.dataset === "comments" && r.recordId === "comment-auto"));
+  assert.equal(cell.hidden, false); assert.equal(visibleThumbs(cell).length, 3);
+  assert.ok(visibleThumbs(cell).every(button => button.children[0]?.tagName === "img"
+    && button.children[0].src === raster.dataUrl));
+  assert.equal(stripOf(cell).children.at(-1).textContent, "5 张");
+  assert.equal(h.resizes[0].targets.size, 0);
+});
+
+test("hideEmpty hides verified empty metadata; default mount still shows its empty label", async () => {
+  const h = harness({ total: 0 }), album = h.cell(), ordinary = h.cell();
+  h.api.mount(album, { dataset: "comments", recordId: "empty-comment" },
+    { layout: "detail", eager: false, hideEmpty: true });
+  h.visible(album); await settle();
+  assert.equal(album.hidden, true); assert.equal(album.children.length, 0);
+  assert.equal(imagesRequested(h).length, 0);
+  h.api.mount(ordinary, record("empty-note"), { eager: true }); await settle();
+  assert.equal(ordinary.hidden, false); assert.equal(ordinary.children[0].textContent, "无已记录图片");
+});
+
+for (const [missingReason, label] of [
+  ["record_not_found", "记录已变更，请刷新"],
+  ["record_identity_mismatch", "图片关联待核验"],
+  ["comment_parent_mismatch", "评论关联待核验"],
+]) test(`hideEmpty keeps ${missingReason} visible instead of treating it as no images`, async () => {
+  const h = harness({ request: () => ({ ...listing(0), missingReason }) }), cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "invalid-comment" },
+    { layout: "detail", eager: false, hideEmpty: true });
+  h.visible(cell); await settle();
+  assert.equal(cell.hidden, false); assert.equal(cell.children[0].textContent, label);
+  assert.equal(cell.children[0].title, missingReason); assert.equal(imagesRequested(h).length, 0);
+});
+
+test("hideEmpty network error remains visible and retryable, not an empty hidden album", async () => {
+  const h = harness({ request: () => Promise.reject(new Error("fixture offline")) }), cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "offline-comment" },
+    { layout: "detail", eager: false, hideEmpty: true });
+  h.visible(cell); await settle();
+  assert.equal(cell.hidden, false); assert.equal(cell.children[0].textContent, "重新读取图片");
+  assert.equal(cell.children[0].title, "fixture offline");
+});
+
+test("hideEmpty reset ignores late empty metadata rather than hiding the stale cell", async () => {
+  const pending = deferred(), h = harness({ request: () => pending.promise }), cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "late-empty" },
+    { layout: "detail", eager: false, hideEmpty: true });
+  h.visible(cell); await settle(); assert.equal(h.requests.length, 1);
+  h.api.reset();
+  const before = { hidden: cell.hidden, text: cell.textContent, children: [...cell.children] };
+  pending.resolve(listing(0)); await settle();
+  assert.equal(cell.hidden, before.hidden); assert.equal(cell.textContent, before.text);
+  assert.deepEqual(cell.children, before.children); assert.equal(imagesRequested(h).length, 0);
+  assert.equal(cell._loadMedia, undefined); assert.equal(h.intersections[0].targets.size, 0);
+});
+
+test("hideEmpty reset ignores late image completion and does not write stale image nodes", async () => {
+  const pending = deferred(), h = harness({ request: args => args.index === undefined ? listing(5) : pending.promise });
+  const cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "late-raster" },
+    { layout: "detail", previewLimit: 3, eager: false, hideEmpty: true });
+  h.visible(cell); await settle(); assert.equal(imagesRequested(h).length, 3);
+  const strip = stripOf(cell), buttons = [...thumbsOf(cell)];
+  h.api.reset(); pending.resolve(raster); await settle();
+  assert.equal(stripOf(cell), strip); assert.equal(cell.hidden, false);
+  assert.ok(buttons.every(button => button.children.length === 0));
+  assert.equal(imagesRequested(h).length, 3); assert.equal(cell._loadMedia, undefined);
+});
+
+test("remounting a hidden empty album unhides it and loads the new comment on intersection", async () => {
+  const h = harness({ request: args => args.index !== undefined ? raster
+    : listing(args.recordId === "empty" ? 0 : 2) }), cell = h.cell();
+  const options = { layout: "detail", previewLimit: 3, eager: false, hideEmpty: true };
+  h.api.mount(cell, { dataset: "comments", recordId: "empty" }, options);
+  h.visible(cell); await settle(); assert.equal(cell.hidden, true);
+  h.api.mount(cell, { dataset: "comments", recordId: "has-images" }, options);
+  assert.equal(cell.hidden, false); await settle(); assert.equal(h.requests.length, 1);
+  h.visible(cell); await settle();
+  assert.equal(visibleThumbs(cell).length, 2);
+  assert.ok(visibleThumbs(cell).every(button => button.children[0]?.tagName === "img"));
+});
+
+test("hideEmpty hides explicit no_previewable_images metadata without fetching rasters", async () => {
+  const h = harness({ request: () => ({ ...listing(0), missingReason: "no_previewable_images" }) });
+  const cell = h.cell();
+  h.api.mount(cell, { dataset: "comments", recordId: "no-preview" },
+    { layout: "detail", eager: false, hideEmpty: true });
+  h.visible(cell); await settle();
+  assert.equal(cell.hidden, true); assert.equal(cell.children.length, 0);
+  assert.equal(imagesRequested(h).length, 0);
+});
+
+for (const missingReason of ["metadata_read_failed", "unknown_future_error"])
+  test(`hideEmpty preserves visible error for unrecognized missingReason ${missingReason}`, async () => {
+    const h = harness({ request: () => ({ ...listing(0), missingReason }) }), cell = h.cell();
+    h.api.mount(cell, { dataset: "comments", recordId: "unknown-error" },
+      { layout: "detail", eager: false, hideEmpty: true });
+    h.visible(cell); await settle();
+    assert.equal(cell.hidden, false); assert.ok(cell.children.length > 0);
+    assert.equal(cell.children[0].title, missingReason);
+    assert.equal(imagesRequested(h).length, 0);
+  });

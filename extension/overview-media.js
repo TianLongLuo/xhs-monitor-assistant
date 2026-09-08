@@ -131,7 +131,7 @@
         img.src = url; stage.replaceChildren(img);
       } catch (error) { if (valid()) stage.textContent = `${error.message}；请刷新数据后重试。`; }
     }
-    function mount(cell, record, { layout = "table", previewLimit = 3, eager = false } = {}) {
+    function mount(cell, record, { layout = "table", previewLimit = 3, eager = false, hideEmpty = false } = {}) {
       mounts.get(cell)?.dispose();
       const currentEpoch = epoch;
       const state = { visible: eager || !observer, loading: false, loaded: false, targets: [] };
@@ -142,6 +142,7 @@
         for (const target of state.targets) { resizeObserver?.unobserve(target); resizeTargets.delete(target); }
         if (cell._loadMedia === load) delete cell._loadMedia;
       };
+      cell.hidden = false;
       cell.classList.add("media-cell"); cell.textContent = "等待图片…";
       cell.classList.toggle("media-detail", layout === "detail");
       const limit = Math.max(1, Math.min(12, Number(previewLimit) || 3));
@@ -154,6 +155,8 @@
           state.loaded = true;
           cell.replaceChildren();
           if (!listing.items.length) {
+            const confirmedEmpty = !listing.missingReason || listing.missingReason === "no_previewable_images";
+            if (hideEmpty && confirmedEmpty) { cell.hidden = true; return; }
             const label = document.createElement("span"); label.className = "media-empty";
             label.textContent = ({ record_not_found: "记录已变更，请刷新", record_identity_mismatch: "图片关联待核验", comment_parent_mismatch: "评论关联待核验" })[listing.missingReason] || "无已记录图片"; label.title = listing.missingReason || "旧记录未保留图片时，可重新同步补充";
             cell.append(label); return;

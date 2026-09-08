@@ -79,7 +79,7 @@ const drawerGallery = globalThis.XhsMonitorOverviewMedia?.create({
 const COMMENT_ACTION_FIELD = "__overview_comment_actions";
 const COMMENT_ACTION_COLUMN = Object.freeze({ key: COMMENT_ACTION_FIELD, label: "操作", dataType: "text", action: "locate_comment" });
 const STORAGE_KEY = "xhsMonitorDataOverviewStateV1";
-const DATA_OVERVIEW_VERSION = "0.34.19";
+const DATA_OVERVIEW_VERSION = "0.34.20";
 const INFINITE_BATCH_SIZE = 100;
 const TIME_COLUMNS = {
   published_at: ["published_at_raw", "published_at_precision", "published_at_status"],
