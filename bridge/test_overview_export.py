@@ -57,7 +57,7 @@ class OverviewExportTests(unittest.TestCase):
         wb = self.build(rows)
         ws = wb['筛选评论']
         self.assertEqual(tuple(c.value for c in ws[1]), export.COMMENT_HEADERS)
-        self.assertEqual(ws.max_column, 22)
+        self.assertEqual(ws.max_column, 23)
         self.assertEqual(ws.max_row, 4)
         self.assertEqual({str(r) for r in ws.merged_cells.ranges}, {'A2:A4', 'B2:B4', 'C2:C4', 'D2:D4'})
         self.assertEqual(ws['B2'].value, 3)
@@ -71,6 +71,39 @@ class OverviewExportTests(unittest.TestCase):
             self.assertEqual(ws.row_dimensions[r].outlineLevel, 1)
             self.assertFalse(ws.row_dimensions[r].hidden)
         self.assertEqual(self.stats(wb)['一级组数'], 1)
+
+    def test_ip_region_preserved_per_comment_in_main_and_special_sheets(self):
+        rows = [record(ip_location='四川', control='high'),
+                record('reply', ip_location='澳大利亚', control='medium')]
+        wb = self.build(rows)
+        self.assertEqual(len(export.COMMENT_HEADERS), len(export.COMMENT_WIDTHS))
+        for title, expected in [('筛选评论', ['四川', '澳大利亚']),
+                                ('需要控制_high', ['四川']), ('中等需要控制', ['澳大利亚'])]:
+            ws = wb[title]
+            self.assertEqual(ws.cell(1, 23).value, 'IP 属地')
+            self.assertEqual([ws.cell(r, 23).value for r in range(2, ws.max_row + 1)], expected)
+            self.assertEqual(ws.column_dimensions['W'].width, 16)
+            self.assertEqual(ws.auto_filter.ref, f'A1:W{ws.max_row}')
+        raw = wb['原始筛选数据']
+        col = [c.value for c in raw[1]].index('ip_location') + 1
+        self.assertEqual([raw.cell(r, col).value for r in (2, 3)], ['四川', '澳大利亚'])
+
+    def test_missing_ip_region_never_falls_back_to_parent_or_post(self):
+        for missing in [None, '']:
+            with self.subTest(missing=missing):
+                wb = self.build([record(ip_location='四川'),
+                                 record('reply', ip_location=missing, post__source_ip_location='广东')])
+                self.assertIsNone(self.main_by_id(wb)['reply'][22].value)
+        wb = self.build([record(post__source_ip_location='广东')])
+        self.assertIsNone(wb['筛选评论'].cell(2, 23).value)
+
+    def test_ip_region_remains_text_and_inherits_row_highlight(self):
+        for deleted, color in [(0, export.NEGATIVE_COLOR), (1, export.DELETED_COLOR)]:
+            wb = self.build([record(ip_location='=1+1', analysis_is_negative='是', is_deleted=deleted)])
+            cell = wb['筛选评论'].cell(2, 23)
+            self.assertEqual(cell.value, '=1+1')
+            self.assertEqual(cell.data_type, 's')
+            self.assertEqual(cell.fill.fgColor.rgb, '00' + color)
 
     def test_same_root_across_notes_never_mix(self):
         rows = [record('a', note='N1'), record('b', note='N2'), record('c', note='N1')]
@@ -355,7 +388,7 @@ class OverviewExportTests(unittest.TestCase):
                 self.assertEqual(actual, str(expected))
             else:
                 self.assertEqual(actual, expected)
-        self.assertEqual(wb['筛选评论'].max_column, 22)
+        self.assertEqual(wb['筛选评论'].max_column, 23)
 
     def test_raw_input_order_not_grouped(self):
         rows = [record('b', note='N1'), record('a', note='N2'), record('c', note='N1')]

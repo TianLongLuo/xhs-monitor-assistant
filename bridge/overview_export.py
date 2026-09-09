@@ -42,10 +42,10 @@ COMMENT_HEADERS = (
     '组号', '同组条数', '一级评论者', '一级评论原文', '本条角色', '评论者',
     '评论原文', 'Translate Comment', '控制级别', 'Main Category', 'Subcategory',
     '评论层级', '高度相似', '已删除', '判断依据', '笔记ID', '原帖标题',
-    '原帖链接', '帖子作者', '评论ID', '评论时间', '点赞量',
+    '原帖链接', '帖子作者', '评论ID', '评论时间', '点赞量', 'IP 属地',
 )
 COMMENT_WIDTHS = (8, 10, 16, 46, 12, 16, 48, 52, 20, 24, 36, 14, 12, 12,
-                  44, 28, 38, 46, 18, 30, 23, 12)
+                  44, 28, 38, 46, 18, 30, 23, 12, 16)
 REPORT_FIELDS = {
     'translate_comment': ('translate_comment', 'Translate Comment'),
     'main_category': ('main_category', 'Main Category'),
@@ -396,6 +396,7 @@ def _comments(wb, title, indices, rows, relations, mapping):
                 '是' if _deleted(row, 'comments') is True else None,
                 reason, row.get('note_id'), row.get('post__title'), row.get('post__url'),
                 row.get('post__author'), row.get('comment_id'), row.get('published_at'), row.get('like_count'),
+                row.get('ip_location'),
             ]
             for col, value in enumerate(values, 1):
                 # Only first row owns the left context; merges never discard values.
@@ -418,7 +419,7 @@ def _comments(wb, title, indices, rows, relations, mapping):
             link = row.get('post__url')
             if isinstance(link, str) and link.startswith(('https://', 'http://')):
                 ws.cell(next_row, 18).hyperlink = link
-            _highlight(ws, next_row, row, 'comments', end=22, start=5, status_col=14, preserve=(5, 9, 10))
+            _highlight(ws, next_row, row, 'comments', end=len(COMMENT_HEADERS), start=5, status_col=14, preserve=(5, 9, 10))
             body_height = max(_text_height(value, COMMENT_WIDTHS[col - 1])
                               for col, value in enumerate(values[4:], 5))
             ws.row_dimensions[next_row].height = min(409, max(72, body_height))

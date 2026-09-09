@@ -104,7 +104,7 @@ class ParentContextTests(unittest.TestCase):
 
     def test_filtered_reply_gets_unfiltered_parent_and_all_fields(self):
         self.pull(comments=[{"commentId":"root","content":"非差评一级","commentLevel":1,"author":"父作者"},
-                            {"commentId":"reply","parentCommentId":"root","content":"筛选命中","commentLevel":2}])
+                            {"commentId":"reply","parentCommentId":"root","content":"筛选命中","commentLevel":2,"ipLocation":"浙江"}])
         schema=self.store.data_overview_schema();self.assertTrue(schema["queryReady"])
         payload=dict(dataset="comments",snapshotToken=schema["snapshotToken"],expectedTotal=1,
                      filter={"children":[{"field":"comment_id","operator":"eq","value":"reply"}]})
@@ -115,6 +115,8 @@ class ParentContextTests(unittest.TestCase):
         self.assertEqual("非差评一级",ws.cell(2,4).value)
         self.assertEqual("二级回复",ws.cell(2,5).value)
         self.assertEqual("reply",ws.cell(2,20).value)
+        self.assertEqual("IP 属地",ws.cell(1,23).value)
+        self.assertEqual("浙江",ws.cell(2,23).value)
         raw=wb["原始筛选数据"]
         self.assertIn("原始结构化数据",[c.value for c in raw[1]])
 
