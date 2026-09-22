@@ -167,6 +167,12 @@ def start_bridge_process(config: dict[str, Any]) -> dict[str, Any]:
             | getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         )
+        # The detached server outlives the short-lived Native Messaging host.
+        # Give a frozen child its own extraction directory; the parent removes
+        # its _MEI directory on exit, including base_library.zip.
+        child_env = os.environ.copy()
+        if getattr(sys, "frozen", False):
+            child_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         log_stream = None
         try:
             log_stream = runtime_log_path().open("ab", buffering=0)
@@ -178,6 +184,7 @@ def start_bridge_process(config: dict[str, Any]) -> dict[str, Any]:
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,
                 close_fds=True,
+                env=child_env,
             )
             log_event(f"spawned Bridge pid={process.pid} command={command!r}")
         except Exception as exc:

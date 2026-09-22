@@ -41,6 +41,9 @@ function harness(count=3) {
     noteIdFromXhsUrl:()=>'', broadcastLocalNoteState:async()=>{},
     setNoteAccessStatuses:async(items,runId,url)=>{h.access.push(...plain(items));h.events.push('access');assert.equal(url,h.url);return {ok:true,items};},
     bridgeApi:async(path,options={})=>{
+      if(path==='/api/imported-links')return {ok:true,notes:h.imported||[]};
+      if(path==='/api/imported-links/complete')return {ok:true};
+      if(path==='/api/pull') { h.pulls=(h.pulls||[]).concat(JSON.parse(options.body)); return {ok:true,consistencyVerified:true,canPrune:true,commentStatus:'likely_complete'}; }
       if(options.expectedBridgeUrl)assert.equal(options.expectedBridgeUrl,h.url);
       if(path==='/api/sync-runs/start')return {ok:true,runId:1};
       if(path==='/api/sync-runs/finish'){h.finish=JSON.parse(options.body);return {ok:true};}
@@ -50,6 +53,7 @@ function harness(count=3) {
       if(h.compare)await h.compare(body);
       return {ok:true,commentHasChanges:false,newCount:0};
     },
+    requireConsistencyVerified: result=>{assert.equal(result.consistencyVerified,true);},
     syncCurrentNoteComments:async(payload,url)=>{
       assert.equal(url,h.url);h.writes.push(plain(payload));h.events.push('write:'+payload.noteId);
       h.maxWrites=Math.max(h.maxWrites,++h.activeWrites);
@@ -60,6 +64,29 @@ function harness(count=3) {
   vm.runInContext(['syncPulledNoteInReader','runPulledCommentSync'].map(declaration).join('\n'),ctx);
   h.ctx=ctx;h.run=()=>ctx.runPulledCommentSync(null,'all');return h;
 }
+test('import queue merges by ID and new links use first pull not comment-only sync',async()=>{
+  const h=harness(1);
+  h.imported=[{noteId:'new',url:'https://www.xiaohongshu.com/explore/new',needsInitialPull:true},
+    {noteId:'n0',url:'https://www.xiaohongshu.com/explore/n0',needsInitialPull:false}];
+  const result=await h.run();
+  assert.equal(result.total,2);
+  assert.deepEqual(h.reads,['n0','new']);
+  assert.equal(h.pulls.length,1);
+  assert.equal(h.pulls[0].note.noteId,'new');
+  assert.equal(h.writes.length,1);
+});
+
+test('failed imported read stays retryable and does not write status for nonexistent note',async()=>{
+  const h=harness(0);
+  h.imported=[{noteId:'new',url:'https://www.xiaohongshu.com/explore/new',needsInitialPull:true}];
+  h.ctx.getNoteStatus=async()=>({found:false});
+  h.read=async()=>{throw new Error('read failed');};
+  const result=await h.run();
+  assert.equal(result.failedPosts,1);
+  assert.equal(h.access.length,0);
+  assert.equal(h.pulls,undefined);
+});
+
 test('bounded prefetch overlaps write; reads and writes each serial, snapshots detached',async()=>{
   const h=harness(4), gate=deferred();h.write=async p=>{if(p.noteId==='n0')await gate.promise;};
   const task=h.run();await tick();await tick();

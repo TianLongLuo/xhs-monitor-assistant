@@ -11,7 +11,7 @@ const HEALTH_TIMEOUT_MS = 1800;
 const DEEP_SCAN_LIMIT = 60;
 const DETAIL_LOAD_TIMEOUT_MS = 18000;
 const CONTENT_SCRIPT_FILES = ["relevance.js", "page-context.js", "note-utils.js", "detail-store.js", "location-utils.js", "comment-utils.js", "comment-collector.js", "process-layout.js", "comment-locator.js", "content.js"];
-const CONTENT_SCRIPT_VERSION = "0.34.20";
+const CONTENT_SCRIPT_VERSION = "0.34.25";
 const BATCH_COMMENT_SYNC_KEY = "batchCommentSyncState";
 const SYNC_ALERT_PREFERENCES_KEY = "syncAlertPreferencesV1";
 const syncAlerts = globalThis.XhsMonitorSyncAlerts;
@@ -1562,6 +1562,29 @@ async function syncPulledNoteInReader(tabId, note, runId = 0, pipeline = null) {
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
+  if (note.needsInitialPull) {
+    let result;
+    try { result = await bridgeApi("/api/pull", {
+      method: "POST", expectedBridgeUrl: pipeline?.bridgeUrl || "",
+      shouldCancel: pipeline?.isCancelled || null, timeoutMs: 10 * 60 * 1000,
+      body: JSON.stringify({ ...snapshot, commentStatus: snapshot.status,
+        collectedAt: new Date().toISOString() })
+    }); } catch (error) { error.syncStage = "write"; throw error; }
+    requireConsistencyVerified(result, "导入帖子首次拉取");
+    await bridgeApi("/api/imported-links/complete", {
+      method: "POST", expectedBridgeUrl: pipeline?.bridgeUrl || "",
+      body: JSON.stringify({ noteId: note.noteId })
+    });
+    if (result.commentStatus !== "likely_complete" || result.canPrune !== true) {
+      const error = new Error(result.commentError || "导入帖子已保存，但评论仍未完整，请重试同步");
+      error.opened = true;
+      error.syncStage = "write";
+      error.syncCommitted = true;
+      throw error;
+    }
+    return { ok: true, changed: true, synced: result,
+      comparison: { newCount: result.commentAdded || 0 }, collectedCount: snapshot.comments.length };
+  }
   let comparison;
   try {
     comparison = await bridgeApi("/api/comments/compare", {
@@ -1626,6 +1649,10 @@ async function syncPulledNoteInReader(tabId, note, runId = 0, pipeline = null) {
     commentCount: snapshot.comments.length,
     commentRows: snapshot.comments.slice(0, 12)
   }).catch(() => {});
+  if (note.importedLink) await bridgeApi("/api/imported-links/complete", {
+    method: "POST", expectedBridgeUrl: pipeline?.bridgeUrl || "",
+    body: JSON.stringify({ noteId: note.noteId })
+  });
   return {
     ok: true, changed: hasCommentChanges, comparison, synced,
     collectedCount: synced.collectedCount || snapshot.comments.length
@@ -1636,11 +1663,19 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
   const batchBridgeUrl = (await getConfig()).bridgeUrl;
   const source = await getNotes("", 1000);
   if (!source?.ok) throw new Error(source?.error || "已拉取帖子列表读取失败");
+  const imported = await bridgeApi("/api/imported-links", { expectedBridgeUrl: batchBridgeUrl });
+  if (!imported?.ok) throw new Error(imported?.error || "导入链接队列读取失败，请更新 Bridge");
+  const merged = new Map((source.notes || []).map(note => [note.noteId, note]));
+  for (const entry of imported.notes || []) {
+    const stored = merged.get(entry.noteId);
+    merged.set(entry.noteId, { ...entry, ...stored, url: entry.url, importedLink: true,
+      needsInitialPull: entry.needsInitialPull });
+  }
   const selection = Array.isArray(selectedNoteIds) && selectedNoteIds.length
     ? new Set(selectedNoteIds.map((item) => String(item || "")).filter(Boolean))
     : null;
-  const pulledCandidates = (source.notes || []).filter((note) => {
-    const pulled = note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
+  const pulledCandidates = [...merged.values()].filter((note) => {
+    const pulled = note.importedLink || note.source === "existing_xlsx" || ["synced", "partial"].includes(note.pullStatus);
     return pulled && note.noteId && (!selection || selection.has(note.noteId));
   });
   const ignoredNotes = pulledCandidates.filter((note) => note.status === "ignored");
@@ -1741,7 +1776,7 @@ async function runPulledCommentSync(selectedNoteIds = null, mode = "all") {
         const markedUnreachable = accessStatus === "unreachable";
         const localStatus = await getNoteStatus(note.noteId).catch(() => ({ ok: false, found: false }));
         const diagnosis = accessFailureDiagnosis({ ...error, opened, unreachable: markedUnreachable }, localStatus || {});
-        accessUpdates.push({
+        if (!note.importedLink || localStatus?.found) accessUpdates.push({
           noteId: note.noteId,
           status: accessStatus,
           result: opened ? "opened_extract_failed" : (markedUnreachable ? "confirmed_v2" : diagnosis.code),
@@ -2475,6 +2510,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "getCurrentNoteComments") return readCurrentNoteComments(message.note || {}, sender.tab?.id || null);
     if (message.type === "auditCurrentNoteComments") return auditCurrentNoteComments(message.note || {}, sender.tab?.id || null);
     if (message.type === "syncCurrentNoteComments") return syncCurrentNoteComments(message);
+    if (message.type === "importPostLinks") return bridgeApi("/api/imported-links", {
+      method: "POST", body: JSON.stringify({ text: message.text }), timeoutMs: 30000
+    });
     if (message.type === "syncAllPulledComments") return startAllPulledCommentSync();
     if (message.type === "syncFailedPulledComments") return startFailedPulledCommentSync();
     if (message.type === "cancelAllPulledComments") return cancelAllPulledCommentSync();

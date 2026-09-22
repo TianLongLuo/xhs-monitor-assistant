@@ -9,7 +9,7 @@
   <body class="apple-utility-ui" data-panel-view="overview">
     <main class="shell">
       <header class="brand-header">
-        <div class="brand-mark" aria-hidden="true">X</div>
+        <img class="brand-mark app-brand-icon" src="icons/icon-128.png" alt="" aria-hidden="true">
         <div class="brand-copy">
           <div class="eyebrow">XHS MONITOR</div>
           <h1>舆情雷达</h1>
@@ -105,10 +105,17 @@
           <span id="deepScanButtonLabel">仅深读未判断帖子</span>
           <small>可单独重试</small>
         </button>
+        <details class="link-import">
+          <summary>批量导入帖子链接</summary>
+          <p>粘贴完整帖子链接或分享文案，每次最多 500 个。导入后点击下方同步，自动读取帖子及评论。短链接请先打开并复制完整链接。</p>
+          <textarea id="importPostLinksText" rows="5" aria-label="批量帖子链接" placeholder="https://www.xiaohongshu.com/explore/…"></textarea>
+          <button id="importPostLinksButton" type="button">导入同步队列</button>
+          <p id="importPostLinksResult" role="status"></p>
+        </details>
         <button id="syncAllPulled" class="batch-sync-button" type="button">
           <span class="batch-sync-button__glyph" aria-hidden="true">↻</span>
           <span class="batch-sync-button__copy">
-            <strong id="syncAllPulledLabel">同步全部已拉取帖子</strong>
+            <strong id="syncAllPulledLabel">同步全部帖子（含导入链接）</strong>
             <small>逐篇同步帖子、评论及存在/已删除状态</small>
           </span>
           <span aria-hidden="true">→</span>

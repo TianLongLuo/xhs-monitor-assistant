@@ -257,6 +257,7 @@ test("a muted mismatch remains in every full-sync run and fresh visible comments
     },
     bridgeApi: async (path, options = {}) => {
       assert.notEqual(path, "/api/ignore");
+      if (path === "/api/imported-links") return { ok: true, notes: [] };
       if (path === "/api/sync-runs/start") return { ok: true, runId: 0 };
       if (path === "/api/comments/compare") return { ok: true, commentHasChanges: round > 1, newCount: round > 1 ? 1 : 0 };
       if (path === "/api/comments/sync") {

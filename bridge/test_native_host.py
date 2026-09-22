@@ -45,6 +45,20 @@ class NativeHostRecoveryTests(unittest.TestCase):
                          getattr(native_host.subprocess, "DETACHED_PROCESS", 0))
         self.assertFalse((self.root / ".bridge-starting-18991.lock").exists())
 
+    def test_frozen_detached_child_gets_independent_runtime(self):
+        with patch.object(native_host.sys, "frozen", True, create=True), \
+             patch.dict(native_host.os.environ, {"PRESERVE_SETTING": "yes"}), \
+             patch.object(native_host, "bridge_is_healthy", return_value=False), \
+             patch.object(native_host, "port_is_open", return_value=False), \
+             patch.object(native_host, "wait_for_bridge", return_value=True), \
+             patch.object(native_host.subprocess, "Popen", return_value=Mock(pid=4321)) as popen:
+            result = native_host.start_bridge_process(self.config)
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+            self.assertEqual(env["PRESERVE_SETTING"], "yes")
+            self.assertIsNot(env, native_host.os.environ)
+            self.assertTrue(result["started"])
+
     def test_log_file_records_startup_diagnostics(self):
         native_host.log_event("bridge diagnostic")
         content = (self.root / "native_host.log").read_text(encoding="utf-8")

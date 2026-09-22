@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 try:
+    from . import link_import
     from .overview_read_sessions import OverviewReadSessions
     from . import agent_analysis
     from .ai_support import AIServiceError, AISettingsStore, DeepSeekClient
@@ -47,6 +48,7 @@ try:
     from .overview_export_service import export_filtered_workbook
     from .semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 except ImportError:  # Native Host runs this module as a top-level script.
+    import link_import
     from overview_read_sessions import OverviewReadSessions
     import agent_analysis
     from ai_support import AIServiceError, AISettingsStore, DeepSeekClient
@@ -59,7 +61,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 
 
-VERSION = "0.34.21"
+VERSION = "0.34.24"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )
@@ -1882,6 +1884,10 @@ class MonitorStore:
                 CREATE INDEX IF NOT EXISTS idx_change_events_unread
                     ON change_events(acknowledged, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS imported_links (
+                    note_id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS watchlist (
                     note_id TEXT PRIMARY KEY,
                     priority TEXT NOT NULL DEFAULT 'normal',
@@ -10594,6 +10600,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 limit = int(query.get("limit", [100])[0])
                 unread_only = text(query.get("unreadOnly", [""])[0], 10).lower() in {"1", "true", "yes"}
                 self._send_json(200, self.store.list_change_events(limit, unread_only))
+            elif parsed.path == "/api/imported-links":
+                self._send_json(200, link_import.list_links(self.store))
             elif parsed.path == "/api/watchlist":
                 query = parse_qs(parsed.query)
                 limit = int(query.get("limit", [200])[0])
@@ -10694,6 +10702,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 result = self.store.purge_untracked_discoveries(payload)
             elif self.path == "/api/changes/ack":
                 result = self.store.acknowledge_change_events(payload)
+            elif self.path == "/api/imported-links/complete":
+                result = link_import.complete_link(self.store, payload)
+            elif self.path == "/api/imported-links":
+                result = link_import.import_links(self.store, payload)
             elif self.path == "/api/watchlist":
                 result = self.store.set_watchlist(payload)
             elif self.path == "/api/sync-runs/start":

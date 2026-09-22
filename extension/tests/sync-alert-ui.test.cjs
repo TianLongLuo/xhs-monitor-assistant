@@ -136,7 +136,7 @@ function panel(state, options = {}) {
     activePulls: new Set(), queueView: { type: "pending" },
     fetch: unexpected, setTimeout: unexpected, setInterval: unexpected,
     chrome: new Proxy({}, { get: unexpected }),
-    confirm: message => { calls.confirmations.push(message); return options.confirm !== false; },
+    confirmPanelAction: async message => { calls.confirmations.push(message); return options.confirm !== false; },
     sendRuntime: async message => {
       calls.messages.push(plain(message));
       if (!options.reply) return unexpected();
@@ -787,4 +787,40 @@ test("new controls use scoped Apple styles, wrap long copy, and expose keyboard 
   assert.match(css, /data-suppressed="true"[^}]*var\(--apple-surface\)/s);
   assert.match(css, /\.app-toast--neutral\s*\{[^}]*white-space:\s*normal/s);
   assert.match(css, /\.sync-alert-rule \.operations-row__copy p\s*\{[^}]*overflow-wrap:\s*anywhere/s);
+});
+
+
+test("in-panel confirmation waits for explicit choice; cancel and Escape preserve records", async () => {
+  for (const choice of ["accept", "cancel", "escape", "close"]) {
+    const ui = panel(projected([failure()]));
+    const original = ui.document.createElement;
+    ui.document.createElement = tag => {
+      const el = original(tag);
+      el.showModal = () => { el.open = true; };
+      el.remove = () => {
+        if (el.parentElement) el.parentElement.children = el.parentElement.children.filter(child => child !== el);
+        el.parentElement = null;
+      };
+      return el;
+    };
+    vm.runInContext(declaration("confirmPanelAction"), ui.context);
+    const prior = ui.elements.ignoreAllBatchFailures;
+    prior.focus();
+    let resolved = false;
+    const result = ui.context.confirmPanelAction("<script>title</script>").then(value => { resolved = true; return value; });
+    await Promise.resolve();
+    assert.equal(resolved, false);
+    const dialog = ui.document.body.querySelector("dialog");
+    assert.equal(dialog.open, true);
+    assert.equal(dialog.querySelector("p").textContent, "<script>title</script>");
+    const buttons = dialog.querySelectorAll("button");
+    assert.equal(ui.document.activeElement, buttons[0]);
+    if (choice === "accept") await buttons[1].click();
+    else if (choice === "cancel") await buttons[0].click();
+    else dialog.listeners.get(choice === "escape" ? "cancel" : "close")({ preventDefault() {} });
+    assert.equal(await result, choice === "accept");
+    assert.equal(ui.document.body.querySelector("dialog"), null);
+    assert.equal(ui.document.activeElement, prior);
+    assert.equal(ui.calls.messages.length, 0);
+  }
 });

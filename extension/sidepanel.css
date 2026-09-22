@@ -4002,3 +4002,16 @@ body.apple-utility-ui.is-ball .ball-widget__ball {
 .sync-alert-rule .sync-alert-button { margin-top: 0; padding: 5px 8px; }
 .sync-alert-hint[data-state="warning"] { color: var(--apple-red); }
 .app-toast--neutral { background: var(--apple-text); border-radius: 12px; color: var(--apple-surface); line-height: 1.5; overflow-wrap: anywhere; white-space: normal; }
+
+.panel-confirm { box-sizing: border-box; width: calc(100% - 32px); max-width: 420px; max-height: calc(100vh - 32px); overflow: auto; padding: 20px; border: 1px solid #dfe3e8; border-radius: 16px; background: #fff; color: #242830; box-shadow: 0 12px 48px #0003; }
+.panel-confirm::backdrop { background: #15203080; }
+.apple-utility-ui .brand-mark.app-brand-icon { object-fit: contain; background: transparent; border: 0; box-shadow: none; padding: 0; }
+.link-import { margin: 12px 0; padding: 12px; border-radius: 12px; background: #f4f6f8; }
+.link-import summary { cursor: pointer; font-weight: 600; }
+.link-import p { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.link-import textarea { box-sizing: border-box; width: 100%; resize: vertical; border: 1px solid #ccd2da; border-radius: 8px; padding: 8px; }
+.link-import button { margin-top: 8px; padding: 8px 12px; border-radius: 8px; border: 0; background: #007aff; color: white; cursor: pointer; }
+.panel-confirm p { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.7; margin: 0 0 20px; }
+.panel-confirm > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.panel-confirm button { padding: 10px 12px; border: 1px solid #ccd2da; border-radius: 8px; background: #f4f6f8; cursor: pointer; }
+.panel-confirm .panel-confirm__accept { background: #bd2929; border-color: #bd2929; color: #fff; }

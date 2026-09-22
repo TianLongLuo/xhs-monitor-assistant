@@ -475,15 +475,52 @@ function failureNoteUrl(failure = {}) {
   return noteId ? `https://www.xiaohongshu.com/explore/${encodeURIComponent(noteId)}` : "";
 }
 
+function confirmPanelAction(message) {
+  // Side panels may suppress window.confirm; use an explicit in-panel modal.
+  return new Promise((resolve) => {
+    const previous = document.activeElement;
+    const dialog = document.createElement("dialog");
+    dialog.className = "panel-confirm";
+    dialog.setAttribute("aria-label", "确认忽略整个帖子");
+    const copy = document.createElement("p");
+    copy.textContent = message;
+    const actions = document.createElement("div");
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "取消";
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.textContent = "确认忽略整个帖子";
+    accept.className = "panel-confirm__accept";
+    let settled = false;
+    const finish = (accepted) => {
+      if (settled) return;
+      settled = true;
+      dialog.remove();
+      if (previous?.isConnected) previous.focus();
+      resolve(accepted);
+    };
+    cancel.addEventListener("click", () => finish(false));
+    accept.addEventListener("click", () => finish(true));
+    dialog.addEventListener("cancel", (event) => { event.preventDefault(); finish(false); });
+    dialog.addEventListener("close", () => finish(false));
+    actions.append(cancel, accept);
+    dialog.append(copy, actions);
+    document.body.append(dialog);
+    try { dialog.showModal(); cancel.focus(); }
+    catch (error) { finish(false); setStatus("确认窗口打开失败，请刷新插件侧边栏后重试", "error"); }
+  });
+}
+
 function confirmWholePostIgnore(items = []) {
   const titles = items.slice(0, 6).map(item => `• ${item.title || item.noteId || "未命名帖子"}`).join("\n");
-  return confirm(`忽略整个帖子（停止同步）\n\n确定忽略以下 ${items.length} 篇帖子吗？\n${titles}${items.length > 6 ? "\n…" : ""}\n\n帖子将停止参与后续同步；帖子与关联评论会标记为删除态，本地记录保留，可在运营页恢复。\n\n如果只想关闭评论告警，请取消并使用“告警设置”；告警忽略不改变数据状态，帖子仍继续同步。`);
+  return confirmPanelAction(`忽略整个帖子（停止同步）\n\n确定忽略以下 ${items.length} 篇帖子吗？\n${titles}${items.length > 6 ? "\n…" : ""}\n\n帖子将停止参与后续同步；帖子与关联评论会标记为删除态，本地记录保留，可在运营页恢复。\n\n如果只想关闭评论告警，请取消并使用“告警设置”；告警忽略不改变数据状态，帖子仍继续同步。`);
 }
 
 async function ignoreBatchFailureItems(items = []) {
   const targets = [...new Map((Array.isArray(items) ? items : [])
     .filter(item => item?.noteId).map(item => [item.noteId, item])).values()];
-  if (!targets.length || batchSyncViewState.running || !confirmWholePostIgnore(targets)) return null;
+  if (!targets.length || batchSyncViewState.running || !(await confirmWholePostIgnore(targets)) || batchSyncViewState.running) return null;
   const result = await sendRuntime({ type: "ignoreBatchFailures", noteIds: targets.map((item) => item.noteId) });
   if (result?.state) renderBatchSync(result.state);
   if (!result?.ok) throw new Error(result?.error || "忽略失败");
@@ -760,7 +797,7 @@ function renderBatchSync(state = {}, notify = false) {
   if (elements.syncAllPulledLabel) {
     setStableText(elements.syncAllPulledLabel, running
       ? `正在同步 ${current}/${total || "?"}`
-      : "同步全部已拉取帖子");
+      : "同步全部帖子（含导入链接）");
   }
   setStableText(elements.batchSyncTitle, batchSyncPhaseLabel(view));
   setStableText(elements.batchSyncCount, `${current} / ${total}`);
@@ -821,6 +858,25 @@ function renderBatchSync(state = {}, notify = false) {
     showToast(message, hasErrors ? "error" : "success");
   }
 }
+
+async function importPostLinksFromPanel() {
+  const input = document.getElementById("importPostLinksText");
+  const button = document.getElementById("importPostLinksButton");
+  const output = document.getElementById("importPostLinksResult");
+  if (button.disabled) return;
+  button.disabled = true;
+  output.textContent = "正在导入…";
+  try {
+    const result = await sendRuntime({ type: "importPostLinks", text: input.value });
+    if (!result?.ok) throw new Error(result?.error || "导入失败，请确认 Bridge 已更新");
+    output.textContent = `新增 ${result.added} · 已在队列 ${result.existing} · 重复 ${result.duplicates} · 已忽略/删除 ${result.ignored} · 无效链接 ${result.rejected.length}。点击同步全部帖子开始读取。`;
+    input.value = result.rejected.join("\n");
+  } catch (error) {
+    output.textContent = error.message || "导入失败，原始输入已保留";
+  } finally { button.disabled = false; }
+}
+
+document.getElementById("importPostLinksButton")?.addEventListener("click", importPostLinksFromPanel);
 
 async function startAllPulledSync() {
   if (batchSyncViewState.running) return;
@@ -1860,7 +1916,7 @@ function renderNoteList(notes, options = {}) {
       if ((note.status || options.status || "") === "new") actions.append(
         actionButton("拉取到 CSV", async (button) => pullNoteToExcel(note, button)),
         actionButton("忽略整个帖子（停止同步）", async () => {
-          if (!confirmWholePostIgnore([{ ...note, noteId }])) return;
+          if (!(await confirmWholePostIgnore([{ ...note, noteId }]))) return;
           const result = await sendRuntime({ type: "ignoreNote", note: { ...note, noteId, url: noteUrl(note) } });
           if (!result?.ok) throw new Error(result?.error || "忽略失败");
           setStatus("已忽略整个帖子并停止同步；帖子与关联评论已标记为删除态", "warning");
