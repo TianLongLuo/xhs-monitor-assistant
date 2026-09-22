@@ -61,7 +61,7 @@ except ImportError:  # Native Host runs this module as a top-level script.
     from semantic_search import LocalEncoder, retrieve as semantic_retrieve, MODEL as SEMANTIC_MODEL
 
 
-VERSION = "0.34.24"
+VERSION = "0.34.26"
 DATA_OVERVIEW_NOTE_SCOPE = (
     "(n.source='existing_xlsx' OR n.pull_status IN ('synced','partial') OR n.status IN ('confirmed','ignored'))"
 )

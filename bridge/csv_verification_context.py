@@ -37,13 +37,23 @@ def _path_stamp(path):
     return (_stamp(path.lstat()), _stamp(path.stat()))
 
 
+def _same_open_file(opened, expected):
+    # Windows stat/fstat may expose different ctime semantics (creation vs
+    # change time). Only omit ctime from this cross-API comparison; retain
+    # full stamps for path-to-path and handle-to-handle stability checks.
+    if os.name == "nt":
+        return opened[:4] + opened[5:] == expected[:4] + expected[5:]
+    return opened == expected
+
+
 def _read_stable(path, expected, *, capture):
     if _path_stamp(path) != expected:
         raise CsvVerificationChanged("CSV 校验期间文件身份或元数据已变化")
     digest = hashlib.sha256()
     chunks = [] if capture else None
     with path.open("rb") as stream:
-        if _stamp(os.fstat(stream.fileno())) != expected[1]:
+        opened = _stamp(os.fstat(stream.fileno()))
+        if not _same_open_file(opened, expected[1]):
             raise CsvVerificationChanged("CSV 校验打开了不同的文件")
         while True:
             chunk = stream.read(1024 * 1024)
@@ -52,7 +62,7 @@ def _read_stable(path, expected, *, capture):
             digest.update(chunk)
             if capture:
                 chunks.append(chunk)
-        if _stamp(os.fstat(stream.fileno())) != expected[1]:
+        if _stamp(os.fstat(stream.fileno())) != opened:
             raise CsvVerificationChanged("CSV 校验读取期间文件已变化")
     if _path_stamp(path) != expected:
         raise CsvVerificationChanged("CSV 校验读取后文件已变化")

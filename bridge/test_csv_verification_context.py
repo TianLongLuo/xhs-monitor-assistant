@@ -19,6 +19,37 @@ import test_ai_publication as fixtures
 
 
 class CsvParsingTests(unittest.TestCase):
+    def test_windows_cross_api_ctime_difference_only(self):
+        stamp = (1, 2, 3, 4, 5, 6)
+        with patch.object(contexts.os, "name", "nt"):
+            self.assertTrue(contexts._same_open_file((1, 2, 3, 4, 99, 6), stamp))
+            for index in (0, 1, 2, 3, 5):
+                changed = list(stamp)
+                changed[index] += 1
+                self.assertFalse(contexts._same_open_file(tuple(changed), stamp))
+        with patch.object(contexts.os, "name", "posix"):
+            self.assertFalse(contexts._same_open_file((1, 2, 3, 4, 99, 6), stamp))
+
+    def test_handle_ctime_change_during_read_is_rejected(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "test.csv"
+            path.write_bytes(b"a,b\n1,2\n")
+            expected = contexts._path_stamp(path)
+            original = os.fstat
+            calls = []
+            def changing(fd):
+                stat = original(fd)
+                calls.append(fd)
+                values = {name: getattr(stat, name) for name in
+                          ('st_dev', 'st_ino', 'st_mode', 'st_mtime_ns', 'st_ctime_ns', 'st_size')}
+                if len(calls) > 1:
+                    values['st_ctime_ns'] += 1
+                return SimpleNamespace(**values)
+            with patch.object(contexts.os, "fstat", side_effect=changing):
+                with self.assertRaisesRegex(contexts.CsvVerificationChanged, "读取期间"):
+                    contexts._read_stable(path, expected, capture=True)
+
     def test_parser_matches_existing_reader_for_encodings_and_edge_rows(self):
         with tempfile.TemporaryDirectory(prefix="csv-verification-parser-") as root:
             path = Path(root) / "synthetic.csv"
